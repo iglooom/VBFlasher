@@ -1,0 +1,3 @@
+# Default location for Secondary Bootloader (SBL) VBF files.
+# Drop the ECU SBLs here, e.g. DV6T-14C097-AB.vbf, BV6T-14C220-AA.vbf.
+# VBF files themselves are gitignored (proprietary Ford firmware).
