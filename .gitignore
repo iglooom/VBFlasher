@@ -7,6 +7,10 @@ __pycache__/
 # Runtime logs / traces
 logs/
 
-# Proprietary Ford firmware — never commit VBF images
+# Proprietary Ford firmware — never commit VBF images...
 *.vbf
 *.VBF
+
+# ...except the Secondary Bootloaders kept in sbl/ (needed by the flasher)
+!sbl/*.vbf
+!sbl/*.VBF
