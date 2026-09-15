@@ -27,10 +27,6 @@ def _as_secret_bytes(secret) -> bytes:
 
 
 def key_from_seed(seed3, secret) -> bytes:
-    """Faithful port of FoCCCus c346::keyFromSeed (ford_c346.cpp).
-
-    secret indices below match the QByteArray there: secret[0] is the MSB.
-    """
     s = _as_secret_bytes(secret)
     s0, s1, s2, s3, s4 = s[0], s[1], s[2], s[3], s[4]
     seed = list(seed3)

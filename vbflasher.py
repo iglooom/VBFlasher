@@ -283,10 +283,27 @@ def flash_session(txid, files, args):
             return
 
     # --- execute -----------------------------------------------------------
-    quiet = BusQuiet(args.iface, args.tp_id if args.tp_id >= 0 else 0x7DF,
-                     execute=True, enabled=args.quiet_bus)
-    ka = Keepalive(ecu, period=args.tp_interval,
-                   can_id=(args.tp_id if args.tp_id >= 0 else None))
+    tp_bcast = args.tp_id if args.tp_id >= 0 else FUNCTIONAL_ID
+    quiet = BusQuiet(args.iface, tp_bcast, execute=True, enabled=args.quiet_bus)
+    # TesterPresent keepalive routing:
+    #   * explicit --tp-id N     -> broadcast on N
+    #   * --quiet-bus (default)  -> broadcast on 0x7DF: REQUIRED so the OTHER
+    #     modules that quiet-bus put into programmingSession keep refreshing
+    #     their S3 and STAY silent. A physical keepalive only refreshes the
+    #     target and lets the rest wake up after ~5 s (S3 timeout).
+    #   * otherwise              -> physical, via the target's ISO-TP socket.
+    if args.tp_id >= 0:
+        ka_can_id = args.tp_id
+    elif args.quiet_bus:
+        ka_can_id = FUNCTIONAL_ID
+    else:
+        ka_can_id = None
+    ka = Keepalive(ecu, period=args.tp_interval, can_id=ka_can_id)
+    if args.tp_interval > 0:
+        where = ("physical (ISO-TP socket)" if ka_can_id is None
+                 else f"broadcast 0x{ka_can_id:03X}")
+        print(f"   keepalive: TesterPresent 3E 80 every {args.tp_interval:.1f}s "
+              f"-> {where}")
     try:
         quiet.arm()
 
