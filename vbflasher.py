@@ -579,7 +579,7 @@ def _dtc_all(args):
         alive = ecu.wake(tries=tries, timeout=wtmo) is not None
         dtcs = None
         if alive:
-            dtcs, _ = ecu.read_dtcs(status_mask=mask, timeout=5.0)
+            dtcs, _ = ecu.read_dtcs(status_mask=mask, timeout=20.0)
         if dtcs is None:
             silent.append(profile)
             print("   %-32s %8s %8s" % (label, "-", "-"))

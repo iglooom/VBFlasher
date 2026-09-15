@@ -8,6 +8,7 @@ The transport is the hardware-proven ISO-TP client: TX/RX padding to DLC=8,
 frame, 0x21 busyRepeatRequest retry.
 """
 import binascii
+import hashlib
 import os
 import re
 import socket
@@ -179,8 +180,13 @@ class Vbf:
     def total_payload(self):
         return sum(b["length"] for b in self.blocks)
 
+    def sha256(self):
+        """SHA-256 of the whole VBF file (as on disk)."""
+        return hashlib.sha256(self.raw).hexdigest()
+
     def describe(self):
         o = [f"=== {os.path.basename(self.path)}  ({len(self.raw)} bytes)",
+             f"   sha256           {self.sha256()}",
              f"   sw_part_number   {self.part}",
              f"   sw_part_type     {self.ptype}",
              f"   ecu_address      "
@@ -315,11 +321,17 @@ class Ecu:
             return r[3:].decode("latin-1", "replace").rstrip("\x00 ")
         return None
 
-    def read_dtcs(self, status_mask=0xFF, timeout=5.0):
+    def read_dtcs(self, status_mask=0xFF, timeout=20.0):
         """UDS 19 02 reportDTCByStatusMask. Returns (dtcs, avail_mask).
 
         dtcs is a list of (dtc_3byte_int, status_byte). A positive response is
         `59 02 <availabilityMask> [ <b2 b1 b0 status> ... ]`.
+
+        NOTE the generous default timeout: a full DTC dump can be >1 KB and
+        many ECUs pace their consecutive frames ~30 ms apart regardless of the
+        STmin we request, so a big response (e.g. a PCM with ~290 DTCs = 1171
+        bytes) takes >5 s to reassemble. A tight 5 s window made the kernel
+        time out mid-reassembly and looked like 'module silent'.
         """
         r = self.req("1902%02X" % status_mask, timeout=timeout,
                      what="19 02 reportDTCByStatusMask")
