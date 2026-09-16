@@ -55,7 +55,9 @@ import ecu_db                                            # noqa: E402
 import ford_seckey                                       # noqa: E402
 from vbf import (Vbf, Ecu, BusQuiet, Keepalive, download_blocks,  # noqa: E402
                  human, fmt, iface_is_up, dtc_code, dtc_status_str,
-                 dtc_is_actual, functional_broadcast)
+                 dtc_is_actual, functional_broadcast,
+                 upload_block, download_raw_block, erase_region,
+                 verify_routine)
 
 TP_INTERVAL = 1.5
 
@@ -396,6 +398,194 @@ def flash_session(txid, files, args):
 
 
 # --------------------------------------------------------------------------
+# generic raw memory read / write (memread / memwrite) — reuses the proven
+# session + security + SBL-load preamble, then does a single 35-upload or a
+# FF00-erase + 34-download over an arbitrary address range. Modelled directly
+# on the UCDS PSCM EEPROM capture (PSCM_ucds_eeprom_procedure.md).
+# --------------------------------------------------------------------------
+def _open_sbl_session(profile, args, need_secret=True):
+    """Connect, read identity, load+start the SBL, unlock security. Returns
+    (ecu, keepalive, quiet, logf, hw). Caller must stop ka / restore quiet /
+    close logf in a finally. Mirrors flash_session's preamble exactly."""
+    txid = profile.txid
+    rxid = args.rxid if args.rxid is not None else profile.resp_id()
+    _check_iface(args.iface)
+
+    logf = None
+    if getattr(args, "logfile", None):
+        os.makedirs(os.path.dirname(args.logfile) or ".", exist_ok=True)
+        logf = open(args.logfile, "a")
+        logf.write(f"\n==== {time.strftime('%F %T')} {profile.name} "
+                   f"mem tx=0x{txid:03X} rx=0x{rxid:03X} ====\n")
+
+    ecu = Ecu(args.iface, txid, rxid, execute=True, logfile=logf)
+    ident = read_identity(ecu, profile, getattr(args, "wake_tries", 8),
+                          getattr(args, "wake_timeout", 0.5))
+    hw = args.hw or ident.get("F111") or ""
+    if not hw and not args.sbl:
+        raise SystemExit("could not read F111 and no --hw/--sbl given; cannot "
+                         "choose the SBL/secret. Pass --hw <F111> or --sbl.")
+
+    sbl_dirs = [SBL_DIR, HERE] + list(args.sbl_dir or [])
+    sbl_path, sbl_name, sbl_reason = resolve_sbl(profile, hw, args, sbl_dirs)
+    sbl = Vbf(sbl_path)
+    if sbl.call is None:
+        raise SystemExit(f"{sbl_path}: SBL VBF has no `call` address")
+    if sbl.check():
+        raise SystemExit(f"{sbl_path}: SBL integrity failure")
+    print(f"   SBL: {sbl_name}  call=0x{sbl.call:08X}  ({sbl_reason})")
+
+    level = args.sec_level
+    if args.secret is not None:
+        secret = (args.secret.to_bytes(5, "big")
+                  if isinstance(args.secret, int) else args.secret)
+    else:
+        secret = profile.pick_secret(hw, level)
+        if secret is None and need_secret:
+            raise SystemExit(f"no SecurityAccess secret for {profile.name} "
+                             f"F111 {hw!r} level {level}. Pass --secret 0x....")
+
+    quiet = BusQuiet(args.iface, FUNCTIONAL_ID, execute=True,
+                     enabled=getattr(args, "quiet_bus", False))
+    ka_can_id = (FUNCTIONAL_ID if getattr(args, "quiet_bus", False) else None)
+    ka = Keepalive(ecu, period=args.tp_interval, can_id=ka_can_id)
+
+    quiet.arm()
+    print("\n== session + security ==")
+    r = None
+    for i in range(1, args.wake_tries + 1):
+        r = ecu.req("1002", timeout=1.0, what=f"10 02 programmingSession {i}")
+        if r is not None and r[0] == 0x50:
+            break
+        time.sleep(0.1)
+    if not (r is not None and r[0] == 0x50):
+        raise SystemExit(f"10 02 programmingSession: {fmt(r)}")
+    print(f"   OK   10 02 programmingSession        {fmt(r)}")
+    time.sleep(0.1)
+    r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
+                   timeout=5.0)
+    seed = list(r[2:5])
+    if seed == [0, 0, 0]:
+        print("   seed 000000 -> already unlocked")
+    else:
+        key = ford_seckey.key_from_seed(seed, secret)
+        print(f"   seed {bytes(seed).hex().upper()} -> key {key.hex().upper()}")
+        ecu.expect(f"27{level + 1:02X}" + key.hex(), 0x67,
+                   f"27 {level + 1:02X} sendKey", timeout=5.0)
+    print("   unlocked")
+
+    ka.start()
+    print("\n== SBL -> RAM ==")
+    download_blocks(ecu, sbl.blocks, "sbl", args.progress_interval)
+    call_arg = (f"{(sbl.call >> 16) & 0xFFFF:04X}" if profile.sbl_call_halfword
+                else f"{sbl.call:08X}")
+    ecu.expect("31010301" + call_arg, 0x71, "31 01 0301 start SBL",
+               timeout=10.0)
+    print(f"   SBL running (call 0x{sbl.call:08X})")
+    return ecu, ka, quiet, logf
+
+
+def do_memread(args):
+    profile = ecu_db.resolve(args.ecu)
+    if profile is None:
+        raise SystemExit(f"unknown ECU {args.ecu!r}. See `list`.")
+    addr, length = args.addr, args.length
+    print("=" * 72)
+    print(f"MEMREAD  {profile.name}  0x{addr:08X} +0x{length:X} "
+          f"({human(length)}) -> {args.outfile}")
+    print("=" * 72)
+    print("   PLAN: load+run SBL, then 35 RequestUpload the region, save to "
+          "file.")
+    if not args.yes:
+        ans = input("Proceed with the read? [y/N] ").strip().lower()
+        if ans != "y":
+            print("aborted by user.")
+            return
+    ecu = ka = quiet = logf = None
+    try:
+        ecu, ka, quiet, logf = _open_sbl_session(profile, args,
+                                                 need_secret=True)
+        print(f"\n== read 0x{addr:08X} +0x{length:X} ==")
+        data = upload_block(ecu, addr, length, addr_len_fmt=args.addr_len_fmt,
+                            progress_interval=args.progress_interval,
+                            tag="read")
+        with open(args.outfile, "wb") as f:
+            f.write(data)
+        import hashlib
+        print(f"\n   wrote {len(data)} bytes to {args.outfile}")
+        print(f"   sha256 {hashlib.sha256(data).hexdigest()}")
+    finally:
+        if ka:
+            ka.stop()
+        if quiet:
+            quiet.restore()
+        if ecu is not None and not args.no_reset:
+            try:
+                ecu.req("1101", timeout=8.0, what="11 01 ECUReset")
+            except Exception:  # noqa: BLE001
+                pass
+        if logf:
+            logf.close()
+    print("\n*** MEMREAD DONE ***")
+
+
+def do_memwrite(args):
+    profile = ecu_db.resolve(args.ecu)
+    if profile is None:
+        raise SystemExit(f"unknown ECU {args.ecu!r}. See `list`.")
+    data = open(args.infile, "rb").read()
+    if args.length is not None and len(data) != args.length:
+        raise SystemExit(f"{args.infile} is {len(data)} bytes but --length "
+                         f"0x{args.length:X} was given; they must match.")
+    addr, length = args.addr, len(data)
+    import hashlib
+    print("=" * 72)
+    print(f"MEMWRITE  {profile.name}  {args.infile} ({len(data)} bytes) "
+          f"-> 0x{addr:08X}")
+    print("=" * 72)
+    print(f"   file sha256 {hashlib.sha256(data).hexdigest()}")
+    print("   PLAN: load+run SBL, 31 01 FF00 erase, 34 download, "
+          + ("31 01 0304 verify, " if not args.no_verify else "")
+          + "11 01 reset.")
+    print("   !! This WRITES ECU memory and is IRREVERSIBLE. Have a backup "
+          "(memread) first.")
+    if not args.yes:
+        ans = input(f"Write 0x{length:X} bytes to 0x{addr:08X} on "
+                    f"{profile.name}? [y/N] ").strip().lower()
+        if ans != "y":
+            print("aborted by user.")
+            return
+    ecu = ka = quiet = logf = None
+    try:
+        ecu, ka, quiet, logf = _open_sbl_session(profile, args,
+                                                 need_secret=True)
+        if not args.no_erase:
+            print(f"\n== erase 0x{addr:08X} +0x{length:X} ==")
+            erase_region(ecu, addr, length, erase_timeout=args.erase_timeout)
+        print(f"\n== write 0x{addr:08X} +0x{length:X} ==")
+        download_raw_block(ecu, addr, data, addr_len_fmt=args.addr_len_fmt,
+                           progress_interval=args.progress_interval,
+                           tag="write")
+        if not args.no_verify:
+            print("\n== verify (31 01 0304) ==")
+            verify_routine(ecu, erase_timeout=args.erase_timeout)
+    finally:
+        if ka:
+            ka.stop()
+        if quiet:
+            quiet.restore()
+        if ecu is not None:
+            try:
+                ecu.req("1101", timeout=8.0, what="11 01 ECUReset")
+            except Exception:  # noqa: BLE001
+                pass
+        if logf:
+            logf.close()
+    print("\n*** MEMWRITE DONE ***")
+    print("    Read back with `memread` and compare to confirm the write.")
+
+
+# --------------------------------------------------------------------------
 # subcommands
 # --------------------------------------------------------------------------
 def do_flash(args):
@@ -485,6 +675,135 @@ def do_ident(args):
     print(f"== {profile.name}  tx=0x{profile.txid:03X} rx=0x{ecu.rxid:03X} ==")
     read_identity(ecu, profile, getattr(args, "wake_tries", 8),
                   getattr(args, "wake_timeout", 0.5))
+
+
+def _ascii_sanitize(data):
+    """Printable-ASCII rendering of bytes; every non-printable byte -> '.'.
+
+    Only 0x20..0x7E pass through; control chars, DEL and all high bytes become
+    '.', so a binary DID can never emit escape sequences that corrupt the
+    terminal (no CR/LF/BS/ESC/colour codes leak through)."""
+    return "".join(chr(b) if 0x20 <= b <= 0x7E else "." for b in data)
+
+
+def _hexdump(data, indent="   "):
+    """Classic 16-byte-per-row hex + sanitized ASCII dump."""
+    lines = []
+    for off in range(0, len(data), 16):
+        chunk = data[off:off + 16]
+        hx = " ".join(f"{b:02X}" for b in chunk)
+        hx = f"{hx:<47}"                       # pad to 16*3-1 columns
+        lines.append(f"{indent}{off:04X}  {hx}  |{_ascii_sanitize(chunk)}|")
+    return "\n".join(lines)
+
+
+def do_readdid(args):
+    profile, ecu = _connect_by_selector(args)
+    print(f"== {profile.name}  tx=0x{profile.txid:03X} rx=0x{ecu.rxid:03X} ==")
+    ecu.wake(tries=getattr(args, "wake_tries", 8),
+             timeout=getattr(args, "wake_timeout", 0.5))
+    for did in args.did:
+        d = did.upper().replace("0X", "").replace(" ", "")
+        if len(d) != 4 or any(c not in "0123456789ABCDEF" for c in d):
+            print(f"\n   {did}: not a 2-byte DID (expected 4 hex digits)")
+            continue
+        r = ecu.req("22" + d, timeout=args.timeout, what="22 " + d)
+        if r is None:
+            print(f"\n   {d}: <no response / timeout>")
+            continue
+        if r[0] == 0x7F:
+            print(f"\n   {d}: {fmt(r)}")
+            continue
+        # positive: 62 <did_hi> <did_lo> <payload...>
+        if r[0] != 0x62 or len(r) < 3:
+            print(f"\n   {d}: unexpected response {r.hex().upper()}")
+            continue
+        payload = r[3:]
+        print(f"\n   DID {d}  ({len(payload)} bytes)")
+        if not payload:
+            print("      (empty)")
+            continue
+        print(f"      hex:   {payload.hex().upper()}")
+        print(f"      ascii: {_ascii_sanitize(payload)!r}")
+        if len(payload) > 16:
+            print(_hexdump(payload, indent="      "))
+
+
+def do_writedid(args):
+    d = args.did.upper().replace("0X", "").replace(" ", "")
+    if len(d) != 4 or any(c not in "0123456789ABCDEF" for c in d):
+        raise SystemExit(f"{args.did}: not a 2-byte DID (expected 4 hex digits)")
+    payload = args.data.replace("0x", "").replace("0X", "").replace(" ", "")
+    if len(payload) % 2 or any(c not in "0123456789abcdefABCDEF" for c in payload):
+        raise SystemExit(f"--data {args.data!r}: not valid hex bytes")
+    if not payload:
+        raise SystemExit("no data given to write")
+    data = bytes.fromhex(payload)
+    profile, ecu = _connect_by_selector(args)
+    print(f"== {profile.name}  tx=0x{profile.txid:03X} rx=0x{ecu.rxid:03X} ==")
+    print(f"   WRITE DID {d}  <- {data.hex().upper()}  ({len(data)} bytes)")
+    print(f"   ascii: {_ascii_sanitize(data)!r}")
+
+    ecu.wake(tries=getattr(args, "wake_tries", 8),
+             timeout=getattr(args, "wake_timeout", 0.5))
+
+    # show current value first (best-effort) so the user sees what changes
+    cur = ecu.req("22" + d, timeout=args.timeout, what="22 " + d + " (before)")
+    if cur is not None and cur and cur[0] == 0x62 and len(cur) >= 3:
+        old = cur[3:]
+        print(f"   current: {old.hex().upper()}  ({_ascii_sanitize(old)!r})")
+    else:
+        print(f"   current: {fmt(cur)} (read-back not available)")
+
+    if not args.yes:
+        ans = input(f"Write {len(data)} byte(s) to DID {d} on {profile.name}? "
+                    "[y/N] ").strip().lower()
+        if ans != "y":
+            print("aborted by user.")
+            return
+
+    # Optional session/security preamble: some DIDs are only writable in an
+    # extended/programming session after SecurityAccess. Default is a bare 2E.
+    if args.session is not None:
+        ecu.expect("10%02X" % args.session, 0x50,
+                   "10 %02X diagnosticSession" % args.session, timeout=5.0)
+        time.sleep(0.1)
+    if args.unlock:
+        level = args.sec_level
+        secret = (args.secret.to_bytes(5, "big")
+                  if isinstance(args.secret, int) else args.secret) \
+            if args.secret is not None else profile.pick_secret(args.hw or "",
+                                                                level)
+        if secret is None:
+            raise SystemExit(f"--unlock: no secret for {profile.name} level "
+                             f"{level}; pass --secret 0x....")
+        r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
+                       timeout=5.0)
+        seed = list(r[2:5])
+        if seed != [0, 0, 0]:
+            key = ford_seckey.key_from_seed(seed, secret)
+            print(f"   seed {bytes(seed).hex().upper()} -> key "
+                  f"{key.hex().upper()}")
+            ecu.expect(f"27{level + 1:02X}" + key.hex(), 0x67,
+                       f"27 {level + 1:02X} sendKey", timeout=5.0)
+        print("   unlocked")
+
+    r = ecu.req("2E" + d + data.hex(), timeout=args.timeout,
+                what="2E " + d + " writeDataByIdentifier")
+    if r is not None and r and r[0] == 0x6E:
+        print(f"   OK   2E {d} accepted (6E)")
+    else:
+        raise SystemExit(f"   FAIL 2E {d}: {fmt(r)}")
+
+    # read back to confirm
+    rb = ecu.req("22" + d, timeout=args.timeout, what="22 " + d + " (after)")
+    if rb is not None and rb and rb[0] == 0x62 and len(rb) >= 3:
+        got = rb[3:]
+        print(f"   after:   {got.hex().upper()}  ({_ascii_sanitize(got)!r})")
+        if got[:len(data)] == data:
+            print("   verified: read-back matches written data.")
+        else:
+            print("   !! read-back does NOT match written data.")
 
 
 def _ident_all(args):
@@ -831,6 +1150,94 @@ def selftest():
         "dtc_is_actual" in inspect.getsource(_dtc_all)
         and "dtc_code" not in inspect.getsource(_dtc_all))
 
+    print("\n== readdid ascii sanitize ==")
+    chk("printable passes through",
+        _ascii_sanitize(b"CV6T-14C217-AR") == "CV6T-14C217-AR")
+    chk("control/high bytes -> '.'",
+        _ascii_sanitize(bytes([0x00, 0x1B, 0x0A, 0x0D, 0x7F, 0xFF, 0x41]))
+        == "......A")
+    chk("no ESC/CR/LF survive sanitize",
+        all(c not in _ascii_sanitize(bytes(range(256))) for c in "\x1b\r\n\x00"))
+    chk("sanitized length == input length",
+        len(_ascii_sanitize(bytes(range(256)))) == 256)
+    chk("hexdump renders binary safely (no raw control bytes)",
+        all(ord(c) >= 0x20 or c == "\n" for c in _hexdump(bytes(range(64)))))
+    chk("readdid wired into main dispatch",
+        "do_readdid" in inspect.getsource(main))
+    chk("writedid wired into main dispatch",
+        "do_writedid" in inspect.getsource(main))
+    chk("writedid builds a 2E request",
+        "2E" in inspect.getsource(do_writedid)
+        and "6E" in inspect.getsource(do_writedid))
+
+    print("\n== memread / memwrite primitives ==")
+    # upload_block: 75 declares 0x82 (128 payload), then 8 x 76-frames of 128 B,
+    # matching the UCDS PSCM EEPROM read (0x400 = 1024 bytes in 8 blocks).
+    class _UpSock:
+        def __init__(self):
+            self.n = 0
+
+        def settimeout(self, t):
+            pass
+
+        def send(self, d):
+            self.last = d
+
+        def recv(self, n):
+            self.n += 1
+            if self.n == 1:
+                return bytes([0x75, 0x20, 0x00, 0x82])      # maxblk 0x82
+            bc = (self.n - 1) & 0xFF
+            return bytes([0x76, bc]) + bytes([bc]) * 128     # 128 payload B
+    eu = _vbf.Ecu("can0", 0x730, 0x738, execute=False)
+    eu.execute = True
+    # the 37 exit answers 77 at the end
+    class _UpSock2(_UpSock):
+        def recv(self, n):
+            self.n += 1
+            if self.n == 1:
+                return bytes([0x75, 0x20, 0x00, 0x82])
+            if self.n <= 9:                                  # 8 data frames
+                bc = (self.n - 1) & 0xFF
+                return bytes([0x76, bc]) + bytes([bc]) * 128
+            return bytes([0x77, 0x0A, 0xD2])                 # 37 exit
+    eu.s = _UpSock2()
+    got = _vbf.upload_block(eu, 0x02000000, 0x400, progress_interval=999)
+    chk("upload_block returns 1024 bytes", len(got) == 1024, str(len(got)))
+    chk("upload_block first block byte == 1", got[0] == 1, str(got[0]))
+
+    # download_raw_block: 74 declares 0x82, then N x 76, then 77.
+    class _DlSock:
+        def __init__(self):
+            self.n = 0
+            self.frames = []
+
+        def settimeout(self, t):
+            pass
+
+        def send(self, d):
+            self.frames.append(d)
+
+        def recv(self, n):
+            self.n += 1
+            if self.n == 1:
+                return bytes([0x74, 0x20, 0x00, 0x82])
+            if self.n <= 9:
+                return bytes([0x76, (self.n - 1) & 0xFF])
+            return bytes([0x77, 0x2B, 0xF8])
+    ed2 = _vbf.Ecu("can0", 0x730, 0x738, execute=False)
+    ed2.execute = True
+    ed2.s = _DlSock()
+    _vbf.download_raw_block(ed2, 0x02000000, bytes(range(256)) * 4,
+                            progress_interval=999)
+    # first sent frame is the 34 RequestDownload; count 36 data frames
+    data_frames = [f for f in ed2.s.frames if f[:1] == b"\x36"]
+    chk("download_raw_block sent 8 data frames", len(data_frames) == 8,
+        str(len(data_frames)))
+    chk("memread/memwrite wired into main dispatch",
+        "do_memread" in inspect.getsource(main)
+        and "do_memwrite" in inspect.getsource(main))
+
     # keys computed via the registry secret must equal each proven tool's key
     print("\n== registry secret -> proven per-ECU key ==")
     import importlib.util
@@ -940,8 +1347,9 @@ def selftest():
     import contextlib
     saved = sys.argv[:]
     try:
-        for cmd in ("info", "verify", "ident", "dtc", "cleardtc", "reset",
-                    "flash", "list"):
+        for cmd in ("info", "verify", "ident", "readdid", "writedid", "dtc",
+                    "cleardtc", "reset", "memread", "memwrite", "flash",
+                    "list"):
             sys.argv = ["x", cmd, "--help"]
             buf = io.StringIO()
             try:
@@ -1000,6 +1408,34 @@ def build_parser():
 
     add_ecu_diag_parser("ident", "read a live ECU's identity DIDs")
 
+    s = add_ecu_diag_parser("readdid",
+                            "read arbitrary DID(s) (22), print hex + ascii")
+    s.add_argument("did", nargs="+", metavar="DID",
+                   help="2-byte DID(s) in hex, e.g. F190 0xF111 F18C")
+    s.add_argument("--timeout", type=float, default=5.0,
+                   help="per-DID response timeout in seconds (default 5)")
+
+    s = add_ecu_diag_parser("writedid",
+                            "write a DID (2E) with hex data")
+    s.add_argument("did", metavar="DID", help="2-byte DID in hex, e.g. F190")
+    s.add_argument("data", metavar="HEX",
+                   help="data as hex bytes, e.g. 574630414258... (spaces ok)")
+    s.add_argument("--session", type=lambda x: int(x, 0), default=None,
+                   help="enter diagnosticSession first (e.g. 0x03 extended, "
+                        "0x02 programming) — some DIDs need it")
+    s.add_argument("--unlock", action="store_true",
+                   help="SecurityAccess unlock before writing (some DIDs need it)")
+    s.add_argument("--secret", type=lambda x: int(x, 0), default=None,
+                   help="override the seed-key secret for --unlock")
+    s.add_argument("--sec-level", type=lambda x: int(x, 0), default=1,
+                   help="SecurityAccess request level for --unlock (default 1)")
+    s.add_argument("--hw", default=None,
+                   help="assume this F111 for secret selection under --unlock")
+    s.add_argument("--timeout", type=float, default=5.0,
+                   help="response timeout in seconds (default 5)")
+    s.add_argument("--yes", "-y", action="store_true",
+                   help="skip the confirmation prompt")
+
     s = add_ecu_diag_parser("dtc", "read DTCs from an ECU (no VBF needed)")
     s.add_argument("--status-mask", type=lambda x: int(x, 0), default=0xFF,
                    help="DTCStatusMask for 19 02 (default 0xFF = all)")
@@ -1024,6 +1460,54 @@ def build_parser():
                    help="broadcast send count for the ALL/7DF target (default 5)")
     s.add_argument("--yes", "-y", action="store_true",
                    help="skip the confirmation prompt")
+
+    def add_sbl_flags(sp):
+        """SBL/session flags shared by memread / memwrite."""
+        sp.add_argument("ecu", metavar="ECU",
+                        help="ECU by name (PSCM, BCM, ...) or CAN id (730)")
+        sp.add_argument("--addr", type=lambda x: int(x, 0), required=True,
+                        help="start address, e.g. 0x02000000")
+        sp.add_argument("--iface", default="can0")
+        sp.add_argument("--rxid", type=lambda x: int(x, 0), default=None)
+        sp.add_argument("--sbl", default=None,
+                        help="explicit SBL VBF path (else auto from F111)")
+        sp.add_argument("--sbl-dir", action="append", default=[])
+        sp.add_argument("--secret", type=lambda x: int(x, 0), default=None)
+        sp.add_argument("--sec-level", type=lambda x: int(x, 0), default=1)
+        sp.add_argument("--hw", default=None,
+                        help="assume this F111 (skip the live read)")
+        sp.add_argument("--addr-len-fmt", type=lambda x: int(x, 0), default=0x44,
+                        help="addressAndLengthFormatId (default 0x44 = 4+4)")
+        sp.add_argument("--quiet-bus", action="store_true")
+        sp.add_argument("--wake-tries", type=int, default=8)
+        sp.add_argument("--wake-timeout", type=float, default=0.5)
+        sp.add_argument("--tp-interval", type=float, default=TP_INTERVAL)
+        sp.add_argument("--progress-interval", type=float, default=2.0)
+        sp.add_argument("--erase-timeout", type=float, default=60.0)
+        sp.add_argument("--yes", "-y", action="store_true",
+                        help="skip the confirmation prompt")
+        sp.add_argument("--logfile",
+                        default=os.path.join(HERE, "logs", "vbflasher.log"))
+        return sp
+
+    s = add_sbl_flags(sub.add_parser(
+        "memread", help="read a raw memory/EEPROM region to a file (via SBL)"))
+    s.add_argument("--length", type=lambda x: int(x, 0), required=True,
+                   help="number of bytes to read, e.g. 0x400")
+    s.add_argument("-o", "--outfile", required=True, help="output binary file")
+    s.add_argument("--no-reset", action="store_true",
+                   help="do not ECUReset after the read")
+
+    s = add_sbl_flags(sub.add_parser(
+        "memwrite",
+        help="write a raw binary file to a memory/EEPROM region (via SBL)"))
+    s.add_argument("-i", "--infile", required=True, help="input binary file")
+    s.add_argument("--length", type=lambda x: int(x, 0), default=None,
+                   help="assert the file is exactly this many bytes")
+    s.add_argument("--no-erase", action="store_true",
+                   help="skip the 31 01 FF00 erase before writing")
+    s.add_argument("--no-verify", action="store_true",
+                   help="skip the 31 01 0304 verify routine after writing")
 
     s = sub.add_parser("flash", help="flash one or more VBF files")
     s.add_argument("vbf", nargs="+", metavar="FILE",
@@ -1090,7 +1574,9 @@ def main():
         # opts out entirely (opens no socket, transmits nothing).
         args.execute = not args.dry_run
     return {"info": do_info, "verify": do_verify, "ident": do_ident,
+            "readdid": do_readdid, "writedid": do_writedid,
             "dtc": do_dtc, "cleardtc": do_cleardtc, "reset": do_reset,
+            "memread": do_memread, "memwrite": do_memwrite,
             "flash": do_flash, "list": do_list}[args.cmd](args)
 
 

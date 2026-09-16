@@ -29,6 +29,10 @@ python3 vbflasher.py info   FILE.vbf [...]           # header + block table + in
 python3 vbflasher.py verify FILE.vbf [...]           # CRC check only
 python3 vbflasher.py ident  BCM                      # read a live module's IDs (name or id)
 python3 vbflasher.py ident  ALL                      # iterate every module, print each ident
+python3 vbflasher.py readdid BCM F190                # read one DID (hex + sanitized ascii)
+python3 vbflasher.py readdid PCM F111 F18C DE00      # several DIDs; binary-safe output
+python3 vbflasher.py writedid BCM DE01 01A0FF        # write a DID (2E) from hex (asks y/N)
+python3 vbflasher.py writedid PCM F1AB 0011 --session 0x03 --unlock  # some DIDs need session+auth
 
 # DTCs — no VBF needed; select ECU by name or CAN id
 python3 vbflasher.py dtc      BCM                     # actual faults only (default)
@@ -54,6 +58,11 @@ python3 vbflasher.py flash  APP.vbf                   # live; asks "are you sure
 python3 vbflasher.py flash  APP.vbf CAL.vbf           # several files in one session
 python3 vbflasher.py flash  APP.vbf --yes             # skip the prompt (scripting)
 python3 vbflasher.py flash  APP.vbf --test-sbl        # load+run SBL only, no erase/write
+
+# raw memory / EEPROM read & write (loads the SBL first, then 35 / 34+FF00)
+# PSCM EEPROM lives at 0x02000000, 1024 bytes (see PSCM_ucds_eeprom_procedure.md)
+python3 vbflasher.py memread  PSCM --addr 0x02000000 --length 0x400 -o pscm_eeprom.bin
+python3 vbflasher.py memwrite PSCM --addr 0x02000000 -i pscm_eeprom.bin   # erase+write+verify+reset
 ```
 
 By default you give only VBF file(s): the ECU is read from each file's
@@ -83,6 +92,34 @@ planning), `--test-sbl`, `--quiet-bus`, `--force`, `--rxid`, `--erase-timeout`,
 5. On `y`: `10 02` → `27 01/02` (seed-key) → download+start SBL → per region
    `31 01 FF00` erase → `34/36/37` download → optional `31 01 0304` finalise →
    `11 01` reset. `--test-sbl` stops right after the SBL starts.
+
+## Raw memory / EEPROM read & write
+
+`memread` / `memwrite` reuse the exact proven preamble (session → security →
+SBL load+start) and then operate on an **arbitrary address range** instead of a
+VBF's block table — the same UDS services the OEM UCDS tool used to read/write
+the PSCM EEPROM (reconstructed in
+`PSCM/Research/PSCM_ucds_eeprom_procedure.md`):
+
+* **memread** = `35 RequestUpload <addr><len>` → `36` (read) × N → `37`, then
+  saves the bytes to a file and prints their SHA-256. Non-destructive; ECUReset
+  afterwards unless `--no-reset`.
+* **memwrite** = `31 01 FF00` erase → `34 RequestDownload` → `36` × N → `37` →
+  `31 01 0304` verify → `11 01` reset. Skips can be toggled with `--no-erase` /
+  `--no-verify`. Prompts `y/N` (bypass `--yes`).
+
+The ECU declares its own `maxNumberOfBlockLength` in the `0x75`/`0x74` response,
+so the chunk size is never hardcoded. Select the ECU by name or CAN id; the SBL
+and secret come from F111 exactly as `flash` does (`--sbl`/`--secret`/`--hw`
+override). `--addr-len-fmt` (default `0x44` = 4-byte addr + 4-byte len) covers
+the addressAndLengthFormatId if a module needs a different one.
+
+```bash
+# back up then restore the PSCM EEPROM (0x02000000, 1024 bytes)
+python3 vbflasher.py memread  PSCM --addr 0x02000000 --length 0x400 -o pscm_eeprom.bin
+python3 vbflasher.py memwrite PSCM --addr 0x02000000 -i pscm_eeprom.bin
+```
+
 
 Safety: a plan is always printed and gated behind a `y/N` prompt (`--dry-run`
 opts out and opens no socket; `--yes` skips the prompt for scripting); DLC=8

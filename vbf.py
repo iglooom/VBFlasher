@@ -553,3 +553,110 @@ def download_blocks(ecu, blocks, tag, progress_interval=2.0):
         if ecu.execute:
             print()
         ecu.expect("37", 0x77, f"{tag} blk{bi} 37 TransferExit", timeout=15.0)
+
+
+# --------------------------------------------------------------------------
+# generic raw memory read / write (used by the memread / memwrite commands).
+# The SBL must already be loaded and running; these are the exact services the
+# UCDS PSCM EEPROM capture used: 35 RequestUpload and 34/FF00/0304 for write.
+# --------------------------------------------------------------------------
+def upload_block(ecu, addr, length, addr_len_fmt=0x44, progress_interval=2.0,
+                 tag="read"):
+    """35 RequestUpload -> 36 TransferData(read) x N -> 37 TransferExit.
+
+    Returns the uploaded bytes. The ECU declares maxNumberOfBlockLength in its
+    0x75 response; each 0x36 reply carries SID+bc then <chunk> payload bytes.
+    """
+    rq = ("35%02X" % addr_len_fmt + struct.pack(">I", addr).hex()
+          + struct.pack(">I", length).hex())
+    r = ecu.expect(rq, 0x75, f"{tag} 35 RequestUpload @0x{addr:08X}",
+                   timeout=10.0)
+    chunk = 0x80
+    if ecu.execute and r is not None and len(r) >= 3:
+        if r[1] == 0x20 and len(r) >= 4:
+            chunk = ((r[2] << 8) | r[3]) - 2
+        elif r[1] == 0x10:
+            chunk = r[2] - 2
+        if chunk <= 0:
+            raise SystemExit(f"nonsensical maxNumberOfBlockLength {r.hex()}")
+        print(f"      ECU declares {chunk + 2} -> {chunk} payload B/transfer")
+    out = bytearray()
+    bc = 1
+    t0 = t_last = time.time()
+    while len(out) < length:
+        rr = ecu.req("36%02X" % (bc & 0xFF), timeout=10.0)
+        if rr is None or rr[0] != 0x76:
+            raise SystemExit(f"{tag} TransferData(read) bc={bc}: {fmt(rr)}")
+        # 76 <bc> <payload...>
+        out += rr[2:]
+        bc = (bc + 1) & 0xFF
+        now = time.time()
+        if ecu.execute and (now - t_last >= progress_interval
+                            or len(out) >= length):
+            t_last = now
+            el = now - t0
+            pct = 100.0 * len(out) / length if length else 100.0
+            print("\r      %s %5.1f%%  %s/%s  %.1f KiB/s   "
+                  % (tag, pct, human(min(len(out), length)), human(length),
+                     (len(out) / el / 1024) if el else 0), end="", flush=True)
+    if ecu.execute:
+        print()
+    ecu.expect("37", 0x77, f"{tag} 37 TransferExit", timeout=15.0)
+    return bytes(out[:length])
+
+
+def download_raw_block(ecu, addr, data, addr_len_fmt=0x44,
+                       progress_interval=2.0, tag="write"):
+    """34 RequestDownload -> 36 TransferData x N -> 37 TransferExit for a raw
+    (addr, bytes) region. Mirrors download_blocks but for a single arbitrary
+    memory block rather than a VBF block table."""
+    length = len(data)
+    rq = ("34%02X" % addr_len_fmt + struct.pack(">I", addr).hex()
+          + struct.pack(">I", length).hex())
+    r = ecu.expect(rq, 0x74, f"{tag} 34 RequestDownload @0x{addr:08X}",
+                   timeout=10.0)
+    chunk = 0x80
+    if ecu.execute and r is not None and len(r) >= 3:
+        if r[1] == 0x20 and len(r) >= 4:
+            chunk = ((r[2] << 8) | r[3]) - 2
+        elif r[1] == 0x10:
+            chunk = r[2] - 2
+        if chunk <= 0:
+            raise SystemExit(f"nonsensical maxNumberOfBlockLength {r.hex()}")
+        print(f"      ECU declares {chunk + 2} -> {chunk} payload B/transfer")
+    bc, off = 1, 0
+    t0 = t_last = time.time()
+    while off < length:
+        piece = data[off:off + chunk]
+        if ecu.execute:
+            rr = ecu.req((bytes([0x36, bc & 0xFF]) + piece).hex(), timeout=10.0)
+            if rr is None or rr[0] != 0x76:
+                raise SystemExit(f"{tag} TransferData bc={bc}: {fmt(rr)}")
+        off += len(piece)
+        bc = (bc + 1) & 0xFF
+        now = time.time()
+        if ecu.execute and (now - t_last >= progress_interval or off >= length):
+            t_last = now
+            el = now - t0
+            pct = 100.0 * off / length if length else 100.0
+            print("\r      %s %5.1f%%  %s/%s  %.1f KiB/s   "
+                  % (tag, pct, human(off), human(length),
+                     (off / el / 1024) if el else 0), end="", flush=True)
+    if ecu.execute:
+        print()
+    ecu.expect("37", 0x77, f"{tag} 37 TransferExit", timeout=15.0,
+               pending_timeout=30.0)
+
+
+def erase_region(ecu, addr, length, erase_timeout=60.0, tag="erase"):
+    """31 01 FF00 <addr><len> eraseMemory (Ford standard routine FF00)."""
+    ecu.expect("3101FF00" + struct.pack(">I", addr).hex()
+               + struct.pack(">I", length).hex(), 0x71,
+               f"{tag} 31 01 FF00 @0x{addr:08X}", timeout=15.0,
+               pending_timeout=erase_timeout)
+
+
+def verify_routine(ecu, erase_timeout=60.0):
+    """31 01 0304 checkMemory / finalise routine."""
+    ecu.expect("31010304", 0x71, "31 01 0304 checkMemory", timeout=15.0,
+               pending_timeout=erase_timeout)
