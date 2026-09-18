@@ -20,54 +20,107 @@ The seed→key algorithm is identical across every Ford ECU here; only the 5-byt
 registry secrets are byte-identical to those from the proven BCM/PSCM/IPMA
 tools (`vbflasher.py --selftest` asserts it).
 
+## Install (user-level CLI)
+
+Symlink the script onto your `PATH` so it runs as `vbflasher` from anywhere:
+
+```bash
+chmod +x vbflasher.py
+mkdir -p ~/.local/bin
+ln -sf "$PWD/vbflasher.py" ~/.local/bin/vbflasher   # ensure ~/.local/bin is on PATH
+vbflasher --selftest
+```
+
+The script resolves its own real path (`realpath`), so the symlink still finds
+its sibling modules (`ecu_db.py`, `vbf.py`) and the `sbl/` folder. It needs only
+Python 3 stdlib. Everywhere below, `python3 vbflasher.py` and `vbflasher` are
+interchangeable.
+
+### Tab completion (bash / zsh)
+
+Completion is generated **from the live parser + ECU registry**, so it never
+drifts from the real subcommands, flags, or ECU names. Install it once:
+
+```bash
+vbflasher completion bash --install      # -> ~/.local/share/bash-completion/completions/vbflasher
+# or
+vbflasher completion zsh  --install      # -> ~/.zsh/completions/vbflasher.zsh
+```
+
+Then activate it. For **bash**, open a new shell (needs the `bash-completion`
+package). For **zsh**, add ONE `source` line to the *end* of `~/.zshrc`, after
+your existing `compinit`:
+
+```zsh
+source ~/.zsh/completions/vbflasher.zsh
+```
+
+The zsh script registers itself with `compdef`, so sourcing it needs **no extra
+`compinit` and no `~/.zcompdump` rebuild** — it does not slow shell startup.
+(Do *not* add the dir to `fpath` and re-run `compinit`; that re-audits every
+completion dir on every new shell and is the usual cause of slow zsh startup.)
+You get:
+
+```
+vbflasher si<TAB>            -> silence
+vbflasher silence <TAB>      -> BCM PCM PSCM ABS ... ALL 7DF   (from the registry)
+vbflasher dtc B<TAB>         -> BCM
+vbflasher flash <TAB>        -> *.vbf files
+vbflasher flash --<TAB>      -> every flash flag
+```
+
+To just print the script (e.g. to a system-wide dir), drop `--install`:
+`vbflasher completion bash > /etc/bash_completion.d/vbflasher`. **Regenerate**
+after adding a subcommand, flag, or ECU by re-running the same command.
+
 ## Usage
 
 ```bash
-python3 vbflasher.py --selftest                      # offline self-tests
-python3 vbflasher.py list                            # registered ECUs
-python3 vbflasher.py info   FILE.vbf [...]           # header + block table + integrity
-python3 vbflasher.py verify FILE.vbf [...]           # CRC check only
-python3 vbflasher.py ident  BCM                      # read a live module's IDs (name or id)
-python3 vbflasher.py ident  ALL                      # iterate every module, print each ident
-python3 vbflasher.py readdid BCM F190                # read one DID (hex + sanitized ascii)
-python3 vbflasher.py readdid PCM F111 F18C DE00      # several DIDs; binary-safe output
-python3 vbflasher.py writedid BCM DE01 01A0FF        # write a DID (2E) from hex (asks y/N)
-python3 vbflasher.py writedid PCM F1AB 0011 --session 0x03 --unlock  # some DIDs need session+auth
+vbflasher --selftest                      # offline self-tests
+vbflasher list                            # registered ECUs
+vbflasher info   FILE.vbf [...]           # header + block table + integrity
+vbflasher verify FILE.vbf [...]           # CRC check only
+vbflasher ident  BCM                      # read a live module's IDs (name or id)
+vbflasher ident  ALL                      # iterate every module, print each ident
+vbflasher readdid BCM F190                # read one DID (hex + sanitized ascii)
+vbflasher readdid PCM F111 F18C DE00      # several DIDs; binary-safe output
+vbflasher writedid BCM DE01 01A0FF        # write a DID (2E) from hex (asks y/N)
+vbflasher writedid PCM F1AB 0011 --session 0x03 --unlock  # some DIDs need session+auth
 
 # DTCs — no VBF needed; select ECU by name or CAN id
-python3 vbflasher.py dtc      BCM                     # actual faults only (default)
-python3 vbflasher.py dtc      ALL                     # per-module actual-DTC count overview
-python3 vbflasher.py dtc      BCM --all               # include 'not completed' entries
-python3 vbflasher.py dtc      7E0                     # by CAN id (PCM)
-python3 vbflasher.py dtc      PCM --status-mask 0x08  # only confirmed DTCs
-python3 vbflasher.py cleardtc BCM                     # clear one module (asks y/N)
-python3 vbflasher.py cleardtc 0x730 --yes             # clear, no prompt
+vbflasher dtc      BCM                     # actual faults only (default)
+vbflasher dtc      ALL                     # per-module actual-DTC count overview
+vbflasher dtc      BCM --all               # include 'not completed' entries
+vbflasher dtc      7E0                     # by CAN id (PCM)
+vbflasher dtc      PCM --status-mask 0x08  # only confirmed DTCs
+vbflasher cleardtc BCM                     # clear one module (asks y/N)
+vbflasher cleardtc 0x730 --yes             # clear, no prompt
 
 # reset a module (11 01 hardReset by default)
-python3 vbflasher.py reset    BCM                     # hard reset one module
-python3 vbflasher.py reset    PCM --mode 0x03         # soft reset
+vbflasher reset    BCM                     # hard reset one module
+vbflasher reset    PCM --mode 0x03         # soft reset
 
 # silence a module (hold in programmingSession so it stops transmitting)
-python3 vbflasher.py silence  BCM                     # quiet one module until Ctrl-C
-python3 vbflasher.py silence  PCM --duration 30       # quiet for 30 s then restore
-python3 vbflasher.py silence  ALL                     # quiet every module (functional 0x7DF)
+vbflasher silence  BCM                     # quiet one module until Ctrl-C
+vbflasher silence  PCM --duration 30       # quiet for 30 s then restore
+vbflasher silence  ALL                     # quiet every module (functional 0x7DF)
 
 # ALL modules at once, via functional 0x7DF broadcast (unconfirmed)
-python3 vbflasher.py cleardtc ALL --yes               # clear DTCs on every module
-python3 vbflasher.py reset    ALL --yes               # reboot every module
-python3 vbflasher.py reset    7DF --yes               # same (id form of ALL)
+vbflasher cleardtc ALL --yes               # clear DTCs on every module
+vbflasher reset    ALL --yes               # reboot every module
+vbflasher reset    7DF --yes               # same (id form of ALL)
 
 # dry run prints the full plan and connects to nothing
-python3 vbflasher.py flash  APP.vbf --dry-run
-python3 vbflasher.py flash  APP.vbf                   # live; asks "are you sure? [y/N]"
-python3 vbflasher.py flash  APP.vbf CAL.vbf           # several files in one session
-python3 vbflasher.py flash  APP.vbf --yes             # skip the prompt (scripting)
-python3 vbflasher.py flash  APP.vbf --test-sbl        # load+run SBL only, no erase/write
+vbflasher flash  APP.vbf --dry-run
+vbflasher flash  APP.vbf                   # live; asks "are you sure? [y/N]"
+vbflasher flash  APP.vbf CAL.vbf           # several files in one session
+vbflasher flash  APP.vbf --yes             # skip the prompt (scripting)
+vbflasher flash  APP.vbf --test-sbl        # load+run SBL only, no erase/write
 
 # raw memory / EEPROM read & write (loads the SBL first, then 35 / 34+FF00)
 # PSCM EEPROM lives at 0x02000000, 1024 bytes (see PSCM_ucds_eeprom_procedure.md)
-python3 vbflasher.py memread  PSCM --addr 0x02000000 --length 0x400 -o pscm_eeprom.bin
-python3 vbflasher.py memwrite PSCM --addr 0x02000000 -i pscm_eeprom.bin   # erase+write+verify+reset
+vbflasher memread  PSCM --addr 0x02000000 --length 0x400 -o pscm_eeprom.bin
+vbflasher memwrite PSCM --addr 0x02000000 -i pscm_eeprom.bin   # erase+write+verify+reset
 ```
 
 By default you give only VBF file(s): the ECU is read from each file's
@@ -121,8 +174,8 @@ the addressAndLengthFormatId if a module needs a different one.
 
 ```bash
 # back up then restore the PSCM EEPROM (0x02000000, 1024 bytes)
-python3 vbflasher.py memread  PSCM --addr 0x02000000 --length 0x400 -o pscm_eeprom.bin
-python3 vbflasher.py memwrite PSCM --addr 0x02000000 -i pscm_eeprom.bin
+vbflasher memread  PSCM --addr 0x02000000 --length 0x400 -o pscm_eeprom.bin
+vbflasher memwrite PSCM --addr 0x02000000 -i pscm_eeprom.bin
 ```
 
 
