@@ -47,6 +47,11 @@ python3 vbflasher.py cleardtc 0x730 --yes             # clear, no prompt
 python3 vbflasher.py reset    BCM                     # hard reset one module
 python3 vbflasher.py reset    PCM --mode 0x03         # soft reset
 
+# silence a module (hold in programmingSession so it stops transmitting)
+python3 vbflasher.py silence  BCM                     # quiet one module until Ctrl-C
+python3 vbflasher.py silence  PCM --duration 30       # quiet for 30 s then restore
+python3 vbflasher.py silence  ALL                     # quiet every module (functional 0x7DF)
+
 # ALL modules at once, via functional 0x7DF broadcast (unconfirmed)
 python3 vbflasher.py cleardtc ALL --yes               # clear DTCs on every module
 python3 vbflasher.py reset    ALL --yes               # reboot every module

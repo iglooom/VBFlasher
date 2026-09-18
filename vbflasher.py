@@ -1018,6 +1018,99 @@ def _reset_all(args):
 
 
 
+def do_silence(args):
+    """Silence a module (or ALL via 7DF) by holding it in programmingSession,
+    exactly like flash's --quiet-bus but as a standalone, persistent action.
+
+    A module in programmingSession stops emitting its normal application
+    frames; a periodic TesterPresent keeps its S3 timer alive so it stays
+    quiet. On exit (Ctrl-C or --duration elapsed) an ECUReset returns it to
+    normal. Watch the bus with candump for proof — functional responses are
+    suppressed, so the quiet itself is unconfirmed.
+    """
+    _check_iface(args.iface)
+    period = args.tp_interval if args.tp_interval > 0 else 2.0
+    ecu = None
+
+    if _selector_is_all(args.ecu):
+        # ALL: functional broadcast, reuse the vehicle-proven BusQuiet machinery
+        quiet = BusQuiet(args.iface, FUNCTIONAL_ID, execute=True, enabled=True)
+        ka = Keepalive(_KaShim(args.iface), period=period, can_id=FUNCTIONAL_ID)
+        print(f"== silence ALL modules  (functional 0x{FUNCTIONAL_ID:03X}, "
+              f"iface {args.iface}) ==")
+        print("   NOTE: functional broadcast, responses suppressed — quiet is "
+              "UNCONFIRMED. Watch with candump.")
+        target = "ALL modules"
+        restore_txt = f"functional 0x{FUNCTIONAL_ID:03X} hardReset"
+    else:
+        profile = ecu_db.resolve(args.ecu)
+        if profile is None:
+            raise SystemExit(f"unknown ECU {args.ecu!r}. Use a name, CAN id, "
+                             "or ALL. See `list`.")
+        rxid = args.rxid if args.rxid is not None else profile.resp_id()
+        ecu = Ecu(args.iface, profile.txid, rxid, execute=True)
+        print(f"== silence {profile.name}  tx=0x{profile.txid:03X} "
+              f"rx=0x{ecu.rxid:03X}  iface {args.iface} ==")
+        ecu.wake(tries=getattr(args, "wake_tries", 8),
+                 timeout=getattr(args, "wake_timeout", 0.5))
+        r = None
+        for i in range(1, args.wake_tries + 1):
+            r = ecu.req("1002", timeout=1.0,
+                        what=f"10 02 programmingSession {i}")
+            if r is not None and r[0] == 0x50:
+                break
+            time.sleep(0.1)
+        if not (r is not None and r[0] == 0x50):
+            raise SystemExit(f"10 02 programmingSession: {fmt(r)}")
+        print(f"   OK   10 02 programmingSession   {fmt(r)}  -> module silent")
+        quiet = None
+        ka = Keepalive(ecu, period=period, can_id=None)  # physical keepalive
+        target = profile.name
+        restore_txt = "11 01 ECUReset"
+
+    if args.duration:
+        print(f"   holding {target} silent for {args.duration:.0f}s "
+              f"(TesterPresent every {period:.1f}s)...")
+    else:
+        print(f"   holding {target} silent (TesterPresent every {period:.1f}s)."
+              "  Press Ctrl-C to stop and restore.")
+
+    try:
+        if quiet is not None:
+            quiet.arm()
+        ka.start()
+        t0 = time.time()
+        while True:
+            time.sleep(0.25)
+            if args.duration and (time.time() - t0) >= args.duration:
+                print(f"\n   {args.duration:.0f}s elapsed.")
+                break
+    except KeyboardInterrupt:
+        print("\n   interrupted.")
+    finally:
+        ka.stop()
+        if ka.sent:
+            print(f"   keepalive: {ka.sent} TesterPresent frames sent")
+        print(f"   restoring ({restore_txt})...")
+        if quiet is not None:
+            quiet.restore()
+        elif ecu is not None:
+            try:
+                ecu.req("1101", timeout=8.0, what="11 01 ECUReset")
+            except Exception:  # noqa: BLE001
+                pass
+    print("   done — module(s) returned to normal operation.")
+
+
+class _KaShim:
+    """Minimal Ecu-like object so Keepalive can broadcast on a raw socket for
+    the ALL/silence path without a bound ISO-TP channel."""
+    def __init__(self, iface):
+        self.iface = iface
+        self.execute = True
+        self.s = None
+
+
 def do_list(args):
     print("Registered ECUs (edit ecu_db.py to add more):\n")
     for txid, p in sorted(ecu_db.ECUS.items()):
@@ -1169,6 +1262,12 @@ def selftest():
     chk("writedid builds a 2E request",
         "2E" in inspect.getsource(do_writedid)
         and "6E" in inspect.getsource(do_writedid))
+    chk("silence wired into main dispatch",
+        "do_silence" in inspect.getsource(main))
+    chk("silence uses 10 02 (single) or BusQuiet (ALL) + keepalive",
+        "1002" in inspect.getsource(do_silence)
+        and "BusQuiet" in inspect.getsource(do_silence)
+        and "Keepalive" in inspect.getsource(do_silence))
 
     print("\n== memread / memwrite primitives ==")
     # upload_block: 75 declares 0x82 (128 payload), then 8 x 76-frames of 128 B,
@@ -1348,8 +1447,8 @@ def selftest():
     saved = sys.argv[:]
     try:
         for cmd in ("info", "verify", "ident", "readdid", "writedid", "dtc",
-                    "cleardtc", "reset", "memread", "memwrite", "flash",
-                    "list"):
+                    "cleardtc", "reset", "silence", "memread", "memwrite",
+                    "flash", "list"):
             sys.argv = ["x", cmd, "--help"]
             buf = io.StringIO()
             try:
@@ -1460,6 +1559,17 @@ def build_parser():
                    help="broadcast send count for the ALL/7DF target (default 5)")
     s.add_argument("--yes", "-y", action="store_true",
                    help="skip the confirmation prompt")
+
+    s = add_ecu_diag_parser(
+        "silence",
+        "hold a module (or ALL/7DF) in programmingSession so it stops "
+        "transmitting; restore on exit")
+    s.add_argument("--tp-interval", type=float, default=TP_INTERVAL,
+                   help=f"TesterPresent period in seconds (default "
+                        f"{TP_INTERVAL}; keeps the module silent)")
+    s.add_argument("--duration", type=float, default=None,
+                   help="silence for N seconds then restore (default: until "
+                        "Ctrl-C)")
 
     def add_sbl_flags(sp):
         """SBL/session flags shared by memread / memwrite."""
@@ -1576,6 +1686,7 @@ def main():
     return {"info": do_info, "verify": do_verify, "ident": do_ident,
             "readdid": do_readdid, "writedid": do_writedid,
             "dtc": do_dtc, "cleardtc": do_cleardtc, "reset": do_reset,
+            "silence": do_silence,
             "memread": do_memread, "memwrite": do_memwrite,
             "flash": do_flash, "list": do_list}[args.cmd](args)
 
