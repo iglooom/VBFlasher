@@ -166,7 +166,13 @@ ECUS = {
         ident_dids=("F113", "F188", "F111", "F18C", "F190"),
         secrets=(SecretRule("", None, "00009875CA"),),
         default_sbl="CV4T-14F399-AF.VBF",
-        sbl_call_halfword=True,     # ground truth: 31 01 0301 <high 16 bits>
+        # GROUND TRUTH (candump-stock-flash.log, UCDS): the SBL is started with
+        # the FULL 4-byte call address. The multi-frame request reassembles to
+        #   706#1008310103010082 + 706#2100...  ->  31 01 0301 00 82 00 00
+        # i.e. 31 01 0301 + 0x00820000. An earlier reading took only the ISO-TP
+        # FirstFrame (…0301 0082) and wrongly concluded a 2-byte (high-half)
+        # argument; that truncated address earns NRC 22 conditionsNotCorrect.
+        sbl_call_halfword=False,
         finalize=True,
     ),
     0x737: EcuProfile(

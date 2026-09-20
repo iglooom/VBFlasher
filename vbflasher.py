@@ -1367,7 +1367,10 @@ def selftest():
     ipma = ecu_db.get_profile(0x706)
     chk("IPMA secret == 00009875CA",
         ipma.pick_secret("anything", 1) == bytes.fromhex("00009875CA"))
-    chk("IPMA uses halfword SBL call", ipma.sbl_call_halfword)
+    # GROUND TRUTH candump-stock-flash.log: 706#1008310103010082 + 21 00 00
+    # reassembles to 31 01 0301 00 82 00 00 -> FULL 4-byte call address, NOT
+    # the high-half (a FirstFrame-only misread earned NRC 22 at SBL-start).
+    chk("IPMA uses FULL 4-byte SBL call address", not ipma.sbl_call_halfword)
     chk("IPMA default SBL", ipma.pick_sbl("x") == "CV4T-14F399-AF.VBF")
 
     print("\n== ECU selection by name / id ==")

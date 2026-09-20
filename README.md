@@ -200,7 +200,7 @@ Append one `EcuProfile` to `ECUS` in `ecu_db.py` — nothing else changes:
     sbls=(SblRule("HWPREFIX", "MY-SBL.vbf"),),     # by F111 prefix
     default_sbl="MY-SBL.vbf",                      # fallback
     finalize=True,          # run 31 01 0304 before reset (PCM/TCM/ABS/PSCM/IPMA)
-    sbl_call_halfword=False,# True => start SBL with high 16 bits only (IPMA)
+    sbl_call_halfword=False,# start SBL with high 16 bits only (no known ECU; default full 4-byte addr)
 )
 ```
 
