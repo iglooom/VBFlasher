@@ -567,7 +567,8 @@ def upload_block(ecu, addr, length, addr_len_fmt=0x44, progress_interval=2.0,
     Returns the uploaded bytes. The ECU declares maxNumberOfBlockLength in its
     0x75 response; each 0x36 reply carries SID+bc then <chunk> payload bytes.
     """
-    rq = ("35%02X" % addr_len_fmt + struct.pack(">I", addr).hex()
+    # 35 <dataFormatIdentifier=00> <addressAndLengthFormatIdentifier> <addr><len>
+    rq = ("3500%02X" % addr_len_fmt + struct.pack(">I", addr).hex()
           + struct.pack(">I", length).hex())
     r = ecu.expect(rq, 0x75, f"{tag} 35 RequestUpload @0x{addr:08X}",
                    timeout=10.0)
@@ -611,7 +612,8 @@ def download_raw_block(ecu, addr, data, addr_len_fmt=0x44,
     (addr, bytes) region. Mirrors download_blocks but for a single arbitrary
     memory block rather than a VBF block table."""
     length = len(data)
-    rq = ("34%02X" % addr_len_fmt + struct.pack(">I", addr).hex()
+    # 34 <dataFormatIdentifier=00> <addressAndLengthFormatIdentifier> <addr><len>
+    rq = ("3400%02X" % addr_len_fmt + struct.pack(">I", addr).hex()
           + struct.pack(">I", length).hex())
     r = ecu.expect(rq, 0x74, f"{tag} 34 RequestDownload @0x{addr:08X}",
                    timeout=10.0)
