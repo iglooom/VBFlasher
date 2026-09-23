@@ -243,15 +243,23 @@ def flash_session(txid, files, args):
         for v in to_flash:
             print(f"\n   FLASH  {os.path.basename(v.path)}  "
                   f"[{v.ptype}]  part {v.part}")
-            if v.erase:
-                print(f"      ERASE {len(v.erase)} region(s):")
-                for a, l in v.erase:
+            erase = v.flash_erase()
+            omitted = [r for r in v.erase if r not in erase]
+            if erase:
+                print(f"      ERASE {len(erase)} region(s):")
+                for a, l in erase:
                     print(f"         0x{a:08X}  len 0x{l:06X} ({human(l)})")
             else:
                 print("      ERASE (none declared)")
-            print(f"      WRITE {len(v.blocks)} block(s), "
-                  f"{human(v.total_payload())}:")
-            for b in v.blocks:
+            if omitted:
+                print(f"      OMIT  {len(omitted)} protected region(s) "
+                      f"(not erased/written):")
+                for a, l in omitted:
+                    print(f"         0x{a:08X}  len 0x{l:06X} ({human(l)})")
+            wblocks = v.flash_blocks()
+            wpayload = sum(b["length"] for b in wblocks)
+            print(f"      WRITE {len(wblocks)} block(s), {human(wpayload)}:")
+            for b in wblocks:
                 print(f"         -> 0x{b['start']:08X}  {human(b['length'])}")
             gate = profile.ident_did_by_type.get(v.ptype, "F188")
             if v.ptype == "EXE":
@@ -367,16 +375,19 @@ def flash_session(txid, files, args):
                   "application is untouched.)")
         else:
             for v in to_flash:
+                erase = v.flash_erase()
+                skipped = len(v.erase) - len(erase)
                 print(f"\n== erase for {os.path.basename(v.path)} "
-                      f"({len(v.erase)} region) ==")
+                      f"({len(erase)} region"
+                      + (f", {skipped} omitted" if skipped else "") + ") ==")
                 import struct as _s
-                for a, l in v.erase:
+                for a, l in erase:
                     ecu.expect("3101FF00" + _s.pack(">I", a).hex()
                                + _s.pack(">I", l).hex(), 0x71,
                                f"erase 0x{a:08X}", timeout=15.0,
                                pending_timeout=args.erase_timeout)
                 print(f"\n== download {os.path.basename(v.path)} ==")
-                download_blocks(ecu, v.blocks, v.part or "app",
+                download_blocks(ecu, v.flash_blocks(), v.part or "app",
                                 args.progress_interval)
 
             if profile.finalize:
@@ -1675,9 +1686,16 @@ def selftest():
     chk("after 0x78 the wait extends to pending_timeout (40.0)",
         e.s.timeouts[-1] == 40.0, str(e.s.timeouts))
 
-    # read_identity must run end-to-end in EXECUTE mode (guards the flash path
-    # against undefined-name / signature regressions that dry-run never hits).
-    class _IdentSock:
+    # STALE-FRAME DRAIN: a frame that is neither the positive nor the negative
+    # response to THIS request (e.g. a duplicated 50 02 programmingSession
+    # still queued when we send 27 01) must be discarded, not returned.
+    chk("req() drains stale frames (skips non-matching SID)",
+        "stale" in inspect.getsource(_vbf.Ecu.req).lower())
+
+    class _StaleSock:
+        def __init__(self, seq):
+            self.seq, self.i = seq, 0
+
         def settimeout(self, t):
             pass
 
@@ -1685,8 +1703,69 @@ def selftest():
             pass
 
         def recv(self, n):
-            # answer every 22 <DID> with a short 62 response
-            return bytes([0x62, 0xF1, 0x11]) + b"TEST-14C245-AA"
+            v = self.seq[self.i]
+            self.i += 1
+            if isinstance(v, Exception):
+                raise v
+            return v
+    es = _vbf.Ecu("can0", 0x7E0, 0x7E8, execute=False)
+    es.execute = True
+    es.s = _StaleSock([bytes.fromhex("5002001901F4"),   # stale 10 02 echo
+                       bytes.fromhex("67011234AB")])     # real seed
+    rr = es.req("2701", timeout=1.0)
+    chk("stale 50 02 dropped, 27 01 gets the real 67 seed",
+        rr is not None and rr[0] == 0x67, rr.hex() if rr else "None")
+    # a genuine negative response to THIS request is NOT stale-dropped
+    es2 = _vbf.Ecu("can0", 0x7E0, 0x7E8, execute=False)
+    es2.execute = True
+    es2.s = _StaleSock([bytes.fromhex("7F2735")])        # NRC 35 to 27
+    rn = es2.req("2701", timeout=1.0)
+    chk("negative response (7F 27 35) is returned, not drained",
+        rn is not None and rn[0] == 0x7F and rn[1] == 0x27,
+        rn.hex() if rn else "None")
+
+    # OMIT regions (Ford PCM boot + protected block) must be excluded from
+    # both erase and download. Ground-truth: pcm_BUNEEV vendor capture.
+    print("\n== VBF omit filtering ==")
+    _pcm = "/home/gl/Projects/ford/PCM/PCM_Research/DV4A-14C204-SB.fanv2-tft.crc.VBF"
+    if os.path.exists(_pcm):
+        vp = Vbf(_pcm)
+        chk("PCM VBF declares an omit section", len(vp.omit) == 5,
+            str(len(vp.omit)))
+        fe = [a for a, _ in vp.flash_erase()]
+        chk("boot block 0x80000000 excluded from erase",
+            0x80000000 not in fe)
+        chk("protected 0x80200000 excluded from erase",
+            0x80200000 not in fe)
+        chk("flash_erase drops exactly the omitted regions",
+            len(vp.flash_erase()) == len(vp.erase) - len(vp.omit),
+            f"{len(vp.flash_erase())} of {len(vp.erase)}")
+        chk("no downloaded block overlaps an omit region",
+            all(not vp._is_omitted(b["start"], b["length"])
+                for b in vp.flash_blocks()))
+    else:
+        print(f"  SKIP  {os.path.basename(_pcm)} not present")
+
+    # read_identity must run end-to-end in EXECUTE mode (guards the flash path
+    # against undefined-name / signature regressions that dry-run never hits).
+    class _IdentSock:
+        """Models a real ECU: answers 22 <DID> reads, but the 3E 00 wake poke
+        gets no reply (times out), exactly like a quiet bus. recv() dispatches
+        on the last request so the stale-frame drain in req() has a real
+        socket.timeout to terminate on."""
+        def __init__(self):
+            self.last = b""
+
+        def settimeout(self, t):
+            pass
+
+        def send(self, d):
+            self.last = d
+
+        def recv(self, n):
+            if self.last[:1] == b"\x22":
+                return bytes([0x62, 0xF1, 0x11]) + b"TEST-14C245-AA"
+            raise _vbf.socket.timeout()     # nothing answers 3E 00 wake
 
     ei = _vbf.Ecu("can0", 0x726, 0x72E, execute=False)
     ei.execute = True

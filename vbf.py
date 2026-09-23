@@ -140,6 +140,19 @@ class Vbf:
                     re.findall(r"0x([0-9A-Fa-f]+)", m.group(1))]
             self.erase = list(zip(nums[0::2], nums[1::2]))
 
+        # `omit = { {addr,len}, ... }`: regions that must NOT be erased or
+        # written even though they appear in `erase`/the block walk. Ford uses
+        # it to protect the boot block and other reserved areas; the SBL
+        # rejects an erase of an omitted region with NRC 31 requestOutOfRange.
+        # Ground-truth: the OEM tool (pcm_BUNEEV capture) erases/downloads
+        # exactly the NON-omitted regions.
+        self.omit = []
+        m = re.search(r"omit\s*=\s*\{(.*?)\}\s*;", h, re.S)
+        if m:
+            nums = [int(x, 16) for x in
+                    re.findall(r"0x([0-9A-Fa-f]+)", m.group(1))]
+            self.omit = list(zip(nums[0::2], nums[1::2]))
+
         # block walk: the start offset whose walk consumes the file EXACTLY
         self.blocks = None
         for ds in range(he, he + 8):
@@ -179,6 +192,22 @@ class Vbf:
 
     def total_payload(self):
         return sum(b["length"] for b in self.blocks)
+
+    def _is_omitted(self, addr, length):
+        """True if [addr, addr+length) overlaps any omit region."""
+        for oa, ol in self.omit:
+            if addr < oa + ol and oa < addr + length:
+                return True
+        return False
+
+    def flash_erase(self):
+        """Erase regions actually sent to the ECU (omit regions removed)."""
+        return [(a, l) for (a, l) in self.erase if not self._is_omitted(a, l)]
+
+    def flash_blocks(self):
+        """Blocks actually downloaded to the ECU (omit regions removed)."""
+        return [b for b in self.blocks
+                if not self._is_omitted(b["start"], b["length"])]
 
     def sha256(self):
         """SHA-256 of the whole VBF file (as on disk)."""
@@ -248,6 +277,8 @@ class Ecu:
 
     def req(self, hexstr, timeout=5.0, pending_timeout=30.0, what=""):
         hexstr = hexstr.replace(" ", "").upper()
+        req_sid = int(hexstr[0:2], 16)
+        pos_sid = (req_sid + 0x40) & 0xFF
         self.sent.append(hexstr)
         self._log(f"{time.strftime('%H:%M:%S')} -> {hexstr}"
                   + (f"   ({what})" if what else ""))
@@ -281,6 +312,19 @@ class Ecu:
                 self.s.send(bytes.fromhex(hexstr))
                 self.s.settimeout(timeout)
                 continue
+            # Drain STALE frames: a frame that is neither the positive
+            # response to THIS request (pos_sid) nor a negative response to
+            # THIS request (7F <req_sid> ..) is a leftover from an earlier
+            # request the ECU answered late/twice (e.g. a duplicated 50 02
+            # programmingSession still queued when we're waiting on 27 01's
+            # seed). Returning it derails the sequence; skip and keep reading.
+            if len(r):
+                is_pos = r[0] == pos_sid
+                is_neg = r[0] == 0x7F and len(r) >= 2 and r[1] == req_sid
+                if not (is_pos or is_neg):
+                    self._log(f"{time.strftime('%H:%M:%S')} <- <stale, "
+                              f"skipped> {fmt(r)}")
+                    continue
             self._log(f"{time.strftime('%H:%M:%S')} <- {fmt(r)}")
             return r
 

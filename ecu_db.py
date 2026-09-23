@@ -215,10 +215,12 @@ ECUS = {
             SecretRule("AV61-12B684", 1, "A3B2C01492"),
             SecretRule("AV61-12B684", 3, "2431DEF946"),
             SecretRule("BV61-12B684-D", None, "083061A4C5"),
+            SecretRule("CV6A-12B684", None, "083061A4C5"),
         ),
         sbls=(
             SblRule("AV61-12B684", "AV61-14C273-AA.vbf"),
             SblRule("BV61-12B684-D", "BB5A-14C273-AA.vbf"),
+            SblRule("CV6A-12B684", "DL3A-14C273-AA.vbf"),
         ),
         finalize=True,
     ),
