@@ -777,12 +777,15 @@ def do_writedid(args):
 
     # Optional session/security preamble: some DIDs are only writable in an
     # extended/programming session after SecurityAccess. Default is a bare 2E.
+    # --sec-level/--secret/--hw imply --unlock so they aren't a silent no-op.
+    if args.sec_level is not None or args.secret is not None or args.hw:
+        args.unlock = True
     if args.session is not None:
         ecu.expect("10%02X" % args.session, 0x50,
                    "10 %02X diagnosticSession" % args.session, timeout=5.0)
         time.sleep(0.1)
     if args.unlock:
-        level = args.sec_level
+        level = args.sec_level if args.sec_level is not None else 1
         secret = (args.secret.to_bytes(5, "big")
                   if isinstance(args.secret, int) else args.secret) \
             if args.secret is not None else profile.pick_secret(args.hw or "",
@@ -1871,9 +1874,10 @@ def build_parser():
     s.add_argument("--unlock", action="store_true",
                    help="SecurityAccess unlock before writing (some DIDs need it)")
     s.add_argument("--secret", type=lambda x: int(x, 0), default=None,
-                   help="override the seed-key secret for --unlock")
-    s.add_argument("--sec-level", type=lambda x: int(x, 0), default=1,
-                   help="SecurityAccess request level for --unlock (default 1)")
+                   help="override the seed-key secret (implies --unlock)")
+    s.add_argument("--sec-level", type=lambda x: int(x, 0), default=None,
+                   help="SecurityAccess request level (implies --unlock; "
+                        "default level 1 when unlocking)")
     s.add_argument("--hw", default=None,
                    help="assume this F111 for secret selection under --unlock")
     s.add_argument("--timeout", type=float, default=5.0,
