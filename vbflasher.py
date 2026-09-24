@@ -710,11 +710,59 @@ def _hexdump(data, indent="   "):
     return "\n".join(lines)
 
 
+def _session_and_unlock(args, profile, ecu):
+    """Shared session + SecurityAccess preamble for readdid/writedid.
+
+    Enters a diagnosticSession when --session is given, then performs a
+    SecurityAccess seed/key exchange when unlocking. --sec-level/--secret/--hw
+    imply --unlock so they are never a silent no-op. Secrets are keyed by the
+    module's F111 hardware prefix (e.g. DV6T); with neither --hw nor --secret
+    we read F111 live so an empty hw doesn't match nothing.
+    """
+    if getattr(args, "sec_level", None) is not None \
+            or getattr(args, "secret", None) is not None \
+            or getattr(args, "hw", None):
+        args.unlock = True
+    if getattr(args, "session", None) is not None:
+        ecu.expect("10%02X" % args.session, 0x50,
+                   "10 %02X diagnosticSession" % args.session, timeout=5.0)
+        time.sleep(0.1)
+    if not getattr(args, "unlock", False):
+        return
+    level = args.sec_level if args.sec_level is not None else 1
+    if args.secret is not None:
+        secret = (args.secret.to_bytes(5, "big")
+                  if isinstance(args.secret, int) else args.secret)
+    else:
+        hw = args.hw or ""
+        if not hw:
+            fr = ecu.req("22F111", timeout=args.timeout, what="22 F111")
+            if fr is not None and fr and fr[0] == 0x62 and len(fr) >= 3:
+                hw = _ascii_sanitize(fr[3:]).strip()
+                print(f"   F111: {hw!r}")
+        secret = profile.pick_secret(hw, level)
+        if secret is None:
+            raise SystemExit(
+                f"--unlock: no secret for {profile.name} F111 {hw!r} "
+                f"level {level}; pass --secret 0x.... or --hw <F111>")
+    r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
+                   timeout=5.0)
+    seed = list(r[2:5])
+    if seed != [0, 0, 0]:
+        key = ford_seckey.key_from_seed(seed, secret)
+        print(f"   seed {bytes(seed).hex().upper()} -> key "
+              f"{key.hex().upper()}")
+        ecu.expect(f"27{level + 1:02X}" + key.hex(), 0x67,
+                   f"27 {level + 1:02X} sendKey", timeout=5.0)
+    print("   unlocked")
+
+
 def do_readdid(args):
     profile, ecu = _connect_by_selector(args)
     print(f"== {profile.name}  tx=0x{profile.txid:03X} rx=0x{ecu.rxid:03X} ==")
     ecu.wake(tries=getattr(args, "wake_tries", 8),
              timeout=getattr(args, "wake_timeout", 0.5))
+    _session_and_unlock(args, profile, ecu)
     for did in args.did:
         d = did.upper().replace("0X", "").replace(" ", "")
         if len(d) != 4 or any(c not in "0123456789ABCDEF" for c in d):
@@ -777,32 +825,7 @@ def do_writedid(args):
 
     # Optional session/security preamble: some DIDs are only writable in an
     # extended/programming session after SecurityAccess. Default is a bare 2E.
-    # --sec-level/--secret/--hw imply --unlock so they aren't a silent no-op.
-    if args.sec_level is not None or args.secret is not None or args.hw:
-        args.unlock = True
-    if args.session is not None:
-        ecu.expect("10%02X" % args.session, 0x50,
-                   "10 %02X diagnosticSession" % args.session, timeout=5.0)
-        time.sleep(0.1)
-    if args.unlock:
-        level = args.sec_level if args.sec_level is not None else 1
-        secret = (args.secret.to_bytes(5, "big")
-                  if isinstance(args.secret, int) else args.secret) \
-            if args.secret is not None else profile.pick_secret(args.hw or "",
-                                                                level)
-        if secret is None:
-            raise SystemExit(f"--unlock: no secret for {profile.name} level "
-                             f"{level}; pass --secret 0x....")
-        r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
-                       timeout=5.0)
-        seed = list(r[2:5])
-        if seed != [0, 0, 0]:
-            key = ford_seckey.key_from_seed(seed, secret)
-            print(f"   seed {bytes(seed).hex().upper()} -> key "
-                  f"{key.hex().upper()}")
-            ecu.expect(f"27{level + 1:02X}" + key.hex(), 0x67,
-                       f"27 {level + 1:02X} sendKey", timeout=5.0)
-        print("   unlocked")
+    _session_and_unlock(args, profile, ecu)
 
     r = ecu.req("2E" + d + data.hex(), timeout=args.timeout,
                 what="2E " + d + " writeDataByIdentifier")
@@ -1860,6 +1883,18 @@ def build_parser():
                             "read arbitrary DID(s) (22), print hex + ascii")
     s.add_argument("did", nargs="+", metavar="DID",
                    help="2-byte DID(s) in hex, e.g. F190 0xF111 F18C")
+    s.add_argument("--session", type=lambda x: int(x, 0), default=None,
+                   help="enter diagnosticSession first (e.g. 0x03 extended, "
+                        "0x02 programming) — some DIDs need it")
+    s.add_argument("--unlock", action="store_true",
+                   help="SecurityAccess unlock before reading (some DIDs need it)")
+    s.add_argument("--secret", type=lambda x: int(x, 0), default=None,
+                   help="override the seed-key secret (implies --unlock)")
+    s.add_argument("--sec-level", type=lambda x: int(x, 0), default=None,
+                   help="SecurityAccess request level (implies --unlock; "
+                        "default level 1 when unlocking)")
+    s.add_argument("--hw", default=None,
+                   help="assume this F111 for secret selection under --unlock")
     s.add_argument("--timeout", type=float, default=5.0,
                    help="per-DID response timeout in seconds (default 5)")
 
