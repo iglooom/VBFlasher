@@ -178,6 +178,58 @@ vbflasher memread  PSCM --addr 0x02000000 --length 0x400 -o pscm_eeprom.bin
 vbflasher memwrite PSCM --addr 0x02000000 -i pscm_eeprom.bin
 ```
 
+### Reading the BCM car-configuration (CCC)
+
+Reconstructed from a UCDS capture (`../BCM/Research/ucds_read_ccc.log`). The
+whole session runs in the **default session after SecurityAccess level 1**
+(secret `64000B0C59`) — no SBL, no programming session. UCDS:
+
+1. reads `22 D12B` → `00 00 80 00`: the address of the upload/result buffer;
+2. `34/36/37`-downloads a ~13 KB helper applet to RAM `0x40002000` (len
+   `0x339E`), then writes its parameter cells:
+   `0x4000E3B8`=`40002A24`, `0x4000E400`= a name→addr table
+   (`SBL1 0x4000E600`, `SBL2 0x4000E6D8`, `SBL3 0x00320000`, `SBL4 0x0FC00000`),
+   `0x4000E480` (214 B) and `0x4000E600` (238 B) parameter blocks,
+   `0x4000E6F0`=`000003E8`;
+3. runs it with `31 01 0301 40002000` (RoutineControl start, arg = applet base);
+4. `35`-uploads the result: **`0x00008000`, `0x200` (512) bytes** — the CCC /
+   As-Built block (starts with the ASCII part/VIN strings). The applet marshals
+   it there from config flash `0x00320000` / `0x0FC00000`.
+
+vbflasher does **not** carry UCDS's RAM applet, so it can't reproduce step 3.
+But you don't need it: after `memread` loads the Ford SBL and does the level-1
+SecurityAccess, the CCC buffer at `0x00008000` is already populated, so a plain
+`35 RequestUpload` of that region returns the same 512 bytes UCDS uploads:
+
+```bash
+# VERIFIED on the bench BCM: the 512-byte CCC / As-Built buffer (addr from D12B)
+vbflasher memread BCM --addr 0x00008000 --length 0x200 -o bcm_ccc.bin
+```
+
+The underlying config-flash regions the applet marshals from
+(`0x00320000`, `0x0FC00000`) are **out of range** for the SBL's `35` handler and
+cannot be read this way — use the `0x00008000` buffer above.
+
+**Writing the CCC back** needs a larger erase than the data. The ECU's
+`31 01 FF00` erases whole flash **sectors** and rejects a short length with
+`requestOutOfRange` (`7F 31 31`), so erasing only `0x200` fails even though you
+write `0x200`. Pass `--erase-len` with the per-ECU sector size (from FoCCCus
+`ford_c346.cpp::writeCccToEcu`):
+
+| ECU | F111 prefix | erase length |
+|-----|-------------|--------------|
+| BCM | DV6T / F1FT / F1DT | `0x4000` |
+| BCM | BV6N (and other)   | `0x400`  |
+| IPC | —                  | `0x1000` |
+
+```bash
+# write the 512-byte CCC back to a DV6T/F1FT/F1DT BCM (erase a full 0x4000 sector)
+vbflasher memwrite BCM --addr 0x00008000 -i bcm_ccc.bin --erase-len 0x4000
+```
+
+`--erase-len` only affects the `31 01 FF00` erase span; the download still writes
+exactly the file size. Take a `memread` backup first.
+
 
 Safety: a plan is always printed and gated behind a `y/N` prompt (`--dry-run`
 opts out and opens no socket; `--yes` skips the prompt for scripting); DLC=8

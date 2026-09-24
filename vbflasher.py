@@ -551,13 +551,15 @@ def do_memwrite(args):
         raise SystemExit(f"{args.infile} is {len(data)} bytes but --length "
                          f"0x{args.length:X} was given; they must match.")
     addr, length = args.addr, len(data)
+    erase_len = args.erase_len if args.erase_len is not None else length
     import hashlib
     print("=" * 72)
     print(f"MEMWRITE  {profile.name}  {args.infile} ({len(data)} bytes) "
           f"-> 0x{addr:08X}")
     print("=" * 72)
     print(f"   file sha256 {hashlib.sha256(data).hexdigest()}")
-    print("   PLAN: load+run SBL, 31 01 FF00 erase, 34 download, "
+    print("   PLAN: load+run SBL, 31 01 FF00 erase "
+          f"0x{erase_len:X}, 34 download 0x{length:X}, "
           + ("31 01 0304 verify, " if not args.no_verify else "")
           + "11 01 reset.")
     print("   !! This WRITES ECU memory and is IRREVERSIBLE. Have a backup "
@@ -573,8 +575,9 @@ def do_memwrite(args):
         ecu, ka, quiet, logf = _open_sbl_session(profile, args,
                                                  need_secret=True)
         if not args.no_erase:
-            print(f"\n== erase 0x{addr:08X} +0x{length:X} ==")
-            erase_region(ecu, addr, length, erase_timeout=args.erase_timeout)
+            print(f"\n== erase 0x{addr:08X} +0x{erase_len:X} ==")
+            erase_region(ecu, addr, erase_len,
+                         erase_timeout=args.erase_timeout)
         print(f"\n== write 0x{addr:08X} +0x{length:X} ==")
         download_raw_block(ecu, addr, data, addr_len_fmt=args.addr_len_fmt,
                            progress_interval=args.progress_interval,
@@ -2001,6 +2004,12 @@ def build_parser():
                    help="assert the file is exactly this many bytes")
     s.add_argument("--no-erase", action="store_true",
                    help="skip the 31 01 FF00 erase before writing")
+    s.add_argument("--erase-len", type=lambda x: int(x, 0), default=None,
+                   help="bytes to erase (31 01 FF00), independent of the data "
+                        "size. The ECU erases whole flash sectors and rejects "
+                        "a short length with requestOutOfRange (0x31). "
+                        "e.g. BCM CCC needs 0x4000 for DV6T/F1FT/F1DT (0x400 "
+                        "for BV6N), IPC 0x1000. Default: the data size.")
     s.add_argument("--no-verify", action="store_true",
                    help="skip the 31 01 0304 verify routine after writing")
 
