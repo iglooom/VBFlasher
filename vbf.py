@@ -97,6 +97,67 @@ def dtc_is_actual(status: int) -> bool:
 
 
 # --------------------------------------------------------------------------
+# LZSS (data_format_identifier = 0x10)
+# --------------------------------------------------------------------------
+# Ford/Volvo compress a block with LZSS (Okumura, EI=10, EJ=4, P=1; 1 KiB ring
+# initialised to 0x20). The stored block crc16 and the erase region are over the
+# DECOMPRESSED bytes, but the RequestDownload transmits the COMPRESSED bytes
+# verbatim with dataFormatIdentifier 0x10 (the ECU decompresses internally).
+# Verified byte-for-byte against the UCDS IPC flash capture
+# (ucds_flash_rebuild.log): 34 10 44 <addr> <compressed-len>, payload == on-disk
+# compressed block, erase = decompressed size.
+_LZSS_EI, _LZSS_EJ, _LZSS_P = 10, 4, 1
+_LZSS_N = 1 << _LZSS_EI
+
+
+def lzss_decode(c):
+    out = bytearray()
+    buf = bytearray(b" " * _LZSS_N)
+    r = 0
+    idx = 0
+    mask = 0
+    cur = 0
+
+    def bits(n):
+        nonlocal idx, mask, cur
+        x = 0
+        for _ in range(n):
+            if mask == 0:
+                if idx >= len(c):
+                    return None
+                cur = c[idx]
+                idx += 1
+                mask = 128
+            x = (x << 1) | (1 if cur & mask else 0)
+            mask >>= 1
+        return x
+
+    while True:
+        b = bits(1)
+        if b is None:
+            break
+        if b:
+            ch = bits(8)
+            if ch is None:
+                break
+            out.append(ch)
+            buf[r] = ch
+            r = (r + 1) & (_LZSS_N - 1)
+        else:
+            i = bits(_LZSS_EI)
+            j = bits(_LZSS_EJ)
+            if i is None or j is None or i == 0:
+                break
+            i -= 1
+            for k in range(j + 2):
+                ch = buf[(i + k) & (_LZSS_N - 1)]
+                out.append(ch)
+                buf[r] = ch
+                r = (r + 1) & (_LZSS_N - 1)
+    return bytes(out)
+
+
+# --------------------------------------------------------------------------
 # VBF
 # --------------------------------------------------------------------------
 class Vbf:
@@ -175,11 +236,21 @@ class Vbf:
         if self.blocks is None:
             raise ValueError(f"{path}: no block walk consumes the file to EOF")
 
+    def _block_flash_data(self, b):
+        """The bytes the block's crc16 covers and that the ECU ends up with:
+        LZSS-decompressed when data_format_identifier is 0x10, else the raw
+        on-disk data. NOTE: this is NOT what goes on the wire — the compressed
+        on-disk bytes (b["data"]) are transmitted verbatim with dfi 0x10."""
+        if self.dfi == 0x10:
+            return lzss_decode(b["data"])
+        return b["data"]
+
     def check(self):
         """Return a list of integrity problems (empty == good)."""
         p = []
         for i, b in enumerate(self.blocks):
-            c = binascii.crc_hqx(b["data"], 0xFFFF)
+            data = self._block_flash_data(b)
+            c = binascii.crc_hqx(data, 0xFFFF)
             if c != b["crc"]:
                 p.append(f"block {i} @0x{b['start']:08X}: "
                          f"CRC-16 stored {b['crc']:#06x} != calc {c:#06x}")
@@ -551,12 +622,17 @@ class Keepalive:
 # --------------------------------------------------------------------------
 # download stage: 34 RequestDownload -> 36 TransferData (chunked) -> 37 exit
 # --------------------------------------------------------------------------
-def download_blocks(ecu, blocks, tag, progress_interval=2.0):
+def download_blocks(ecu, blocks, tag, progress_interval=2.0, dfi=0x00):
     total = sum(b["length"] for b in blocks)
     done = 0
     t0 = time.time()
     for bi, b in enumerate(blocks):
-        rd = ("340044" + struct.pack(">I", b["start"]).hex()
+        # dataFormatIdentifier: 0x00 raw, 0x10 LZSS-compressed. When compressed,
+        # the on-disk (compressed) bytes and length go on the wire verbatim; the
+        # ECU decompresses internally. (Verified vs. the UCDS IPC flash capture:
+        # 34 10 44 <addr> <compressed-len>.)
+        rd = ("34" + f"{dfi:02X}" + "44"
+              + struct.pack(">I", b["start"]).hex()
               + struct.pack(">I", b["length"]).hex())
         r = ecu.expect(rd, 0x74, f"{tag} blk{bi} 34 RequestDownload",
                        timeout=10.0)

@@ -124,6 +124,7 @@ ECUS = {
             SblRule("CM5T-14C226-EA", "CM5T-14C025-AC.vbf"),
             SblRule("CV4T-14F094-B", "CV4T-14C025-BC.vbf"),
             SblRule("F1ET-14F094-A", "F1ET-14C025-AB.vbf"),
+            SblRule("GJ5T-14F094-B", "GJ5T-14C025-BB.vbf"),
         ),
     ),
     0x726: EcuProfile(

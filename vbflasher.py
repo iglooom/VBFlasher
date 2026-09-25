@@ -359,7 +359,8 @@ def flash_session(txid, files, args):
         ka.start()
 
         print("\n== SBL -> RAM ==")
-        download_blocks(ecu, sbl.blocks, "sbl", args.progress_interval)
+        download_blocks(ecu, sbl.blocks, "sbl", args.progress_interval,
+                        dfi=sbl.dfi or 0x00)
         if profile.sbl_call_halfword:
             call_arg = f"{(sbl.call >> 16) & 0xFFFF:04X}"
         else:
@@ -388,7 +389,7 @@ def flash_session(txid, files, args):
                                pending_timeout=args.erase_timeout)
                 print(f"\n== download {os.path.basename(v.path)} ==")
                 download_blocks(ecu, v.flash_blocks(), v.part or "app",
-                                args.progress_interval)
+                                args.progress_interval, dfi=v.dfi or 0x00)
 
             if profile.finalize:
                 print("\n== finalise (31 01 0304) ==")
@@ -489,7 +490,8 @@ def _open_sbl_session(profile, args, need_secret=True):
 
     ka.start()
     print("\n== SBL -> RAM ==")
-    download_blocks(ecu, sbl.blocks, "sbl", args.progress_interval)
+    download_blocks(ecu, sbl.blocks, "sbl", args.progress_interval,
+                    dfi=sbl.dfi or 0x00)
     call_arg = (f"{(sbl.call >> 16) & 0xFFFF:04X}" if profile.sbl_call_halfword
                 else f"{sbl.call:08X}")
     ecu.expect("31010301" + call_arg, 0x71, "31 01 0301 start SBL",
