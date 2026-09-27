@@ -2102,7 +2102,7 @@ def build_parser():
         sp.add_argument("--wake-tries", type=int, default=8)
         sp.add_argument("--wake-timeout", type=float, default=0.5)
         sp.add_argument("--tp-interval", type=float, default=TP_INTERVAL)
-        sp.add_argument("--progress-interval", type=float, default=2.0)
+        sp.add_argument("--progress-interval", type=float, default=1.0)
         sp.add_argument("--erase-timeout", type=float, default=60.0)
         sp.add_argument("--yes", "-y", action="store_true",
                         help="skip the confirmation prompt")
@@ -2173,9 +2173,9 @@ def build_parser():
                    help="3E 00 wake attempts for a sleeping bus (default 8)")
     s.add_argument("--wake-timeout", type=float, default=0.5,
                    help="seconds per wake attempt (default 0.5)")
-    s.add_argument("--progress-interval", type=float, default=2.0,
-                   help="download progress print interval in seconds "
-                        "(default 2.0)")
+    s.add_argument("--progress-interval", type=float, default=1.0,
+                   help="progress refresh interval in seconds "
+                        "(default 1.0)")
     s.add_argument("--tp-interval", type=float, default=TP_INTERVAL,
                    help=f"TesterPresent period (default {TP_INTERVAL}; 0 off)")
     s.add_argument("--tp-id", type=lambda x: int(x, 0), default=-1,

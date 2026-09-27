@@ -7,6 +7,7 @@ import pty
 import re
 import struct
 import termios
+import time
 import unittest
 from unittest.mock import patch
 
@@ -29,7 +30,7 @@ class FakeEcu:
 class ProgressTests(unittest.TestCase):
     def test_footer_survives_block_logs_and_uses_terminal_width(self):
         master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 6, 40, 0, 0))
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 6, 64, 0, 0))
         try:
             with os.fdopen(slave, "w", buffering=1) as output:
                 with patch("sys.stdout", output), patch.dict(os.environ, {"TERM": "xterm"}):
@@ -60,8 +61,10 @@ class ProgressTests(unittest.TestCase):
             self.assertNotIn("\x1b[7m", text)  # no reverse-video white background
             for segment in text.split("\x1b[49m")[1:]:
                 bar = re.sub(r"\x1b\[[0-9;]*m", "", segment.split("\x1b[K")[0])
-                self.assertEqual(len(bar), 39)
-                self.assertRegex(bar, r"\[.*\] +\d+\.\d% $")
+                self.assertEqual(len(bar), 63)
+                self.assertRegex(bar, r"^ \d+:\d\d ")  # elapsed clock at left
+                self.assertRegex(bar,
+                                 r"\[.*\] +\d+\.\d% +ETA [\d:-]+ $")
             self.assertRegex(text, r"\d+\.\d KiB/s \[")
         finally:
             os.close(master)
@@ -96,7 +99,34 @@ class ProgressTests(unittest.TestCase):
             text = data.decode()
             self.assertIn("1.0 KiB/s [", text)
             self.assertIn("-- KiB/s [", text)
-            self.assertIn("] 100.0% \x1b[K", text)
+            self.assertIn("] 100.0%  ETA 00:00 \x1b[K", text)
+            self.assertIn(" 00:01 downloa", text)  # elapsed clock at far left
+        finally:
+            os.close(master)
+
+    def test_ticker_redraws_clock_without_byte_traffic(self):
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 6, 64, 0, 0))
+        try:
+            with os.fdopen(slave, "w", buffering=1) as output:
+                with patch("sys.stdout", output), patch.dict(os.environ, {"TERM": "xterm"}):
+                    bar = FlashProgress(1024, interval=0.1)
+                    try:
+                        bar.start()
+                        bar.stage_name("erase")
+                        time.sleep(0.45)  # no advance() at all
+                    finally:
+                        bar.close()
+                    self.assertIsNone(bar._ticker)
+            data = bytearray()
+            try:
+                while True:
+                    data.extend(os.read(master, 65536))
+            except OSError:
+                pass
+            text = data.decode()
+            # start + stage_name + >=3 ticker repaints of the footer row
+            self.assertGreaterEqual(text.count("\x1b[6;1H\x1b[49m"), 5)
         finally:
             os.close(master)
 

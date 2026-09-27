@@ -625,7 +625,7 @@ class Keepalive:
 # above it. Non-interactive output stays free of terminal control sequences.
 # --------------------------------------------------------------------------
 class FlashProgress:
-    def __init__(self, total, interval=2.0):
+    def __init__(self, total, interval=1.0):
         self.total = total
         self.done = 0
         self.stage = "starting"
@@ -636,10 +636,42 @@ class FlashProgress:
         self.last_draw = 0.0
         self.stage_started = None
         self.stage_bytes = 0
+        self.started = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._ticker = None
 
     def start(self):
-        if self.enabled:
+        self.started = time.monotonic()
+        if not self.enabled:
+            return
+        self.draw(force=True)
+        # Redraw on a timer so the elapsed clock and ETA keep moving during
+        # long silent stages (erase, checksum) with no byte traffic.
+        self._stop.clear()
+        self._ticker = threading.Thread(target=self._tick, daemon=True)
+        self._ticker.start()
+
+    def _tick(self):
+        period = max(0.1, self.interval)
+        while not self._stop.wait(period):
             self.draw(force=True)
+
+    @staticmethod
+    def _clock(seconds):
+        seconds = max(0, int(seconds))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def _eta(self, now, pct):
+        """Remaining time extrapolated from overall progress so far."""
+        if self.started is None or pct <= 0 or pct >= 100:
+            return "--:--" if pct < 100 else self._clock(0)
+        elapsed = now - self.started
+        if elapsed <= 0:
+            return "--:--"
+        return self._clock(elapsed * (100 - pct) / pct)
 
     def stage_name(self, name):
         self.stage = name
@@ -656,6 +688,12 @@ class FlashProgress:
     def draw(self, force=False):
         if not self.enabled:
             return
+        # The ticker thread and the transfer loop both draw; serialise so the
+        # escape sequences of two footer repaints can never interleave.
+        with self._lock:
+            self._draw(force)
+
+    def _draw(self, force):
         now = time.monotonic()
         if not force and now - self.last_draw < self.interval:
             return
@@ -677,18 +715,32 @@ class FlashProgress:
             elapsed = now - self.stage_started
             speed = (f"{self.stage_bytes / elapsed / 1024:.1f} KiB/s"
                      if elapsed > 0 else "0.0 KiB/s")
-        # Speed sits to the left of the bar, percentage at the right edge.
-        # On narrow terminals drop speed first, keeping percentage and bar.
+        # Elapsed time since flash start on the far left, ETA on the far right;
+        # speed sits left of the bar and percentage right of it. On narrow
+        # terminals drop speed first, then ETA, then the elapsed clock.
         percent = f" {pct:5.1f}% "
         speed_label = f" {speed} "
-        if cols < len(speed_label) + len(percent) + 4:
-            speed_label = ""
-        stage_width = max(0, cols - len(speed_label) - len(percent) - 4)
-        label = f" {self.stage}"[:stage_width] + speed_label
-        width = cols - len(label) - len(percent) - 3
+        elapsed_label = (f" {self._clock(now - self.started)}"
+                         if self.started is not None else "")
+        eta_label = f" ETA {self._eta(now, pct)} "
+        for _ in range(3):
+            fixed = (len(elapsed_label) + len(speed_label) + len(percent)
+                     + len(eta_label) + 4)
+            if cols >= fixed + 1:
+                break
+            if speed_label:
+                speed_label = ""
+            elif eta_label:
+                eta_label = ""
+            else:
+                elapsed_label = ""
+        stage_width = max(0, cols - len(elapsed_label) - len(speed_label)
+                          - len(percent) - len(eta_label) - 4)
+        label = elapsed_label + f" {self.stage}"[:stage_width] + speed_label
+        width = max(0, cols - len(label) - len(percent) - len(eta_label) - 3)
         filled = min(width, int(width * pct / 100))
         line = (f"{label}[\x1b[97m{'█' * filled}\x1b[39m"
-                f"{'-' * (width - filled)}]{percent}")
+                f"{'-' * (width - filled)}]{percent}{eta_label}")
         # Default terminal background; colour only the filled part white.
         self.stream.write(f"\x1b7\x1b[{rows};1H\x1b[49m{line}"
                           "\x1b[K\x1b8")
@@ -696,12 +748,17 @@ class FlashProgress:
         self.last_draw = now
 
     def close(self):
-        if self.size:
-            rows = self.size[1]
-            self.stream.write(f"\x1b7\x1b[{rows};1H\x1b[2K\x1b8\x1b[r"
-                              f"\x1b[{rows};1H")
-            self.stream.flush()
-            self.size = None
+        self._stop.set()
+        if self._ticker:
+            self._ticker.join(timeout=max(0.1, self.interval) + 1.0)
+            self._ticker = None
+        with self._lock:
+            if self.size:
+                rows = self.size[1]
+                self.stream.write(f"\x1b7\x1b[{rows};1H\x1b[2K\x1b8\x1b[r"
+                                  f"\x1b[{rows};1H")
+                self.stream.flush()
+                self.size = None
 
 
 # --------------------------------------------------------------------------
