@@ -677,18 +677,18 @@ class FlashProgress:
             elapsed = now - self.stage_started
             speed = (f"{self.stage_bytes / elapsed / 1024:.1f} KiB/s"
                      if elapsed > 0 else "0.0 KiB/s")
-        # Reserve a right-aligned speed field, but retain the percentage and
-        # at least one bar cell when the terminal is narrow.
+        # Speed sits to the left of the bar, percentage at the right edge.
+        # On narrow terminals drop speed first, keeping percentage and bar.
         percent = f" {pct:5.1f}% "
-        suffix = f" {speed} "
-        if cols < len(suffix) + len(percent) + 4:
-            suffix = ""
-        stage_width = max(0, cols - len(suffix) - len(percent) - 4)
-        label = f" {self.stage}"[:stage_width] + percent
-        width = cols - len(label) - len(suffix) - 3
+        speed_label = f" {speed} "
+        if cols < len(speed_label) + len(percent) + 4:
+            speed_label = ""
+        stage_width = max(0, cols - len(speed_label) - len(percent) - 4)
+        label = f" {self.stage}"[:stage_width] + speed_label
+        width = cols - len(label) - len(percent) - 3
         filled = min(width, int(width * pct / 100))
         line = (f"{label}[\x1b[97m{'█' * filled}\x1b[39m"
-                f"{'-' * (width - filled)}]{suffix}")
+                f"{'-' * (width - filled)}]{percent}")
         # Default terminal background; colour only the filled part white.
         self.stream.write(f"\x1b7\x1b[{rows};1H\x1b[49m{line}"
                           "\x1b[K\x1b8")

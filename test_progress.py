@@ -57,11 +57,12 @@ class ProgressTests(unittest.TestCase):
             self.assertIn("\x1b[r", text)  # margins restored
             self.assertIn("\x1b[49m", text)  # terminal's normal background
             self.assertIn("\x1b[97m█", text)  # white filled bar
-            self.assertRegex(text, r"\]\s+\d+\.\d KiB/s \x1b\[K")
             self.assertNotIn("\x1b[7m", text)  # no reverse-video white background
             for segment in text.split("\x1b[49m")[1:]:
-                bar = segment.split("\x1b[K")[0]
-                self.assertEqual(len(re.sub(r"\x1b\[[0-9;]*m", "", bar)), 39)
+                bar = re.sub(r"\x1b\[[0-9;]*m", "", segment.split("\x1b[K")[0])
+                self.assertEqual(len(bar), 39)
+                self.assertRegex(bar, r"\[.*\] +\d+\.\d% $")
+            self.assertRegex(text, r"\d+\.\d KiB/s \[")
         finally:
             os.close(master)
 
@@ -93,8 +94,9 @@ class ProgressTests(unittest.TestCase):
             except OSError:
                 pass
             text = data.decode()
-            self.assertIn("] 1.0 KiB/s \x1b[K", text)
-            self.assertIn("] -- KiB/s \x1b[K", text)
+            self.assertIn("1.0 KiB/s [", text)
+            self.assertIn("-- KiB/s [", text)
+            self.assertIn("] 100.0% \x1b[K", text)
         finally:
             os.close(master)
 
