@@ -13,6 +13,7 @@ import os
 import re
 import socket
 import struct
+import sys
 import threading
 import time
 import zlib
@@ -620,9 +621,94 @@ class Keepalive:
 
 
 # --------------------------------------------------------------------------
+# flash progress: reserve the bottom terminal row while normal output scrolls
+# above it. Non-interactive output stays free of terminal control sequences.
+# --------------------------------------------------------------------------
+class FlashProgress:
+    def __init__(self, total, interval=2.0):
+        self.total = total
+        self.done = 0
+        self.stage = "starting"
+        self.interval = interval
+        self.stream = sys.stdout
+        self.enabled = self.stream.isatty() and os.environ.get("TERM") != "dumb"
+        self.size = None
+        self.last_draw = 0.0
+        self.stage_started = None
+        self.stage_bytes = 0
+
+    def start(self):
+        if self.enabled:
+            self.draw(force=True)
+
+    def stage_name(self, name):
+        self.stage = name
+        self.stage_started = (time.monotonic()
+                              if name in ("SBL -> RAM", "download") else None)
+        self.stage_bytes = 0
+        self.draw(force=True)
+
+    def advance(self, count):
+        self.done += count
+        self.stage_bytes += count
+        self.draw()
+
+    def draw(self, force=False):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_draw < self.interval:
+            return
+        try:
+            cols, rows = os.get_terminal_size(self.stream.fileno())
+        except OSError:
+            cols, rows = 80, 24
+        if cols < 12 or rows < 3:
+            return
+        if self.size != (cols, rows):
+            # Keep stdout's scrolling inside rows 1..rows-1; the last row is
+            # reserved for this bar even when expect() prints block counters.
+            self.stream.write(f"\x1b[1;{rows - 1}r\x1b[{rows - 1};1H")
+            self.size = cols, rows
+        pct = min(100, 100 * self.done / self.total) if self.total else 100
+        if self.stage_started is None:
+            speed = "-- KiB/s"
+        else:
+            elapsed = now - self.stage_started
+            speed = (f"{self.stage_bytes / elapsed / 1024:.1f} KiB/s"
+                     if elapsed > 0 else "0.0 KiB/s")
+        # Reserve a right-aligned speed field, but retain the percentage and
+        # at least one bar cell when the terminal is narrow.
+        percent = f" {pct:5.1f}% "
+        suffix = f" {speed} "
+        if cols < len(suffix) + len(percent) + 4:
+            suffix = ""
+        stage_width = max(0, cols - len(suffix) - len(percent) - 4)
+        label = f" {self.stage}"[:stage_width] + percent
+        width = cols - len(label) - len(suffix) - 3
+        filled = min(width, int(width * pct / 100))
+        line = (f"{label}[\x1b[97m{'█' * filled}\x1b[39m"
+                f"{'-' * (width - filled)}]{suffix}")
+        # Default terminal background; colour only the filled part white.
+        self.stream.write(f"\x1b7\x1b[{rows};1H\x1b[49m{line}"
+                          "\x1b[K\x1b8")
+        self.stream.flush()
+        self.last_draw = now
+
+    def close(self):
+        if self.size:
+            rows = self.size[1]
+            self.stream.write(f"\x1b7\x1b[{rows};1H\x1b[2K\x1b8\x1b[r"
+                              f"\x1b[{rows};1H")
+            self.stream.flush()
+            self.size = None
+
+
+# --------------------------------------------------------------------------
 # download stage: 34 RequestDownload -> 36 TransferData (chunked) -> 37 exit
 # --------------------------------------------------------------------------
-def download_blocks(ecu, blocks, tag, progress_interval=2.0, dfi=0x00):
+def download_blocks(ecu, blocks, tag, progress_interval=2.0, dfi=0x00,
+                    progress=None):
     total = sum(b["length"] for b in blocks)
     done = 0
     t0 = time.time()
@@ -658,19 +744,22 @@ def download_blocks(ecu, blocks, tag, progress_interval=2.0, dfi=0x00):
                                      f"{fmt(rr)}")
             off += len(piece)
             done += len(piece)
+            if progress is not None:
+                progress.advance(len(piece))
+                if off >= b["length"]:
+                    progress.draw(force=True)
             bc = (bc + 1) & 0xFF
             now = time.time()
-            # report at least every `progress_interval` seconds, and on the
-            # final transfer of the block
-            if ecu.execute and (now - t_last >= progress_interval
-                                or off >= b["length"]):
+            # Non-TTY callers keep the original periodic text progress.
+            if ecu.execute and progress is None and (
+                    now - t_last >= progress_interval or off >= b["length"]):
                 t_last = now
                 el = now - t0
                 pct = 100.0 * done / total if total else 100.0
                 print("\r      %s %5.1f%%  %s/%s  %.1f KiB/s   "
                       % (tag, pct, human(done), human(total),
                          (done / el / 1024) if el else 0), end="", flush=True)
-        if ecu.execute:
+        if ecu.execute and progress is None:
             print()
         ecu.expect("37", 0x77, f"{tag} blk{bi} 37 TransferExit", timeout=15.0)
 

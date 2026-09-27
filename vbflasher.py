@@ -55,7 +55,7 @@ sys.path.insert(0, HERE)
 
 import ecu_db                                            # noqa: E402
 import ford_seckey                                       # noqa: E402
-from vbf import (Vbf, Ecu, BusQuiet, Keepalive, download_blocks,  # noqa: E402
+from vbf import (Vbf, Ecu, BusQuiet, Keepalive, FlashProgress, download_blocks,  # noqa: E402
                  human, fmt, iface_is_up, dtc_code, dtc_status_str,
                  dtc_is_actual, functional_broadcast,
                  upload_block, download_raw_block, erase_region,
@@ -288,6 +288,8 @@ def flash_session(txid, files, args):
               "begins.")
         print("Have the stock VBF on hand, battery charger on, engine off.")
         print("!" * 72)
+        for v in (to_flash if to_flash else [sbl]):
+            print(f"SHA-256 {os.path.basename(v.path)}: {v.sha256()[:8]}...")
         ans = input("Are you sure you want to proceed? [y/N] ").strip().lower()
         if ans != "y":
             print("aborted by user.")
@@ -317,7 +319,12 @@ def flash_session(txid, files, args):
                  else f"broadcast 0x{ka_can_id:03X}")
         print(f"   keepalive: TesterPresent 3E 80 every {args.tp_interval:.1f}s "
               f"-> {where}")
+    progress = FlashProgress(
+        sbl.total_payload() + sum(sum(b["length"] for b in v.flash_blocks())
+                                  for v in ([] if args.test_sbl else to_flash)),
+        interval=args.progress_interval)
     try:
+        progress.start()
         quiet.arm()
 
         # identity gate on EXE parts
@@ -359,9 +366,11 @@ def flash_session(txid, files, args):
 
         ka.start()
 
+        progress.stage_name("SBL -> RAM")
         print("\n== SBL -> RAM ==")
         download_blocks(ecu, sbl.blocks, "sbl", args.progress_interval,
-                        dfi=sbl.dfi or 0x00)
+                        dfi=sbl.dfi or 0x00,
+                        progress=progress if progress.enabled else None)
         if profile.sbl_call_halfword:
             call_arg = f"{(sbl.call >> 16) & 0xFFFF:04X}"
         else:
@@ -379,6 +388,7 @@ def flash_session(txid, files, args):
             for v in to_flash:
                 erase = v.flash_erase()
                 skipped = len(v.erase) - len(erase)
+                progress.stage_name("erase")
                 print(f"\n== erase for {os.path.basename(v.path)} "
                       f"({len(erase)} region"
                       + (f", {skipped} omitted" if skipped else "") + ") ==")
@@ -388,24 +398,31 @@ def flash_session(txid, files, args):
                                + _s.pack(">I", l).hex(), 0x71,
                                f"erase 0x{a:08X}", timeout=15.0,
                                pending_timeout=args.erase_timeout)
+                progress.stage_name("download")
                 print(f"\n== download {os.path.basename(v.path)} ==")
                 download_blocks(ecu, v.flash_blocks(), v.part or "app",
-                                args.progress_interval, dfi=v.dfi or 0x00)
+                                args.progress_interval, dfi=v.dfi or 0x00,
+                                progress=progress if progress.enabled else None)
 
             if profile.finalize:
+                progress.stage_name("finalise")
                 print("\n== finalise (31 01 0304) ==")
                 ecu.expect("31010304", 0x71, "31 01 0304 finalise",
                            timeout=15.0, pending_timeout=args.erase_timeout)
 
+        progress.stage_name("reset")
         print("\n== reset ==")
         ecu.req("1101", timeout=8.0, what="11 01 ECUReset")
     finally:
-        ka.stop()
-        if ka.sent:
-            print(f"   keepalive: {ka.sent} TesterPresent frames")
-        quiet.restore()
-        if logf:
-            logf.close()
+        try:
+            ka.stop()
+            if ka.sent:
+                print(f"   keepalive: {ka.sent} TesterPresent frames")
+            quiet.restore()
+            if logf:
+                logf.close()
+        finally:
+            progress.close()
 
     print("\n*** DONE ***")
     print("    Power-cycle if the module does not return on its own, then "
