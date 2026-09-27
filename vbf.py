@@ -637,6 +637,9 @@ class FlashProgress:
         self.stage_started = None
         self.stage_bytes = 0
         self.started = None
+        self.finished = None
+        self.transfer_bytes = 0
+        self.transfer_time = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._ticker = None
@@ -665,19 +668,35 @@ class FlashProgress:
         return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
     def _eta(self, now, pct):
-        """Remaining time extrapolated from overall progress so far."""
-        if self.started is None or pct <= 0 or pct >= 100:
-            return "--:--" if pct < 100 else self._clock(0)
-        elapsed = now - self.started
-        if elapsed <= 0:
+        """Remaining time at the CURRENT transfer rate.
+
+        Extrapolating from the whole run would fold in erase/handshake time,
+        which does not repeat for the bytes still to come; the live stage rate
+        is what those bytes will actually be moved at.
+        """
+        if pct >= 100:
+            return self._clock(0)
+        if self.stage_started is None or not self.total:
             return "--:--"
-        return self._clock(elapsed * (100 - pct) / pct)
+        elapsed = now - self.stage_started
+        if elapsed <= 0 or self.stage_bytes <= 0:
+            return "--:--"
+        return self._clock((self.total - self.done)
+                           / (self.stage_bytes / elapsed))
+
+    def _bank_stage(self):
+        """Fold the finished transfer stage into the overall throughput totals."""
+        if self.stage_started is not None:
+            self.transfer_bytes += self.stage_bytes
+            self.transfer_time += max(0.0, time.monotonic() - self.stage_started)
+        self.stage_started = None
+        self.stage_bytes = 0
 
     def stage_name(self, name):
+        self._bank_stage()
         self.stage = name
-        self.stage_started = (time.monotonic()
-                              if name in ("SBL -> RAM", "download") else None)
-        self.stage_bytes = 0
+        if name in ("SBL -> RAM", "download"):
+            self.stage_started = time.monotonic()
         self.draw(force=True)
 
     def advance(self, count):
@@ -722,7 +741,11 @@ class FlashProgress:
         speed_label = f" {speed} "
         elapsed_label = (f" {self._clock(now - self.started)}"
                          if self.started is not None else "")
-        eta_label = f" ETA {self._eta(now, pct)} "
+        # Only a running transfer moves the byte counter, so only then does the
+        # extrapolation mean anything; erase/finalise/reset stall pct and would
+        # show a stale, steadily growing ETA.
+        eta_label = (f" ETA {self._eta(now, pct)} "
+                     if self.stage_started is not None else "")
         for _ in range(3):
             fixed = (len(elapsed_label) + len(speed_label) + len(percent)
                      + len(eta_label) + 4)
@@ -748,6 +771,9 @@ class FlashProgress:
         self.last_draw = now
 
     def close(self):
+        if self.finished is None:
+            self.finished = time.monotonic()
+        self._bank_stage()
         self._stop.set()
         if self._ticker:
             self._ticker.join(timeout=max(0.1, self.interval) + 1.0)
@@ -759,6 +785,30 @@ class FlashProgress:
                                   f"\x1b[{rows};1H")
                 self.stream.flush()
                 self.size = None
+
+    def summary(self):
+        """Total wall time and average transfer speed, for the final report.
+
+        Two figures: overall (bytes moved / whole run, i.e. what the flash
+        actually costs including erase and handshakes) and transfer-only
+        (bytes moved / time spent inside 34/36/37 stages).
+        """
+        if self.started is None:
+            return None
+        end = self.finished if self.finished is not None else time.monotonic()
+        total = max(0.0, end - self.started)
+        # advance() only runs for a TTY footer; fall back to the planned size.
+        moved = self.done or self.total
+        lines = [f"    elapsed:   {self._clock(total)}"
+                 f" ({total:.1f}s), {human(moved)} transferred"]
+        if total > 0:
+            lines.append(f"    avg speed: {moved / total / 1024:.1f} KiB/s "
+                         f"overall"
+                         + (f", {self.transfer_bytes / self.transfer_time / 1024:.1f}"
+                            f" KiB/s during transfers"
+                            if self.transfer_time > 0 and self.transfer_bytes
+                            else ""))
+        return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------

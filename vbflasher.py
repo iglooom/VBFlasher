@@ -425,6 +425,9 @@ def flash_session(txid, files, args):
             progress.close()
 
     print("\n*** DONE ***")
+    stats = progress.summary()
+    if stats:
+        print(stats)
     print("    Power-cycle if the module does not return on its own, then "
           "re-read identity with the `ident` subcommand.")
 

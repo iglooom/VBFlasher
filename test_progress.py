@@ -14,6 +14,31 @@ from unittest.mock import patch
 from vbf import FlashProgress, download_blocks
 
 
+def _drain(master):
+    """Read whatever the PTY holds right now, without blocking on the slave."""
+    out = bytearray()
+    os.set_blocking(master, False)
+    try:
+        while True:
+            chunk = os.read(master, 65536)
+            if not chunk:
+                break
+            out.extend(chunk)
+    except BlockingIOError:
+        pass
+    except OSError:
+        pass
+    finally:
+        os.set_blocking(master, True)
+    return out.decode(errors="replace")
+
+
+def _footer_lines(text):
+    """Each footer repaint, stripped of SGR codes."""
+    return [re.sub(r"\x1b\[[0-9;]*m", "", seg.split("\x1b[K")[0])
+            for seg in text.split("\x1b[49m")[1:]]
+
+
 class FakeEcu:
     execute = True
 
@@ -63,8 +88,9 @@ class ProgressTests(unittest.TestCase):
                 bar = re.sub(r"\x1b\[[0-9;]*m", "", segment.split("\x1b[K")[0])
                 self.assertEqual(len(bar), 63)
                 self.assertRegex(bar, r"^ \d+:\d\d ")  # elapsed clock at left
+                # ETA only appears once a transfer stage is running
                 self.assertRegex(bar,
-                                 r"\[.*\] +\d+\.\d% +ETA [\d:-]+ $")
+                                 r"\[.*\] +\d+\.\d% *(ETA [\d:-]+ )?$")
             self.assertRegex(text, r"\d+\.\d KiB/s \[")
         finally:
             os.close(master)
@@ -139,6 +165,62 @@ class ProgressTests(unittest.TestCase):
             bar.close()
         self.assertFalse(bar.enabled)
         self.assertEqual(output.getvalue(), "")
+
+    def test_eta_hidden_outside_transfer_stages(self):
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 6, 64, 0, 0))
+        clock = [10.0]
+        try:
+            with os.fdopen(slave, "w", buffering=1) as output:
+                with (patch("sys.stdout", output),
+                      patch.dict(os.environ, {"TERM": "xterm"}),
+                      patch("vbf.time.monotonic", side_effect=lambda: clock[0])):
+                    bar = FlashProgress(2048, interval=999)
+                    try:
+                        bar.start()
+                        bar.stage_name("erase")
+                        clock[0] = 20.0
+                        bar.draw(force=True)
+                        erase_frames = [s for s in _footer_lines(_drain(master))
+                                        if "erase" in s]
+                        bar.stage_name("download")
+                        clock[0] = 21.0
+                        bar.advance(1024)  # 1 KiB/s, 1 KiB left -> ETA 00:01
+                        bar.draw(force=True)
+                        dl_frames = [s for s in _footer_lines(_drain(master))
+                                     if "download" in s]
+                    finally:
+                        bar.close()
+            self.assertTrue(erase_frames)
+            for frame in erase_frames:
+                self.assertNotIn("ETA", frame)
+            self.assertTrue(dl_frames)
+            self.assertTrue(any("ETA 00:01" in f for f in dl_frames),
+                            dl_frames)
+        finally:
+            os.close(master)
+
+    def test_summary_reports_elapsed_and_average_speed(self):
+        clock = [100.0]
+        with patch("vbf.time.monotonic", side_effect=lambda: clock[0]):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                bar = FlashProgress(2048)
+                bar.start()
+                bar.stage_name("download")
+                clock[0] = 102.0
+                bar.advance(2048)
+                bar.stage_name("finalise")  # banks 2048 B over 2.0 s
+                clock[0] = 104.0
+                bar.close()
+        stats = bar.summary()
+        assert stats is not None
+        self.assertIn("00:04 (4.0s), 2.0 KiB transferred", stats)
+        self.assertIn("0.5 KiB/s overall", stats)
+        self.assertIn("1.0 KiB/s during transfers", stats)
+
+    def test_summary_without_start_is_none(self):
+        self.assertIsNone(FlashProgress(4).summary())
 
 
 if __name__ == "__main__":
