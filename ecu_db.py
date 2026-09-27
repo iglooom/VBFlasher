@@ -27,6 +27,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+BUS_DEFAULT_IFACES = {
+    "HS-CAN": "can0",
+    "MS-CAN": "can1",
+}
+
+
 @dataclass
 class SecretRule:
     """One secret, chosen by F111 hardware-string prefix and diag security level.
@@ -52,6 +58,7 @@ class SblRule:
 class EcuProfile:
     name: str
     txid: int                       # diagnostic request CAN ID
+    bus: str                        # physical diagnostic bus: HS-CAN or MS-CAN
     rxid: Optional[int] = None      # response ID; default txid + 8 (Ford)
     aliases: tuple = ()             # short names, e.g. ("BCM",) — for CLI select
     # DIDs read (report only) at flash time; F111 drives SBL+secret selection.
@@ -74,6 +81,13 @@ class EcuProfile:
 
     def resp_id(self):
         return self.rxid if self.rxid is not None else self.txid + 8
+
+    def default_iface(self):
+        """Return the SocketCAN interface assigned to this ECU's physical bus."""
+        try:
+            return BUS_DEFAULT_IFACES[self.bus]
+        except KeyError:
+            raise ValueError(f"unsupported CAN bus {self.bus!r} for {self.name}")
 
     def pick_secret(self, hw: str, level: int) -> Optional[bytes]:
         hw = hw or ""
@@ -111,7 +125,8 @@ class EcuProfile:
 # --------------------------------------------------------------------------
 ECUS = {
     0x720: EcuProfile(
-        name="IPC (instrument cluster)", txid=0x720, aliases=("IPC",),
+        name="IPC (instrument cluster)", txid=0x720, bus="MS-CAN",
+        aliases=("IPC",),
         secrets=(
             SecretRule("", 1, "621C067260"),
             SecretRule("", 3, "8408F57701"),
@@ -128,7 +143,8 @@ ECUS = {
         ),
     ),
     0x726: EcuProfile(
-        name="BCM (body control)", txid=0x726, rxid=0x72E, aliases=("BCM",),
+        name="BCM (body control)", txid=0x726, bus="MS-CAN", rxid=0x72E,
+        aliases=("BCM",),
         secrets=(
             SecretRule("BV6N", None, "F311454C73"),
             SecretRule("AV6N", None, "F311454C73"),
@@ -149,20 +165,32 @@ ECUS = {
         default_sbl="DV6T-14C097-AB.vbf",
     ),
     0x727: EcuProfile(
-        name="ACM (audio)", txid=0x727, aliases=("ACM",),
+        name="ACM (audio)", txid=0x727, bus="MS-CAN", aliases=("ACM",),
         secrets=(SecretRule("", None, "13F129B301"),),
         sbls=(SblRule("BM5T-14C230", "AM5T-14C047-DC.vbf"),),
         finalize=True,
     ),
     0x730: EcuProfile(
-        name="PSCM (electric power steering)", txid=0x730, rxid=0x738,
-        aliases=("PSCM", "EPAS"),
+        name="PSCM (electric power steering)", txid=0x730, bus="HS-CAN",
+        rxid=0x738, aliases=("PSCM", "EPAS"),
         secrets=(SecretRule("", 1, "00009B2533"),),
         default_sbl="BV6T-14C220-AA.vbf",
         finalize=True,
     ),
+    0x764: EcuProfile(
+        # Delphi ESR forward radar; also runs the ACC state machine.
+        # Host CPU is V850 (GV6T-14D049-xx), plus a TI DSP (GV6T-14G012-AA).
+        # SBL AE9T-14D051-AA loads to RAM at 0x03FF9000.
+        name="CCM (cruise control module / ESR radar)", txid=0x764,
+        bus="HS-CAN", rxid=0x76C, aliases=("CCM", "ESR", "ACC"),
+        # NOT YET VERIFIED against a live module or a UCDS capture: rxid is the
+        # Ford txid+8 convention, and no secret/SBL rule is claimed here.
+        # Reads (22) need neither, so `readdid` is safe; flashing this ECU
+        # requires a SecretRule + SBL established from ground truth first.
+        default_sbl="AE9T-14D051-AA.VBF",
+    ),
     0x706: EcuProfile(
-        name="IPMA (front camera)", txid=0x706, rxid=0x70E,
+        name="IPMA (front camera)", txid=0x706, bus="HS-CAN", rxid=0x70E,
         aliases=("IPMA",),
         ident_dids=("F113", "F188", "F111", "F18C", "F190"),
         secrets=(SecretRule("", None, "00009875CA"),),
@@ -177,7 +205,7 @@ ECUS = {
         finalize=True,
     ),
     0x737: EcuProfile(
-        name="RCM (restraints)", txid=0x737, aliases=("RCM",),
+        name="RCM (restraints)", txid=0x737, bus="HS-CAN", aliases=("RCM",),
         secrets=(
             SecretRule("", 3, "50000A241D"),
             SecretRule("", None, "0000000000"),
@@ -185,7 +213,7 @@ ECUS = {
         finalize=True,
     ),
     0x760: EcuProfile(
-        name="ABS", txid=0x760, aliases=("ABS",),
+        name="ABS", txid=0x760, bus="HS-CAN", aliases=("ABS",),
         secrets=(SecretRule("", None, "42434D5932"),),
         sbls=(
             SblRule("BV61-14C227", "BV61-14C039-AA.vbf"),
@@ -194,7 +222,7 @@ ECUS = {
         finalize=True,
     ),
     0x7A5: EcuProfile(
-        name="FCDIM / FDIM (display)", txid=0x7A5,
+        name="FCDIM / FDIM (display)", txid=0x7A5, bus="MS-CAN",
         aliases=("FCDIM", "FDIM", "APIM"),
         secrets=(
             SecretRule("CM5T-14F180-C", None, "50C86A49F1"),
@@ -211,7 +239,8 @@ ECUS = {
         ),
     ),
     0x7E0: EcuProfile(
-        name="PCM (engine)", txid=0x7E0, rxid=0x7E8, aliases=("PCM", "ECM"),
+        name="PCM (engine)", txid=0x7E0, bus="HS-CAN", rxid=0x7E8,
+        aliases=("PCM", "ECM"),
         secrets=(
             SecretRule("AV61-12B684", 1, "A3B2C01492"),
             SecretRule("AV61-12B684", 3, "2431DEF946"),
@@ -226,13 +255,15 @@ ECUS = {
         finalize=True,
     ),
     0x7E1: EcuProfile(
-        name="TCM (transmission)", txid=0x7E1, rxid=0x7E9, aliases=("TCM",),
+        name="TCM (transmission)", txid=0x7E1, bus="HS-CAN", rxid=0x7E9,
+        aliases=("TCM",),
         secrets=(SecretRule("", None, "415249414E"),),
         sbls=(SblRule("AE8P-14F085", "AE8P-7J244-AB.vbf"),),
         finalize=True,
     ),
     0x733: EcuProfile(
-        name="DEATC / HVAC", txid=0x733, aliases=("DEATC", "HVAC"),
+        name="DEATC / HVAC", txid=0x733, bus="MS-CAN",
+        aliases=("DEATC", "HVAC"),
         secrets=(SecretRule("", None, "415249414E"),),
         sbls=(SblRule("AM5T-14C239", "AM5T-18D618-BB.vbf"),),
     ),

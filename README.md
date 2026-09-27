@@ -125,14 +125,18 @@ vbflasher memwrite PSCM --addr 0x02000000 -i pscm_eeprom.bin   # erase+write+ver
 
 By default you give only VBF file(s): the ECU is read from each file's
 `ecu_address`, and the SBL + secret come from the internal database keyed on the
-live F111. The SBL VBF is looked up in the `sbl/` subdir (then beside the
-flasher); if it is missing the
-tool tells you exactly which file to supply.
+live F111. The registry also selects the physical CAN interface automatically:
+HS-CAN modules use `can0`, while MS-CAN modules use `can1`. Commands targeting
+`ALL` use both interfaces. Pass `--iface IFACE` to override this selection (and
+to force `ALL` onto only that interface). The SBL VBF is looked up in the `sbl/`
+subdir (then beside the flasher); if it is missing the tool tells you exactly
+which file to supply.
 
-Key flags: `--iface can0` (default), `--dry-run/-n` (plan only, opens no
-socket), `--yes/-y` (skip the confirmation prompt), `--sbl PATH` (override the
-auto-selected SBL), `--sbl-dir DIR` (extra search dir, repeatable), `--secret
-0x...` (override the seed-key secret), `--sec-level N` (diag security level;
+Key flags: `--iface IFACE` (override the automatic bus interface),
+`--dry-run/-n` (plan only, opens no socket), `--yes/-y` (skip the confirmation
+prompt), `--sbl PATH` (override the auto-selected SBL), `--sbl-dir DIR` (extra
+search dir, repeatable), `--secret 0x...` (override the seed-key secret),
+`--sec-level N` (diag security level;
 secrets can differ per level), `--hw STRING` (assume an F111 for dry-run
 planning), `--test-sbl`, `--quiet-bus`, `--force`, `--rxid`, `--erase-timeout`,
 `--tp-interval`, `--tp-id`, `--logfile`.

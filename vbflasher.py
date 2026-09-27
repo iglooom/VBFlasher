@@ -36,8 +36,8 @@ USAGE
   python3 vbflasher.py --selftest
   python3 vbflasher.py info    FILE.vbf [FILE2.vbf ...]
   python3 vbflasher.py verify  FILE.vbf [...]
-  python3 vbflasher.py ident   --ecu 0x730 [--iface can0]
-  python3 vbflasher.py flash   APP.vbf CAL.vbf [...] [--iface can0]
+  python3 vbflasher.py ident   0x730 [--iface IFACE]
+  python3 vbflasher.py flash   APP.vbf CAL.vbf [...] [--iface IFACE]
   python3 vbflasher.py flash   APP.vbf --dry-run          # plan only, no bus
   python3 vbflasher.py flash   APP.vbf --test-sbl         # load+run SBL only
 """
@@ -139,12 +139,13 @@ def flash_session(txid, files, args):
             f"ecu_address 0x{txid:03X} is not in the registry (ecu_db.py). "
             f"Add an EcuProfile for it.")
     rxid = args.rxid if args.rxid is not None else profile.resp_id()
+    iface = _profile_iface(profile, args.iface)
 
     vbfs = [Vbf(f) for f in files]
     # SBL parts among the given files are loaded as the SBL, not flashed to app.
     print("=" * 72)
     print(f"TARGET  {profile.name}   tx=0x{txid:03X} rx=0x{rxid:03X}   "
-          f"iface={args.iface}")
+          f"bus={profile.bus} iface={iface}")
     print("=" * 72)
     for v in vbfs:
         print(v.describe())
@@ -163,12 +164,12 @@ def flash_session(txid, files, args):
                          "just load an SBL.")
 
     if args.execute:
-        up = iface_is_up(args.iface)
+        up = iface_is_up(iface)
         if up is False:
-            raise SystemExit(f"interface {args.iface} is DOWN. Bring it up "
-                             f"first (e.g. sudo ip link set {args.iface} up).")
-        if up is None and not os.path.exists(f"/sys/class/net/{args.iface}"):
-            raise SystemExit(f"interface {args.iface} does not exist. Check "
+            raise SystemExit(f"interface {iface} is DOWN. Bring it up "
+                             f"first (e.g. sudo ip link set {iface} up).")
+        if up is None and not os.path.exists(f"/sys/class/net/{iface}"):
+            raise SystemExit(f"interface {iface} does not exist. Check "
                              f"`ip link` or pass --iface.")
 
     # --- connect + identity (needs the live F111 to choose SBL/secret) -----
@@ -179,7 +180,7 @@ def flash_session(txid, files, args):
         logf.write(f"\n==== {time.strftime('%F %T')} {profile.name} "
                    f"tx=0x{txid:03X} rx=0x{rxid:03X} ====\n")
 
-    ecu = Ecu(args.iface, txid, rxid, execute=args.execute, logfile=logf)
+    ecu = Ecu(iface, txid, rxid, execute=args.execute, logfile=logf)
 
     hw = args.hw or ""
     ident = {}
@@ -296,7 +297,7 @@ def flash_session(txid, files, args):
 
     # --- execute -----------------------------------------------------------
     tp_bcast = args.tp_id if args.tp_id >= 0 else FUNCTIONAL_ID
-    quiet = BusQuiet(args.iface, tp_bcast, execute=True, enabled=args.quiet_bus)
+    quiet = BusQuiet(iface, tp_bcast, execute=True, enabled=args.quiet_bus)
     # TesterPresent keepalive routing:
     #   * explicit --tp-id N     -> broadcast on N
     #   * --quiet-bus (default)  -> broadcast on 0x7DF: REQUIRED so the OTHER
@@ -423,7 +424,8 @@ def _open_sbl_session(profile, args, need_secret=True):
     close logf in a finally. Mirrors flash_session's preamble exactly."""
     txid = profile.txid
     rxid = args.rxid if args.rxid is not None else profile.resp_id()
-    _check_iface(args.iface)
+    iface = _profile_iface(profile, args.iface)
+    _check_iface(iface)
 
     logf = None
     if getattr(args, "logfile", None):
@@ -432,7 +434,7 @@ def _open_sbl_session(profile, args, need_secret=True):
         logf.write(f"\n==== {time.strftime('%F %T')} {profile.name} "
                    f"mem tx=0x{txid:03X} rx=0x{rxid:03X} ====\n")
 
-    ecu = Ecu(args.iface, txid, rxid, execute=True, logfile=logf)
+    ecu = Ecu(iface, txid, rxid, execute=True, logfile=logf)
     ident = read_identity(ecu, profile, getattr(args, "wake_tries", 8),
                           getattr(args, "wake_timeout", 0.5))
     hw = args.hw or ident.get("F111") or ""
@@ -459,7 +461,7 @@ def _open_sbl_session(profile, args, need_secret=True):
             raise SystemExit(f"no SecurityAccess secret for {profile.name} "
                              f"F111 {hw!r} level {level}. Pass --secret 0x....")
 
-    quiet = BusQuiet(args.iface, FUNCTIONAL_ID, execute=True,
+    quiet = BusQuiet(iface, FUNCTIONAL_ID, execute=True,
                      enabled=getattr(args, "quiet_bus", False))
     ka_can_id = (FUNCTIONAL_ID if getattr(args, "quiet_bus", False) else None)
     ka = Keepalive(ecu, period=args.tp_interval, can_id=ka_can_id)
@@ -665,11 +667,28 @@ def _selector_is_all(sel) -> bool:
     return False
 
 
+def _profile_iface(profile, override):
+    """Use an explicit --iface, otherwise the interface assigned to the ECU bus."""
+    return override or profile.default_iface()
+
+
+def _all_ifaces(override):
+    """Interfaces needed for ALL: override once, or every registered bus."""
+    if override:
+        return [override]
+    return sorted({p.default_iface() for p in ecu_db.ECUS.values()})
+
+
 def _check_iface(iface):
     if not os.path.exists(f"/sys/class/net/{iface}"):
         raise SystemExit(f"interface {iface} does not exist.")
     if iface_is_up(iface) is False:
         raise SystemExit(f"interface {iface} is DOWN.")
+
+
+def _check_ifaces(ifaces):
+    for iface in ifaces:
+        _check_iface(iface)
 
 
 def _connect_by_selector(args):
@@ -681,8 +700,9 @@ def _connect_by_selector(args):
         raise SystemExit(f"unknown ECU {args.ecu!r}. Use a name ({known}), a "
                          f"CAN id (e.g. 726, 0x7E0), or ALL. See `list`.")
     rxid = args.rxid if args.rxid is not None else profile.resp_id()
-    _check_iface(args.iface)
-    ecu = Ecu(args.iface, profile.txid, rxid, execute=True)
+    iface = _profile_iface(profile, args.iface)
+    _check_iface(iface)
+    ecu = Ecu(iface, profile.txid, rxid, execute=True)
     return profile, ecu
 
 
@@ -858,27 +878,30 @@ def _ident_all(args):
     A module that does not answer (not present on this bus / asleep) is noted
     and skipped, not fatal. Uses a short wake so absent modules don't stall.
     """
-    _check_iface(args.iface)
+    ifaces = _all_ifaces(args.iface)
+    _check_ifaces(ifaces)
     # Keep the presence probe FAST — a full 8×0.5s wake per absent module would
     # make a 12-module scan crawl. Cap it; the user's --wake-* still cap it down.
     tries = min(getattr(args, "wake_tries", 2), 2)
     wtmo = min(getattr(args, "wake_timeout", 0.3), 0.3)
     print(f"== identity of ALL {len(ecu_db.ECUS)} registered modules "
-          f"(iface {args.iface}) ==")
+          f"(interfaces {', '.join(ifaces)}) ==")
     present, absent = [], []
     for txid in sorted(ecu_db.ECUS):
         profile = ecu_db.ECUS[txid]
+        iface = _profile_iface(profile, args.iface)
         rxid = profile.resp_id()
-        ecu = Ecu(args.iface, txid, rxid, execute=True)
+        ecu = Ecu(iface, txid, rxid, execute=True)
         # quick probe: is anything home? (bounded, so absent modules are fast)
         if ecu.wake(tries=tries, timeout=wtmo) is None \
                 and ecu.read_did(profile.ident_dids[0], timeout=wtmo) is None:
             absent.append(profile)
             print(f"\n-- {profile.name}  tx=0x{txid:03X} rx=0x{rxid:03X}  "
-                  f"-> no response, skipped")
+                  f"iface={iface} -> no response, skipped")
             continue
         present.append(profile)
-        print(f"\n-- {profile.name}  tx=0x{txid:03X} rx=0x{rxid:03X}")
+        print(f"\n-- {profile.name}  tx=0x{txid:03X} rx=0x{rxid:03X}  "
+              f"iface={iface}")
         read_identity(ecu, profile, wake_tries=1, wake_timeout=wtmo)
     print(f"\n== summary: {len(present)} responded, {len(absent)} silent "
           f"of {len(ecu_db.ECUS)} ==")
@@ -923,19 +946,22 @@ def _dtc_all(args):
     Per module: actual (real-fault) count and total count. Use `dtc <ECU>` to
     list one module in full. Absent/silent modules are skipped fast.
     """
-    _check_iface(args.iface)
+    ifaces = _all_ifaces(args.iface)
+    _check_ifaces(ifaces)
     tries = min(getattr(args, "wake_tries", 2), 2)
     wtmo = min(getattr(args, "wake_timeout", 0.3), 0.3)
     mask = args.status_mask
     print(f"== actual DTC counts across all {len(ecu_db.ECUS)} registered "
-          f"modules (iface {args.iface}, status mask 0x{mask:02X}) ==\n")
-    print("   %-32s %8s %8s" % ("module (tx/rx)", "actual", "total"))
-    print("   " + "-" * 50)
+          f"modules (interfaces {', '.join(ifaces)}, status mask 0x{mask:02X}) ==\n")
+    print("   %-39s %8s %8s" % ("module (tx/rx, iface)", "actual", "total"))
+    print("   " + "-" * 57)
     rows, silent, grand = [], [], 0
     for txid in sorted(ecu_db.ECUS):
         profile = ecu_db.ECUS[txid]
-        ecu = Ecu(args.iface, txid, profile.resp_id(), execute=True)
-        label = f"{profile.name.split()[0]} (0x{txid:03X}/0x{profile.resp_id():03X})"
+        iface = _profile_iface(profile, args.iface)
+        ecu = Ecu(iface, txid, profile.resp_id(), execute=True)
+        label = (f"{profile.name.split()[0]} "
+                 f"(0x{txid:03X}/0x{profile.resp_id():03X}, {iface})")
         # Fast presence probe first: absent modules cost only the short wake,
         # not a full DTC-read timeout. A present module then gets a generous
         # read window (its 19 02 can be a large multi-frame response).
@@ -945,14 +971,14 @@ def _dtc_all(args):
             dtcs, _ = ecu.read_dtcs(status_mask=mask, timeout=20.0)
         if dtcs is None:
             silent.append(profile)
-            print("   %-32s %8s %8s" % (label, "-", "-"))
+            print("   %-39s %8s %8s" % (label, "-", "-"))
             continue
         actual = sum(1 for _, s in dtcs if dtc_is_actual(s))
         grand += actual
         rows.append((profile, actual, len(dtcs)))
         flag = "  <--" if actual else ""
-        print("   %-32s %8d %8d%s" % (label, actual, len(dtcs), flag))
-    print("   " + "-" * 50)
+        print("   %-39s %8d %8d%s" % (label, actual, len(dtcs), flag))
+    print("   " + "-" * 57)
     faulted = [p.name.split()[0] for p, a, _ in rows if a]
     print(f"\n   {grand} actual DTC(s) total across {len(rows)} responding "
           f"module(s); {len(silent)} silent.")
@@ -1000,9 +1026,10 @@ def _cleardtc_all(args):
     so there is NO confirmation. Sent several times so a module that missed
     the first frame still clears. Watch candump for proof if needed.
     """
-    _check_iface(args.iface)
+    ifaces = _all_ifaces(args.iface)
+    _check_ifaces(ifaces)
     print(f"== clear DTCs on ALL modules  (functional 0x{FUNCTIONAL_ID:03X}, "
-          f"iface {args.iface}) ==")
+          f"interfaces {', '.join(ifaces)}) ==")
     print("   NOTE: functional broadcast — responses are suppressed, so there "
           "is NO per-module confirmation.")
     if not args.yes:
@@ -1014,10 +1041,12 @@ def _cleardtc_all(args):
             return
     payload = [0x14, (args.group >> 16) & 0xFF, (args.group >> 8) & 0xFF,
                args.group & 0xFF]
-    functional_broadcast(args.iface, [payload], can_id=FUNCTIONAL_ID,
-                         repeat=args.repeat)
-    print(f"   sent {FUNCTIONAL_ID:03X}#{bytes([len(payload)] + payload).hex().upper()}"
-          f" x{args.repeat}  [unconfirmed]")
+    for iface in ifaces:
+        functional_broadcast(iface, [payload], can_id=FUNCTIONAL_ID,
+                             repeat=args.repeat)
+        print(f"   {iface}: sent "
+              f"{FUNCTIONAL_ID:03X}#{bytes([len(payload)] + payload).hex().upper()}"
+              f" x{args.repeat}  [unconfirmed]")
     print("   done. Re-read a specific module with `dtc <ECU>` to verify.")
 
 
@@ -1040,10 +1069,11 @@ def _reset_all(args):
     Fire-and-forget (suppressed responses). This reboots the whole network;
     on a vehicle do it stationary with the engine off.
     """
-    _check_iface(args.iface)
+    ifaces = _all_ifaces(args.iface)
+    _check_ifaces(ifaces)
     mode = args.mode
     print(f"== ECUReset ALL modules  (functional 0x{FUNCTIONAL_ID:03X}, "
-          f"iface {args.iface}, mode 0x{mode:02X}) ==")
+          f"interfaces {', '.join(ifaces)}, mode 0x{mode:02X}) ==")
     print("   NOTE: functional broadcast — reboots EVERY module; responses "
           "suppressed (no confirmation). Vehicle stationary, engine off.")
     if not args.yes:
@@ -1054,10 +1084,12 @@ def _reset_all(args):
             return
     # sub-function 0x80 (suppressPosRsp) so nobody floods the bus with 51s
     payload = [0x11, mode | 0x80]
-    functional_broadcast(args.iface, [payload], can_id=FUNCTIONAL_ID,
-                         repeat=args.repeat)
-    print(f"   sent {FUNCTIONAL_ID:03X}#{bytes([len(payload)] + payload).hex().upper()}"
-          f" x{args.repeat}  [unconfirmed]")
+    for iface in ifaces:
+        functional_broadcast(iface, [payload], can_id=FUNCTIONAL_ID,
+                             repeat=args.repeat)
+        print(f"   {iface}: sent "
+              f"{FUNCTIONAL_ID:03X}#{bytes([len(payload)] + payload).hex().upper()}"
+              f" x{args.repeat}  [unconfirmed]")
     print("   done. Modules reboot into their default session.")
 
 
@@ -1072,29 +1104,38 @@ def do_silence(args):
     normal. Watch the bus with candump for proof — functional responses are
     suppressed, so the quiet itself is unconfirmed.
     """
-    _check_iface(args.iface)
     period = args.tp_interval if args.tp_interval > 0 else 2.0
     ecu = None
+    quiets = []
+    kas = []
 
     if _selector_is_all(args.ecu):
-        # ALL: functional broadcast, reuse the vehicle-proven BusQuiet machinery
-        quiet = BusQuiet(args.iface, FUNCTIONAL_ID, execute=True, enabled=True)
-        ka = Keepalive(_KaShim(args.iface), period=period, can_id=FUNCTIONAL_ID)
+        # ALL spans both registered buses unless --iface explicitly collapses it
+        # to one interface. Each bus needs its own functional arm + keepalive.
+        ifaces = _all_ifaces(args.iface)
+        _check_ifaces(ifaces)
+        quiets = [BusQuiet(iface, FUNCTIONAL_ID, execute=True, enabled=True)
+                  for iface in ifaces]
+        kas = [Keepalive(_KaShim(iface), period=period, can_id=FUNCTIONAL_ID)
+               for iface in ifaces]
         print(f"== silence ALL modules  (functional 0x{FUNCTIONAL_ID:03X}, "
-              f"iface {args.iface}) ==")
+              f"interfaces {', '.join(ifaces)}) ==")
         print("   NOTE: functional broadcast, responses suppressed — quiet is "
               "UNCONFIRMED. Watch with candump.")
         target = "ALL modules"
-        restore_txt = f"functional 0x{FUNCTIONAL_ID:03X} hardReset"
+        restore_txt = (f"functional 0x{FUNCTIONAL_ID:03X} hardReset on "
+                       f"{', '.join(ifaces)}")
     else:
         profile = ecu_db.resolve(args.ecu)
         if profile is None:
             raise SystemExit(f"unknown ECU {args.ecu!r}. Use a name, CAN id, "
                              "or ALL. See `list`.")
+        iface = _profile_iface(profile, args.iface)
+        _check_iface(iface)
         rxid = args.rxid if args.rxid is not None else profile.resp_id()
-        ecu = Ecu(args.iface, profile.txid, rxid, execute=True)
+        ecu = Ecu(iface, profile.txid, rxid, execute=True)
         print(f"== silence {profile.name}  tx=0x{profile.txid:03X} "
-              f"rx=0x{ecu.rxid:03X}  iface {args.iface} ==")
+              f"rx=0x{ecu.rxid:03X}  iface {iface} ==")
         ecu.wake(tries=getattr(args, "wake_tries", 8),
                  timeout=getattr(args, "wake_timeout", 0.5))
         r = None
@@ -1107,8 +1148,7 @@ def do_silence(args):
         if not (r is not None and r[0] == 0x50):
             raise SystemExit(f"10 02 programmingSession: {fmt(r)}")
         print(f"   OK   10 02 programmingSession   {fmt(r)}  -> module silent")
-        quiet = None
-        ka = Keepalive(ecu, period=period, can_id=None)  # physical keepalive
+        kas = [Keepalive(ecu, period=period, can_id=None)]  # physical keepalive
         target = profile.name
         restore_txt = "11 01 ECUReset"
 
@@ -1120,9 +1160,10 @@ def do_silence(args):
               "  Press Ctrl-C to stop and restore.")
 
     try:
-        if quiet is not None:
+        for quiet in quiets:
             quiet.arm()
-        ka.start()
+        for ka in kas:
+            ka.start()
         t0 = time.time()
         while True:
             time.sleep(0.25)
@@ -1132,13 +1173,15 @@ def do_silence(args):
     except KeyboardInterrupt:
         print("\n   interrupted.")
     finally:
-        ka.stop()
-        if ka.sent:
-            print(f"   keepalive: {ka.sent} TesterPresent frames sent")
+        for ka in kas:
+            ka.stop()
+        sent = sum(ka.sent for ka in kas)
+        if sent:
+            print(f"   keepalive: {sent} TesterPresent frames sent")
         print(f"   restoring ({restore_txt})...")
-        if quiet is not None:
+        for quiet in quiets:
             quiet.restore()
-        elif ecu is not None:
+        if ecu is not None:
             try:
                 ecu.req("1101", timeout=8.0, what="11 01 ECUReset")
             except Exception:  # noqa: BLE001
@@ -1161,8 +1204,8 @@ def do_list(args):
         sbls = ", ".join(sorted({r.filename for r in p.sbls}
                                 | ({p.default_sbl} if p.default_sbl else set())))
         print(f"  0x{txid:03X}  {p.name}")
-        print(f"         rx 0x{p.resp_id():03X}  secrets:{len(p.secrets)}  "
-              f"finalise:{p.finalize}")
+        print(f"         {p.bus} -> {p.default_iface()}  rx 0x{p.resp_id():03X}  "
+              f"secrets:{len(p.secrets)}  finalise:{p.finalize}")
         if sbls:
             print(f"         SBLs: {sbls}")
 
@@ -1414,6 +1457,63 @@ def selftest():
     # the high-half (a FirstFrame-only misread earned NRC 22 at SBL-start).
     chk("IPMA uses FULL 4-byte SBL call address", not ipma.sbl_call_halfword)
     chk("IPMA default SBL", ipma.pick_sbl("x") == "CV4T-14F399-AF.VBF")
+
+    print("\n== per-ECU CAN interface selection ==")
+    chk("BCM is MS-CAN and defaults to can1",
+        getattr(bcm, "bus", None) == "MS-CAN"
+        and getattr(bcm, "default_iface", lambda: None)() == "can1")
+    chk("IPC is MS-CAN and defaults to can1",
+        getattr(ecu_db.get_profile(0x720), "bus", None) == "MS-CAN"
+        and getattr(ecu_db.get_profile(0x720), "default_iface", lambda: None)()
+        == "can1")
+    chk("PSCM is HS-CAN and defaults to can0",
+        getattr(pscm, "bus", None) == "HS-CAN"
+        and getattr(pscm, "default_iface", lambda: None)() == "can0")
+    chk("PCM is HS-CAN and defaults to can0",
+        getattr(ecu_db.get_profile(0x7E0), "bus", None) == "HS-CAN"
+        and getattr(ecu_db.get_profile(0x7E0), "default_iface", lambda: None)()
+        == "can0")
+    _expected_ms = {0x720, 0x726, 0x727, 0x733, 0x7A5}
+    _actual_ms = {txid for txid, p in ecu_db.ECUS.items() if p.bus == "MS-CAN"}
+    chk("all registered MS-CAN modules default to can1",
+        _actual_ms == _expected_ms
+        and all(ecu_db.ECUS[x].default_iface() == "can1" for x in _actual_ms),
+        f"actual={sorted(hex(x) for x in _actual_ms)}")
+    chk("all other registered modules are HS-CAN on can0",
+        all(p.bus == "HS-CAN" and p.default_iface() == "can0"
+            for txid, p in ecu_db.ECUS.items() if txid not in _expected_ms))
+    _iface_for = globals().get("_profile_iface")
+    chk("interface resolver exists", callable(_iface_for))
+    if callable(_iface_for):
+        chk("interface resolver uses profile default",
+            _iface_for(bcm, None) == "can1")
+        chk("--iface overrides profile default",
+            _iface_for(bcm, "vcan7") == "vcan7")
+    _all_iface_fn = globals().get("_all_ifaces")
+    chk("ALL interface resolver exists", callable(_all_iface_fn))
+    if callable(_all_iface_fn):
+        chk("ALL defaults cover HS can0 and MS can1",
+            _all_iface_fn(None) == ["can0", "can1"],
+            str(_all_iface_fn(None)))
+        chk("ALL --iface override uses only override",
+            _all_iface_fn("vcan7") == ["vcan7"])
+    _bp = build_parser()
+    chk("diagnostic --iface default is automatic",
+        _bp.parse_args(["ident", "BCM"]).iface is None)
+    chk("flash --iface default is automatic",
+        _bp.parse_args(["flash", "x.vbf"]).iface is None)
+    chk("explicit --iface is preserved",
+        _bp.parse_args(["ident", "BCM", "--iface", "vcan7"]).iface == "vcan7")
+    chk("single-ECU connection resolves the profile interface",
+        "_profile_iface" in inspect.getsource(_connect_by_selector))
+    chk("flash session resolves the profile interface",
+        "_profile_iface" in inspect.getsource(flash_session))
+    chk("memory/SBL session resolves the profile interface",
+        "_profile_iface" in inspect.getsource(_open_sbl_session))
+    chk("ALL operations resolve both registered interfaces",
+        all("_all_ifaces" in inspect.getsource(fn)
+            for fn in (_ident_all, _dtc_all, _cleardtc_all, _reset_all,
+                       do_silence)))
 
     print("\n== ECU selection by name / id ==")
     chk("resolve('PCM') -> 0x7E0", ecu_db.resolve("PCM") is ecu_db.ECUS[0x7E0])
@@ -1874,8 +1974,9 @@ def build_parser():
         sp.add_argument("ecu", metavar="ECU",
                         help="ECU by name (PCM, BCM, PSCM, ABS, ...), CAN id "
                              "(726, 0x7E0), or ALL / 7DF for every module")
-        sp.add_argument("--iface", default="can0",
-                        help="SocketCAN interface (default can0)")
+        sp.add_argument("--iface", default=None,
+                        help="override SocketCAN interface (default: HS-CAN=can0, "
+                             "MS-CAN=can1)")
         sp.add_argument("--rxid", type=lambda x: int(x, 0), default=None,
                         help="override response CAN ID (default: profile's)")
         sp.add_argument("--wake-tries", type=int, default=8)
@@ -1967,7 +2068,9 @@ def build_parser():
                         help="ECU by name (PSCM, BCM, ...) or CAN id (730)")
         sp.add_argument("--addr", type=lambda x: int(x, 0), required=True,
                         help="start address, e.g. 0x02000000")
-        sp.add_argument("--iface", default="can0")
+        sp.add_argument("--iface", default=None,
+                        help="override SocketCAN interface (default: HS-CAN=can0, "
+                             "MS-CAN=can1)")
         sp.add_argument("--rxid", type=lambda x: int(x, 0), default=None)
         sp.add_argument("--sbl", default=None,
                         help="explicit SBL VBF path (else auto from F111)")
@@ -2019,8 +2122,9 @@ def build_parser():
     s.add_argument("vbf", nargs="+", metavar="FILE",
                    help="VBF file(s) to upload. Multiple allowed; grouped by "
                         "ecu_address. SBL-type files are used as the SBL.")
-    s.add_argument("--iface", default="can0",
-                   help="SocketCAN interface (default can0)")
+    s.add_argument("--iface", default=None,
+                   help="override SocketCAN interface (default: HS-CAN=can0, "
+                        "MS-CAN=can1)")
     s.add_argument("--rxid", type=lambda x: int(x, 0), default=None,
                    help="override response CAN ID (default: profile's)")
     s.add_argument("--sbl", default=None,
