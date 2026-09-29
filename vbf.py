@@ -38,6 +38,32 @@ NRC = {
     0x7F: "serviceNotSupportedInActiveSession",
 }
 
+# NRC 0x21 busyRepeatRequest retry policy. The ECU is ALIVE and answering but
+# not ready to serve this request; retrying is correct, retrying forever is not
+# (see Ecu.req). Linear back-off: attempt n sleeps n * BUSY_BACKOFF, so the
+# default budget spans ~1.65 s before the negative is handed to the caller.
+BUSY_RETRIES = 5
+BUSY_BACKOFF = 0.11
+
+
+def did_status(r):
+    """Describe the outcome of a `22 <DID>` read for the operator.
+
+    Distinguishes the three cases an ident read can land in, which look
+    identical ("-") if you only report the decoded value:
+      * no answer at all  -> the module really is silent on this bus
+      * a negative        -> the module is ALIVE and deliberately refusing
+      * a positive        -> None (nothing to report)
+    """
+    if r is None:
+        return "no response"
+    if len(r) >= 3 and r[0] == 0x7F:
+        nrc = r[2]
+        return "refused: NRC %02X %s" % (nrc, NRC.get(nrc, "?"))
+    if not r or r[0] != 0x62:
+        return "unexpected: " + fmt(r)
+    return None
+
 
 def human(n):
     for u, d in (("MiB", 1 << 20), ("KiB", 1 << 10)):
@@ -380,6 +406,14 @@ class Ecu:
         self.execute = execute
         self.logfile = logfile
         self.sent = []
+        self.last_did_status = None
+        # Serialises ALL access to the ISO-TP socket. The TesterPresent
+        # keepalive runs on its own thread and, when it has no separate
+        # broadcast socket, writes to THIS socket. A 3E 80 injected between a
+        # FirstFrame and its ConsecutiveFrames corrupts the segmented send;
+        # the kernel aborts the transfer and the next recv() raises
+        # OSError [Errno 70] Communication error on send. See Keepalive.
+        self.lock = threading.RLock()
         self.s = open_isotp(iface, txid, rxid) if execute else None
 
     def _log(self, line):
@@ -387,7 +421,17 @@ class Ecu:
             self.logfile.write(line + "\n")
             self.logfile.flush()
 
-    def req(self, hexstr, timeout=5.0, pending_timeout=30.0, what=""):
+    def req(self, hexstr, timeout=5.0, pending_timeout=30.0, what="",
+            busy_retries=BUSY_RETRIES):
+        # The lock spans the WHOLE transaction (send + all recvs), not just the
+        # send: a keepalive slipped in while we are waiting for a response
+        # would still interleave with the ECU's flow control on the next send.
+        with self.lock:
+            return self._req(hexstr, timeout, pending_timeout, what,
+                             busy_retries)
+
+    def _req(self, hexstr, timeout=5.0, pending_timeout=30.0, what="",
+             busy_retries=BUSY_RETRIES):
         hexstr = hexstr.replace(" ", "").upper()
         req_sid = int(hexstr[0:2], 16)
         pos_sid = (req_sid + 0x40) & 0xFF
@@ -398,6 +442,7 @@ class Ecu:
             return None
         self.s.send(bytes.fromhex(hexstr))
         pend = 0
+        busy = 0
         # First response is bounded by `timeout`. Only AFTER the ECU says
         # 0x78 responsePending do we extend the budget to `pending_timeout`
         # (and each pending restarts that clock). Otherwise a silent/asleep
@@ -420,7 +465,23 @@ class Ecu:
                 self.s.settimeout(pending_timeout)   # extend; clock restarts
                 continue
             if len(r) >= 3 and r[0] == 0x7F and r[2] == 0x21:
-                time.sleep(0.05)
+                # busyRepeatRequest: the ECU is alive but not ready. Retry a
+                # BOUNDED number of times, then RETURN the negative so the
+                # caller can decide. An unbounded retry here hangs the tool
+                # forever against a module that is permanently busy — the
+                # observed failure was an IPC answering every ident DID with
+                # `7F 22 21`, producing an endless 22 F124 / 7F 22 21 storm on
+                # the bus and a flasher that never reached the plan. A dead or
+                # bootloader-resident module is exactly the case where this
+                # must fail fast and legibly.
+                busy += 1
+                if busy > busy_retries:
+                    self._log(f"{time.strftime('%H:%M:%S')} <- busyRepeat "
+                              f"x{busy}, giving up: {fmt(r)}")
+                    return r
+                self._log(f"{time.strftime('%H:%M:%S')} <- busyRepeatRequest "
+                          f"#{busy}, retrying")
+                time.sleep(BUSY_BACKOFF * busy)      # linear back-off
                 self.s.send(bytes.fromhex(hexstr))
                 self.s.settimeout(timeout)
                 continue
@@ -473,6 +534,7 @@ class Ecu:
     def read_did(self, did, timeout=3.0):
         """Return the decoded string value of a 22 <DID> read, or None."""
         r = self.req("22" + did, timeout=timeout, what="22 " + did)
+        self.last_did_status = did_status(r)
         if r and r[0] == 0x62:
             return r[3:].decode("latin-1", "replace").rstrip("\x00 ")
         return None
@@ -626,6 +688,7 @@ class Keepalive:
     def __init__(self, ecu, period=1.5, can_id=None):
         self.ecu, self.period, self.can_id = ecu, period, can_id
         self.sent = 0
+        self.skipped = 0
         self._stop = threading.Event()
         self._t = None
         self._raw = None
@@ -640,10 +703,32 @@ class Keepalive:
             while not self._stop.wait(self.period):
                 try:
                     if self._raw is not None:
+                        # Separate raw socket, different CAN id: cannot
+                        # interleave with the target's ISO-TP transfer.
                         self._raw.send(_frame(self.can_id, _single([0x3E, 0x80])))
+                        self.sent += 1
                     else:
-                        self.ecu.s.send(bytes.fromhex("3E80"))
-                    self.sent += 1
+                        # PHYSICAL keepalive shares the target's ISO-TP socket.
+                        # It MUST NOT be written between a FirstFrame and its
+                        # ConsecutiveFrames — that corrupts the segmented send
+                        # and the kernel kills the transfer with
+                        # OSError [Errno 70] Communication error on send.
+                        # Take the same lock req() holds for a whole
+                        # transaction. Never BLOCK on it: during a flash the
+                        # socket is busy almost continuously, and a queued
+                        # keepalive would fire the instant the lock is released
+                        # (i.e. between two 36 TransferData requests), adding
+                        # latency for no benefit. A skipped keepalive is
+                        # harmless — S3 is refreshed by the TransferData
+                        # traffic itself.
+                        if not self.ecu.lock.acquire(blocking=False):
+                            self.skipped += 1
+                            continue
+                        try:
+                            self.ecu.s.send(bytes.fromhex("3E80"))
+                            self.sent += 1
+                        finally:
+                            self.ecu.lock.release()
                 except OSError:
                     return
         self._t = threading.Thread(target=run, daemon=True)
