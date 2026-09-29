@@ -45,7 +45,9 @@ import argparse
 import inspect
 import os
 import re
+import socket
 import sys
+import threading
 import time
 
 # realpath (not abspath) so a symlink in ~/.local/bin resolves back to the real
@@ -126,17 +128,115 @@ def read_identity(ecu, profile, wake_tries=8, wake_timeout=0.5):
               "F111": "hardware/Core Assembly (F111)",
               "F113": "core assembly (F113)", "F18C": "ECU serial (F18C)",
               "F190": "VIN (F190)", "F91": "ext hardware (F191)"}
+    reasons = {}
     for did in profile.ident_dids:
         val = ecu.read_did(did)
         ident[did] = val
-        print("   %-32s %s" % (labels.get(did, did), val if val else "-"))
+        why = ecu.last_did_status
+        if why:
+            reasons[did] = why
+        # Report WHY a DID is blank. A module that answers `7F 22 21
+        # busyRepeatRequest` to every ident is ALIVE and refusing, not absent —
+        # printing a bare "-" for both makes a recoverable module look dead.
+        print("   %-32s %s" % (labels.get(did, did),
+                               val if val else f"-   ({why})" if why else "-"))
+    if not any(ident.values()) and reasons:
+        refused = [d for d, w in reasons.items() if w.startswith("refused")]
+        if refused:
+            print(f"   NOTE: the ECU ANSWERED every ident read with a negative "
+                  f"response ({len(refused)}/{len(reasons)} DIDs) — it is alive "
+                  f"on the bus, not absent.")
+            print("         A module sitting in its bootloader, or busy, "
+                  "cannot report identity but can still be flashed.")
+            print("         Pass --hw <F111 string> to choose the SBL/secret "
+                  "manually, or --sbl /path/to/SBL.vbf.")
+        else:
+            print("   NOTE: no ident DID answered at all — check the "
+                  "interface, the CAN IDs and that the module is powered.")
     return ident
+
+
+def part_family(p):
+    """'EJ7T-14C088-AH' -> '14C088'; None when it is not a Ford part number.
+
+    The middle field is the FUNCTION of the part (which software slot it
+    fills); the prefix is the platform and the suffix the revision.
+    """
+    if not p:
+        return None
+    m = re.match(r"^[A-Z0-9]+-([A-Z0-9]+)-[A-Z0-9]+$", p.strip().upper())
+    return m.group(1) if m else None
+
+
+# Ident DIDs that carry SOFTWARE part numbers and may therefore be used as a
+# flash gate. F111/F113 are HARDWARE (a hardware part can never equal a VBF's
+# software part number — gating on one refuses every legitimate flash), F18C is
+# a serial and F190 the VIN.
+SW_IDENT_DIDS = ("F188", "F120", "F124", "F125", "F108", "F10A")
+
+
+def resolve_gate_did(vbf, ident, profile):
+    """Pick the ident DID that this VBF actually replaces, and judge it.
+
+    Returns (did, live_value, verdict) where verdict is one of:
+      'exact'  - the ECU already reports this exact part number
+      'family' - same software slot, different revision: the normal upgrade
+      'nomatch'- no DID carries this part family: probably the wrong file
+
+    WHY NOT sw_part_type: a Ford IPC carries FOUR software parts across four
+    DIDs (observed on the bench cluster: F188=EJ7T-14C026-AK,
+    F120=EJ7T-14C026-BH, F124=EJ7T-14C088-AH, F125=EJ7T-14C088-BH) but a VBF
+    only declares EXE or DATA. The static EXE->F188 map therefore compared a
+    14C088 part against the 14C026 DID and refused a perfectly valid flash,
+    which --force then papered over. The part-number FAMILY says which slot a
+    file belongs in, so resolve the DID from the data instead of guessing from
+    the type.
+    """
+    fam = part_family(vbf.part)
+    if fam:
+        # Prefer an exact hit, then any DID in the same family.
+        cands = [(d, ident.get(d)) for d in SW_IDENT_DIDS if ident.get(d)]
+        for d, val in cands:
+            if val.strip().upper() == (vbf.part or "").strip().upper():
+                return d, val, "exact"
+        for d, val in cands:
+            if part_family(val) == fam:
+                return d, val, "family"
+        if cands:
+            return None, None, "nomatch"
+    # No usable identity (dead/refusing module, or an unparseable part
+    # number): fall back to the static map and let the caller report it.
+    did = profile.ident_did_by_type.get(vbf.ptype, "F188")
+    return did, ident.get(did), "unknown"
 
 
 # --------------------------------------------------------------------------
 # one ECU session (may hold several VBFs)
 # --------------------------------------------------------------------------
-def _check_flash_order(to_flash):
+def _is_virtual_map(v):
+    """True if this VBF's block addresses are NOT a linear flash memory map.
+
+    Ford/Volvo "Jade" parts (the QNX-based IPC, ecu_address 0x720) do not
+    address flash at all: the header documents a `virtual_start_address =
+    0x30000000` plus a `files_to_download` list of virtual lookup indices, and
+    the body is a stream of alternating 4-byte index writes at 0x3FFFFFFC and
+    payload blobs at 0x30000000. Both addresses REPEAT dozens of times inside
+    one file (EJ7T-14C088-AH: 66 blocks at 0x3FFFFFFC, 4 at 0x30000000), which
+    a real linear image can never do — writing the same address twice in one
+    part would mean the part overwrites itself.
+
+    That repetition is therefore the detector, and it is also why the
+    interval bookkeeping in _check_flash_order() is meaningless for such a
+    part: every Jade file "erases" the 4-byte index cell 0x3FFFFFFC that every
+    other Jade file "writes", so ANY ordering of two of them looks fatal. The
+    real serialisation for these parts is the on-target post_download.sh
+    script, not the VBF address map.
+    """
+    starts = [b["start"] for b in v.flash_blocks()]
+    return len(starts) != len(set(starts))
+
+
+def _check_flash_order(to_flash, force=False):
     """Refuse an ordering where a later part's ERASE wipes an earlier part's
     freshly written blocks.
 
@@ -147,18 +247,37 @@ def _check_flash_order(to_flash):
     other order this tool would erase away the SIGCFG it had just written and
     leave the module with a blank config, with nothing on the bus indicating a
     failure. Ordering is the operator's to fix, so name the offenders.
+
+    Parts whose addresses are virtual rather than physical (see
+    _is_virtual_map) are excluded from the bookkeeping entirely — checking them
+    produces a guaranteed false positive, not safety.
+
+    `force` downgrades a real overlap to a printed warning. It exists because
+    this guard models the address map, and a map it models wrongly must not be
+    able to block a flash outright; it is NOT a reason to skip thinking about
+    the order.
     """
     written = []                                    # [(name, start, end)]
     for v in to_flash:
         name = os.path.basename(v.path)
+        if _is_virtual_map(v):
+            print(f"   note: {name} uses virtual (non-flash) block addresses; "
+                  f"excluded from the flash-order check")
+            continue
         for a, l in v.flash_erase():
             for pname, ps, pe in written:
                 if a < pe and ps < a + l:
+                    msg = (f"{name} erases 0x{a:08X}..0x{a + l:08X}, which "
+                           f"covers blocks already written by {pname} "
+                           f"(0x{ps:08X}..0x{pe:08X}). Put {name} BEFORE "
+                           f"{pname} on the command line.")
+                    if force:
+                        print(f"   WARNING (--force): flash order would "
+                              f"destroy data: {msg}")
+                        continue
                     raise SystemExit(
-                        f"flash order would destroy data: {name} erases "
-                        f"0x{a:08X}..0x{a + l:08X}, which covers blocks already "
-                        f"written by {pname} (0x{ps:08X}..0x{pe:08X}). Put "
-                        f"{name} BEFORE {pname} on the command line.")
+                        f"flash order would destroy data: {msg} "
+                        f"Use --force to flash in this order anyway.")
         for b in v.flash_blocks():
             written.append((name, b["start"], b["start"] + b["length"]))
 
@@ -193,7 +312,7 @@ def flash_session(txid, files, args):
     if not to_flash and not args.test_sbl:
         raise SystemExit("no flashable (non-SBL) VBF given; use --test-sbl to "
                          "just load an SBL.")
-    _check_flash_order(to_flash)
+    _check_flash_order(to_flash, force=args.force)
 
     if args.execute:
         up = iface_is_up(iface)
@@ -222,7 +341,15 @@ def flash_session(txid, files, args):
         if not hw and not args.sbl:
             raise SystemExit(
                 "could not read F111 from the ECU and no --hw/--sbl given; "
-                "cannot choose the SBL/secret. Pass --hw <F111> or --sbl.")
+                "cannot choose the SBL/secret.\n"
+                "    If the ECU is answering with negative responses (see "
+                "above) it is alive and flashable —\n"
+                "    it just cannot report its identity. Pass --hw <F111> or "
+                "--sbl /path/to/SBL.vbf.\n"
+                "    Known F111 prefixes for this ECU: "
+                + (", ".join(sorted({r.hw_prefix or "(any)"
+                                     for r in profile.secrets}))
+                   or "(none registered)"))
     else:
         print("\n== current firmware / identity ==")
         print("   [dry run] F111 would be read here to choose SBL + secret.")
@@ -300,10 +427,22 @@ def flash_session(txid, files, args):
             for b in wblocks:
                 print(f"         -> 0x{b['start']:08X}  {human(b['length'])}")
             gate = profile.ident_did_by_type.get(v.ptype, "F188")
-            if v.ptype == "EXE":
-                print(f"      identity gate: ECU {gate} must match {v.part}")
+            if ident:
+                gdid, live, verdict = resolve_gate_did(v, ident, profile)
+                if verdict == "exact":
+                    print(f"      identity: already on the ECU as "
+                          f"{gdid}={live} (re-flash of the same part)")
+                elif verdict == "family":
+                    print(f"      identity gate: replaces {gdid}={live} "
+                          f"(same family {part_family(v.part)})")
+                elif verdict == "nomatch":
+                    print(f"      identity gate: NO DID carries family "
+                          f"{part_family(v.part)} — wrong file for this module?")
+                else:
+                    print(f"      identity: {gate} (unverified)")
             else:
-                print(f"      identity: {gate} reported only (not gated)")
+                print(f"      identity gate: resolved from the part family "
+                      f"at flash time (dry run — ECU not read)")
         if profile.finalize:
             print("\n   FINALISE  31 01 0304 (checkProgrammingDependencies) "
                   "after the last block")
@@ -364,15 +503,34 @@ def flash_session(txid, files, args):
         progress.start()
         quiet.arm()
 
-        # identity gate on EXE parts
+        # Identity gate. Resolve WHICH DID a file replaces from its part-number
+        # family rather than from sw_part_type — an IPC carries several
+        # software parts and the type alone names the wrong DID (see
+        # resolve_gate_did). Only a file whose family matches NO DID on the
+        # module is refused; a same-family revision change is a normal flash.
         for v in to_flash:
-            if v.ptype == "EXE" and not args.force:
-                gate = profile.ident_did_by_type.get("EXE", "F188")
-                live = ident.get(gate) or ecu.read_did(gate) or ""
-                if live and v.part and live.strip() != v.part.strip():
-                    raise SystemExit(
-                        f"identity mismatch: ECU {gate}={live!r} != VBF "
-                        f"{v.part!r}. Use --force to override.")
+            gdid, live, verdict = resolve_gate_did(v, ident, profile)
+            if verdict == "exact":
+                print(f"   {v.part}: already on the ECU as {gdid} "
+                      f"(re-flashing the same part)")
+            elif verdict == "family":
+                print(f"   {v.part}: replaces {gdid}={live} "
+                      f"(same part family)")
+            elif verdict == "nomatch":
+                msg = (f"no software DID on this ECU carries part family "
+                       f"{part_family(v.part)} (file {os.path.basename(v.path)}"
+                       f", part {v.part}). The module reports: "
+                       + ", ".join(f"{d}={ident[d]}" for d in SW_IDENT_DIDS
+                                   if ident.get(d))
+                       + ". This is probably the wrong file for this module.")
+                if args.force:
+                    print(f"   WARNING (--force): {msg}")
+                else:
+                    raise SystemExit(f"identity mismatch: {msg} "
+                                     f"Use --force to flash it anyway.")
+            else:
+                print(f"   {v.part}: identity unverified "
+                      f"(no readable software DID); proceeding")
 
         print("\n== session + security ==")
         # A just-woken module can still drop the first programmingSession
@@ -454,7 +612,9 @@ def flash_session(txid, files, args):
         try:
             ka.stop()
             if ka.sent:
-                print(f"   keepalive: {ka.sent} TesterPresent frames")
+                print(f"   keepalive: {ka.sent} TesterPresent frames"
+                      + (f" ({ka.skipped} skipped while the socket was busy)"
+                         if ka.skipped else ""))
             quiet.restore()
             if logf:
                 logf.close()
@@ -1563,8 +1723,42 @@ def selftest():
             _bad_order = True
         chk("flash order SIGCFG-then-EXE REFUSED (erase would wipe it)",
             _bad_order)
+        try:
+            _check_flash_order([vs, ve], force=True)
+            _forced = True
+        except SystemExit:
+            _forced = False
+        chk("flash order --force downgrades the refusal to a warning", _forced)
     else:
         print("  SKIP  GWM VBFs not present for the flash-order guard")
+
+    # Jade/QNX IPC parts address a VIRTUAL map (virtual_start_address
+    # 0x30000000 + a 4-byte lookup-index cell at 0x3FFFFFFC), not flash. Both
+    # addresses repeat many times within ONE file, so the linear-interval
+    # bookkeeping reports every ordering of two such parts as fatal. Assert the
+    # exemption fires on a real Jade file and that plain linear parts are still
+    # checked.
+    _ldir = "/home/gl/Projects/ford/IPC/Lincoln"
+    _jade = [os.path.join(_ldir, n) for n in
+             ("EJ7T-14C088-AH.vbf", "EJ7T-14C088-BH.vbf",
+              "EJ7T-14C026-BH.vbf")]
+    if all(os.path.exists(p) for p in _jade):
+        _jv = [Vbf(p) for p in _jade]
+        for _v in _jv:
+            chk(f"{os.path.basename(_v.path)} detected as a virtual map",
+                _is_virtual_map(_v))
+        try:
+            _check_flash_order(_jv)
+            _jade_ok = True
+        except SystemExit:
+            _jade_ok = False
+        chk("Jade IPC parts accepted in any order (guard does not apply)",
+            _jade_ok)
+    else:
+        print("  SKIP  Lincoln IPC VBFs not present for the virtual-map guard")
+    if os.path.exists(_exe):
+        chk("a linear part is NOT mistaken for a virtual map",
+            not _is_virtual_map(Vbf(_exe)))
 
     print("\n== per-ECU CAN interface selection ==")
     chk("BCM is MS-CAN and defaults to can1",
@@ -1890,7 +2084,9 @@ def selftest():
     # a 0x78 arrives. Regression guard for the sleeping-bus hang.
     print("\n== transport timeout semantics ==")
     import vbf as _vbf
-    src = inspect.getsource(_vbf.Ecu.req)
+    # req() is a thin locking wrapper around _req(); inspect BOTH so these
+    # source assertions keep covering the real recv loop.
+    src = inspect.getsource(_vbf.Ecu.req) + inspect.getsource(_vbf.Ecu._req)
     chk("req() sets settimeout(timeout) before the recv loop",
         "self.s.settimeout(timeout)" in src)
     chk("req() extends to pending_timeout only inside the 0x78 branch",
@@ -1925,11 +2121,186 @@ def selftest():
     chk("after 0x78 the wait extends to pending_timeout (40.0)",
         e.s.timeouts[-1] == 40.0, str(e.s.timeouts))
 
+    # NRC 0x21 busyRepeatRequest must be retried a BOUNDED number of times and
+    # then RETURNED. GROUND TRUTH: a dead/bootloader IPC answered `22 F124`
+    # with `7F 22 21` forever; the old unbounded retry loop resent the request
+    # in a tight loop and the flasher never reached the plan (candump showed a
+    # 720/728 storm). Assert both halves: it does retry, and it gives up.
+    class _BusySock:
+        def __init__(self):
+            self.sends = 0
+
+        def settimeout(self, t):
+            pass
+
+        def send(self, d):
+            self.sends += 1
+
+        def recv(self, n):
+            return bytes([0x7F, 0x22, 0x21])          # busyRepeatRequest
+
+    eb = _vbf.Ecu("can0", 0x720, 0x728, execute=False)
+    eb.execute = True
+    eb.s = _BusySock()
+    t0 = time.monotonic()
+    rb = eb.req("22F124", timeout=1.0, busy_retries=3)
+    dt = time.monotonic() - t0
+    chk("busyRepeatRequest is RETRIED (not returned immediately)",
+        eb.s.sends == 4, f"{eb.s.sends} sends for 3 retries")
+    chk("busyRepeatRequest retry is BOUNDED (returns the negative)",
+        rb is not None and rb[0] == 0x7F and rb[2] == 0x21, _vbf.fmt(rb))
+    chk("bounded busy retry terminates quickly", dt < 5.0, f"{dt:.2f}s")
+    chk("req() does not loop forever on 0x21 (source has a busy bound)",
+        "busy > busy_retries" in src)
+
+    # An ident read must report WHY it is blank: a refusing module is ALIVE.
+    eb2 = _vbf.Ecu("can0", 0x720, 0x728, execute=False)
+    eb2.execute = True
+    eb2.s = _BusySock()
+    chk("read_did returns None on a negative response",
+        eb2.read_did("F111") is None)
+    chk("read_did records the NRC so the caller can say 'alive but refusing'",
+        (eb2.last_did_status or "").startswith("refused: NRC 21"),
+        str(eb2.last_did_status))
+
+    class _SilentSock:
+        def settimeout(self, t):
+            pass
+
+        def send(self, d):
+            pass
+
+        def recv(self, n):
+            raise socket.timeout()
+
+    es = _vbf.Ecu("can0", 0x720, 0x728, execute=False)
+    es.execute = True
+    es.s = _SilentSock()
+    es.read_did("F111")
+    chk("a genuinely silent ECU is reported differently from a refusing one",
+        es.last_did_status == "no response", str(es.last_did_status))
+
+    # KEEPALIVE / ISO-TP SOCKET RACE. GROUND TRUTH (bench IPC, candump
+    # 2026-09-29): a PHYSICAL TesterPresent keepalive shares the target's
+    # ISO-TP socket. 43 of 48 `3E 80` frames were written between a FirstFrame
+    # and its ConsecutiveFrames during 36 TransferData; the kernel aborted the
+    # segmented send and the next recv() raised
+    # OSError [Errno 70] Communication error on send, 36.9% into a 2.4 MiB
+    # block. Assert the transaction lock serialises the two writers.
+    chk("Ecu owns a lock for whole transactions", hasattr(_vbf.Ecu, "req")
+        and "self.lock" in inspect.getsource(_vbf.Ecu.req))
+    chk("Keepalive takes the ECU lock non-blockingly (physical mode)",
+        "self.ecu.lock.acquire(blocking=False)"
+        in inspect.getsource(_vbf.Keepalive.start))
+
+    class _SegSock:
+        """Fails if a write lands inside a multi-frame send, as the kernel does.
+
+        The race window is INSIDE send(): the kernel streams a FirstFrame plus
+        N ConsecutiveFrames and only then returns. A concurrent write during
+        that window is what corrupts the transfer. An earlier version of this
+        fake flipped the flag only BETWEEN send() and recv(), leaving a window
+        so small the keepalive never hit it — it passed with the fix reverted.
+        """
+        def __init__(self):
+            self.in_segment = False
+            self.violations = 0
+            self.frames = 0
+
+        def settimeout(self, t):
+            pass
+
+        def send(self, d):
+            self.frames += 1
+            if self.in_segment:
+                self.violations += 1
+                raise OSError(70, "Communication error on send")
+            if len(d) > 7:                      # segmented on the wire
+                self.in_segment = True
+                try:
+                    # ~3 ms for a 130-byte transfer at 500 kbit/s. Time must
+                    # actually pass here or there is no window to race.
+                    time.sleep(0.002)
+                finally:
+                    self.in_segment = False
+
+        def recv(self, n):
+            return bytes([0x76, 0x01])
+
+    seg = _SegSock()
+    eseg = _vbf.Ecu("can0", 0x720, 0x728, execute=False)
+    eseg.execute = True
+    eseg.s = seg
+    # Drive the REAL Keepalive class, not a hand-rolled imitation: a local
+    # copy of the locking logic would pass even with the fix reverted out of
+    # vbf.py (verified — it did), testing the test instead of the code.
+    kseg = _vbf.Keepalive(eseg, period=0.001)
+    kseg.start()
+    try:
+        for _ in range(200):
+            eseg.req("36" + "01" + "AA" * 128, timeout=1.0)
+    finally:
+        kseg.stop()
+    chk("no keepalive write lands inside a segmented transfer (Errno 70 race)",
+        seg.violations == 0, f"{seg.violations} interleavings")
+    chk("the keepalive really did contend for the socket",
+        kseg.sent + kseg.skipped > 0,
+        f"sent={kseg.sent} skipped={kseg.skipped}")
+
+    # IDENTITY GATE resolves the DID from the PART FAMILY, not sw_part_type.
+    # GROUND TRUTH (bench Lincoln IPC, 2026-09-29): the cluster carries FOUR
+    # software parts across four DIDs —
+    #   F188=EJ7T-14C026-AK  F120=EJ7T-14C026-BH
+    #   F124=EJ7T-14C088-AH  F125=EJ7T-14C088-BH
+    # while each VBF only declares EXE or DATA. The old static EXE->F188 map
+    # compared EJ7T-14C088-AH (an EXE) against the 14C026 DID and refused a
+    # legitimate flash; --force then hid a real gate rather than an error.
+    print("\n== identity gate: part-family DID resolution ==")
+    _bench = {"F188": "EJ7T-14C026-AK", "F120": "EJ7T-14C026-BH",
+              "F124": "EJ7T-14C088-AH", "F125": "EJ7T-14C088-BH",
+              "F111": "EJ7T-14F094-AA", "F113": "EJ7T-10849-AK"}
+    chk("part_family('EJ7T-14C088-AH') == '14C088'",
+        part_family("EJ7T-14C088-AH") == "14C088",
+        str(part_family("EJ7T-14C088-AH")))
+    chk("part_family ignores a non-part string",
+        part_family("EJAK074768") is None)
+    _ipc = ecu_db.get_profile(0x720)
+    _lin = "/home/gl/Projects/ford/IPC/Lincoln"
+    _cases = [("EJ7T-14C088-AH.vbf", "F124", "exact"),
+              ("EJ7T-14C088-BH.vbf", "F125", "exact"),
+              ("EJ7T-14C026-AK.vbf", "F188", "exact"),
+              ("EJ7T-14C026-BH.vbf", "F120", "exact")]
+    if all(os.path.exists(os.path.join(_lin, n)) for n, _, _ in _cases):
+        for fn, want_did, want_verdict in _cases:
+            vv = Vbf(os.path.join(_lin, fn))
+            d, live, verdict = resolve_gate_did(vv, _bench, _ipc)
+            chk(f"{fn} [{vv.ptype}] gates on {want_did} ({want_verdict})",
+                d == want_did and verdict == want_verdict,
+                f"got {d} / {verdict}")
+        # A revision change in the same slot is a NORMAL flash, not a refusal.
+        vv = Vbf(os.path.join(_lin, "EJ7T-14C088-AH.vbf"))
+        d, live, verdict = resolve_gate_did(
+            vv, dict(_bench, F124="EJ7T-14C088-AG"), _ipc)
+        chk("a same-family revision change is allowed ('family')",
+            d == "F124" and verdict == "family", f"{d} / {verdict}")
+        # A part whose family appears on NO DID is the real error case.
+        d, live, verdict = resolve_gate_did(
+            vv, {"F188": "CV6T-14C217-AR"}, _ipc)
+        chk("a foreign part family is REFUSED ('nomatch')",
+            verdict == "nomatch", f"{d} / {verdict}")
+        # A hardware DID must never satisfy the gate.
+        d, live, verdict = resolve_gate_did(vv, {"F111": "EJ7T-14C088-AH"},
+                                            _ipc)
+        chk("F111 (hardware) is not usable as a software gate",
+            verdict != "exact", f"{d} / {verdict}")
+    else:
+        print("  SKIP  Lincoln IPC VBFs not present for the gate test")
+
     # STALE-FRAME DRAIN: a frame that is neither the positive nor the negative
     # response to THIS request (e.g. a duplicated 50 02 programmingSession
     # still queued when we send 27 01) must be discarded, not returned.
     chk("req() drains stale frames (skips non-matching SID)",
-        "stale" in inspect.getsource(_vbf.Ecu.req).lower())
+        "stale" in src.lower())
 
     class _StaleSock:
         def __init__(self, seq):
@@ -2293,7 +2664,9 @@ def build_parser():
     s.add_argument("--yes", "-y", action="store_true",
                    help="skip the 'are you sure?' confirmation (for scripting)")
     s.add_argument("--force", action="store_true",
-                   help="ignore an EXE identity mismatch")
+                   help="downgrade refusals to warnings: an EXE identity "
+                        "mismatch, and a flash-order overlap where a later "
+                        "part's erase covers an earlier part's blocks")
     s.add_argument("--quiet-bus", action="store_true",
                    help="silence other modules for the flash (functional "
                         "10 82; unconfirmed, network-wide; off by default)")
