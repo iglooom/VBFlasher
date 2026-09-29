@@ -131,9 +131,8 @@ ECUS = {
         secrets=(
             SecretRule("", 1, "621C067260"),
             SecretRule("", 3, "8408F57701"),
-            # U502 (MKC/Kuga) EJ7T cluster: different level-3 secret, solved
-            # from two UCDS 27 03/04 exchanges (ucds_ipc_U502_HB5TE*.log).
             SecretRule("EJ7T-14F094", 3, "0000DCBF06"),
+            SecretRule("EJ7T-14F094", 1, "00004A7722"),
         ),
         sbls=(
             SblRule("BM5T-14C226-C", "BM5T-14C025-AD.vbf"),
@@ -144,6 +143,7 @@ ECUS = {
             SblRule("CV4T-14F094-B", "CV4T-14C025-BC.vbf"),
             SblRule("F1ET-14F094-A", "F1ET-14C025-AB.vbf"),
             SblRule("GJ5T-14F094-B", "GJ5T-14C025-BB.vbf"),
+            SblRule("EJ7T-14F094", "DP5T-14C025-CA.vbf"),
         ),
     ),
     0x726: EcuProfile(
@@ -199,12 +199,6 @@ ECUS = {
         ident_dids=("F113", "F188", "F108", "F10A", "F111", "F18C", "F190"),
         secrets=(SecretRule("", None, "00009875CA"),),
         default_sbl="CV4T-14F399-AF.VBF",
-        # GROUND TRUTH (candump-stock-flash.log, UCDS): the SBL is started with
-        # the FULL 4-byte call address. The multi-frame request reassembles to
-        #   706#1008310103010082 + 706#2100...  ->  31 01 0301 00 82 00 00
-        # i.e. 31 01 0301 + 0x00820000. An earlier reading took only the ISO-TP
-        # FirstFrame (…0301 0082) and wrongly concluded a 2-byte (high-half)
-        # argument; that truncated address earns NRC 22 conditionsNotCorrect.
         sbl_call_halfword=False,
         finalize=True,
     ),
@@ -273,29 +267,13 @@ ECUS = {
     ),
     0x716: EcuProfile(
         name="GWM", txid=0x716, bus="HS-CAN", aliases=("GWM",),
-        # PROVEN: live-flashed with vbflasher using the level-1 secret below.
-        # Secrets DERIVED from UCDS captures in /home/gl/Projects/ford/GWM/.
-        # ford_seckey's key is XOR-linear in the 40-bit secret with rank 24, so
-        # ONE seed/key pair pins the secret to a 2^16 coset whose members are
-        # byte-identical for EVERY seed (verified over 200 random seeds); the
-        # values below are the canonical (minimal) coset members.
-        #   L1  ucds_gwm_flash.log:        10 02 -> 27 01 seed 790F2C
-        #                                            27 02 key  7BBE1D
-        #   L3  ucds_gwm_writedid{,2,3}.log: 10 03 -> 27 03 seed E68E01
-        #                                            27 04 key  EECCA0
-        # The two levels are genuinely different secrets: L3's value on the L1
-        # seed gives E3BFE6, not 7BBE1D. Flashing uses LEVEL 1.
         secrets=(
             SecretRule("", 1, "0000F64E88"),
             SecretRule("", 3, "00000D14EF"),
         ),
         sbls=(SblRule("", "CM5T-14F532-AA.vbf"),),
-        # SIGCFG is a third sw_part_type alongside EXE/DATA on this module; it
-        # is report-only (never gated), mapped to the signal-configuration DID.
         ident_did_by_type={"EXE": "F188", "DATA": "F124",
                            "SIGCFG": "F108", "SBL": "F188"},
-        # ucds_gwm_flash.log: 31 01 0304 is sent after the last TransferExit
-        # and before the reset.
         finalize=True,
     ),
 }
