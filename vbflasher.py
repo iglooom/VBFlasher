@@ -44,6 +44,7 @@ USAGE
 import argparse
 import inspect
 import os
+import re
 import sys
 import time
 
@@ -282,7 +283,12 @@ def flash_session(txid, files, args):
                 for a, l in erase:
                     print(f"         0x{a:08X}  len 0x{l:06X} ({human(l)})")
             else:
-                print("      ERASE (none declared)")
+                print("      ERASE (none declared in the header)")
+                if re.search(r"//.*erase\s*=", v.header_text):
+                    print("            note: the header's erase block is "
+                          "COMMENTED OUT — deliberately not sent.")
+                    print("            (sending it earns NRC 31 "
+                          "requestOutOfRange from the SBL)")
             if omitted:
                 print(f"      OMIT  {len(omitted)} protected region(s) "
                       f"(not erased/written):")
@@ -1978,6 +1984,45 @@ def selftest():
                 for b in vp.flash_blocks()))
     else:
         print(f"  SKIP  {os.path.basename(_pcm)} not present")
+
+    # Header COMMENTS must never be parsed as declarations. Ford ships the
+    # F1FT IPMA calibration with its whole `erase = {...};` block commented
+    # out; a raw-header regex resurrects it and the SBL answers the phantom
+    # erase with NRC 31 requestOutOfRange.
+    print("\n== VBF header comment stripping ==")
+    _sc = _vbf.strip_comments
+    chk("// line comment removed",
+        "erase" not in _sc("a = 1;\r\n  // erase = { { 0x1, 0x2 } };\r\n"))
+    chk("/* block */ comment removed",
+        "erase" not in _sc("a = 1; /* erase = { { 0x1, 0x2 } }; */ b = 2;"))
+    chk("comment stripping preserves length",
+        len(_sc("x; // hi\r\ny;")) == len("x; // hi\r\ny;"))
+    chk("newlines survive stripping so line structure is intact",
+        _sc("x; // hi\r\ny;").endswith("\r\ny;"))
+    chk("a // inside a quoted string is NOT treated as a comment",
+        'http://x' in _sc('description = { "http://x" };'))
+    chk("real (uncommented) erase still parses",
+        "erase" in _sc('   erase = { { 0x00003000, 0x00004428 }\r\n };'))
+    _f1ft = ("/home/gl/Projects/ford/IPMA/Research/"
+             "F1FT-14F398-AG_LKA40_LCA45.VBF")
+    if os.path.exists(_f1ft):
+        vf = Vbf(_f1ft)
+        chk("F1FT calibration declares NO erase (its block is commented out)",
+            vf.erase == [], repr(vf.erase))
+        chk("F1FT calibration still walks its one block at 0x00902000",
+            [(b["start"], b["length"]) for b in vf.blocks]
+            == [(0x902000, 0x640D)])
+        chk("F1FT calibration container verifies clean", vf.check() == [],
+            "; ".join(vf.check()))
+    else:
+        print(f"  SKIP  {os.path.basename(_f1ft)} not present")
+    _cv4t = "/home/gl/Projects/ford/IPMA/Research/CV4T-14F398-AF.VBF"
+    if os.path.exists(_cv4t):
+        vc = Vbf(_cv4t)
+        chk("CV4T calibration (uncommented) keeps its erase region",
+            vc.erase == [(0x3000, 0x4428)], repr(vc.erase))
+    else:
+        print(f"  SKIP  {os.path.basename(_cv4t)} not present")
 
     # read_identity must run end-to-end in EXECUTE mode (guards the flash path
     # against undefined-name / signature regressions that dry-run never hits).

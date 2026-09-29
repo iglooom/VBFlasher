@@ -161,6 +161,39 @@ def lzss_decode(c):
 # --------------------------------------------------------------------------
 # VBF
 # --------------------------------------------------------------------------
+def strip_comments(text):
+    """Blank out // line and /* */ block comments in a VBF header.
+
+    Replaces comment bytes with spaces so every surviving offset is unchanged
+    (nothing downstream indexes into it today, but a shifted header is a
+    classic source of off-by-one bugs). Quoted strings are honoured, so a
+    `description = { "http://..." }` is never truncated.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] not in "\r\n":
+                out[i] = " "
+                i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if text[k] not in "\r\n":
+                    out[k] = " "
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
 class Vbf:
     def __init__(self, path):
         self.path = path
@@ -178,7 +211,14 @@ class Vbf:
         if he is None:
             raise ValueError(f"{path}: no header braces found")
         self.header_text = raw[:he].decode("latin-1")
-        h = self.header_text
+        # Parse the CODE, never the comments. Ford ships VBFs whose `erase`
+        # block is COMMENTED OUT (`// erase = { { 0x00902000, 0x0000640d } };`
+        # in F1FT-14F398-AG) — a regex over the raw header happily matches it
+        # and the flasher then sends an erase the SBL rejects with
+        # NRC 31 requestOutOfRange. Strip // and /* */ (respecting strings)
+        # first; whatever survives is what the file actually declares.
+        self.header_code = strip_comments(self.header_text)
+        h = self.header_code
 
         def field(name):
             m = re.search(name + r"\s*=\s*([^;]+);", h)
