@@ -118,7 +118,10 @@ def read_identity(ecu, profile, wake_tries=8, wake_timeout=0.5):
     # A sleeping bus drops the first frames; poke it several times briefly
     # rather than block on one long read.
     ecu.wake(tries=wake_tries, timeout=wake_timeout)
-    labels = {"F188": "application sw (F188)", "F124": "calibration (F124)",
+    labels = {"F188": "application sw (F188)", "F120": "application sw #2 (F120)",
+              "F124": "calibration (F124)", "F125": "calibration #2 (F125)",
+              "F108": "signal configuration (F108)",
+              "F10A": "ECU cal-config part (F10A)",
               "F111": "hardware/Core Assembly (F111)",
               "F113": "core assembly (F113)", "F18C": "ECU serial (F18C)",
               "F190": "VIN (F190)", "F91": "ext hardware (F191)"}
@@ -132,6 +135,33 @@ def read_identity(ecu, profile, wake_tries=8, wake_timeout=0.5):
 # --------------------------------------------------------------------------
 # one ECU session (may hold several VBFs)
 # --------------------------------------------------------------------------
+def _check_flash_order(to_flash):
+    """Refuse an ordering where a later part's ERASE wipes an earlier part's
+    freshly written blocks.
+
+    GROUND TRUTH (ford/GWM/ucds_gwm_flash.log): the GWM's EXE part erases
+    0x00008000 +0x38000 (224 KiB) while its SIGCFG part loads at 0x00008000 —
+    i.e. the application erase covers the whole signal-configuration area. UCDS
+    therefore sends EXE first and SIGCFG second. Given the two files in the
+    other order this tool would erase away the SIGCFG it had just written and
+    leave the module with a blank config, with nothing on the bus indicating a
+    failure. Ordering is the operator's to fix, so name the offenders.
+    """
+    written = []                                    # [(name, start, end)]
+    for v in to_flash:
+        name = os.path.basename(v.path)
+        for a, l in v.flash_erase():
+            for pname, ps, pe in written:
+                if a < pe and ps < a + l:
+                    raise SystemExit(
+                        f"flash order would destroy data: {name} erases "
+                        f"0x{a:08X}..0x{a + l:08X}, which covers blocks already "
+                        f"written by {pname} (0x{ps:08X}..0x{pe:08X}). Put "
+                        f"{name} BEFORE {pname} on the command line.")
+        for b in v.flash_blocks():
+            written.append((name, b["start"], b["start"] + b["length"]))
+
+
 def flash_session(txid, files, args):
     profile = ecu_db.get_profile(txid)
     if profile is None:
@@ -162,6 +192,7 @@ def flash_session(txid, files, args):
     if not to_flash and not args.test_sbl:
         raise SystemExit("no flashable (non-SBL) VBF given; use --test-sbl to "
                          "just load an SBL.")
+    _check_flash_order(to_flash)
 
     if args.execute:
         up = iface_is_up(iface)
@@ -428,9 +459,6 @@ def flash_session(txid, files, args):
     stats = progress.summary()
     if stats:
         print(stats)
-    print("    Power-cycle if the module does not return on its own, then "
-          "re-read identity with the `ident` subcommand.")
-
 
 # --------------------------------------------------------------------------
 # generic raw memory read / write (memread / memwrite) — reuses the proven
@@ -1477,6 +1505,60 @@ def selftest():
     # the high-half (a FirstFrame-only misread earned NRC 22 at SBL-start).
     chk("IPMA uses FULL 4-byte SBL call address", not ipma.sbl_call_halfword)
     chk("IPMA default SBL", ipma.pick_sbl("x") == "CV4T-14F399-AF.VBF")
+    # GWM: secret derived from the UCDS writedid captures
+    # (ford/GWM/ucds_gwm_writedid{,2,3}.log) — 10 03, then 27 03 seed E68E01
+    # answered with 27 04 key EECCA0. Reproduce that exact pair.
+    gwm = ecu_db.get_profile(0x716)
+    _gwm_l3 = gwm.pick_secret("", 3)
+    _gwm_l1 = gwm.pick_secret("", 1)
+    chk("GWM level3 secret registered",
+        _gwm_l3 == bytes.fromhex("00000D14EF"), (_gwm_l3 or b"").hex())
+    chk("GWM level3 secret reproduces writedid key E68E01 -> EECCA0",
+        _gwm_l3 is not None
+        and ford_seckey.key_from_seed([0xE6, 0x8E, 0x01],
+                                      _gwm_l3).hex() == "eecca0",
+        ford_seckey.key_from_seed([0xE6, 0x8E, 0x01],
+                                  _gwm_l3 or b"\0" * 5).hex())
+    # ucds_gwm_flash.log: the FLASH uses level 1 (10 02 -> 27 01/02).
+    chk("GWM level1 secret registered",
+        _gwm_l1 == bytes.fromhex("0000F64E88"), (_gwm_l1 or b"").hex())
+    chk("GWM level1 secret reproduces flash key 790F2C -> 7BBE1D",
+        _gwm_l1 is not None
+        and ford_seckey.key_from_seed([0x79, 0x0F, 0x2C],
+                                      _gwm_l1).hex() == "7bbe1d",
+        ford_seckey.key_from_seed([0x79, 0x0F, 0x2C],
+                                  _gwm_l1 or b"\0" * 5).hex())
+    chk("GWM level1 and level3 secrets are distinct", _gwm_l1 != _gwm_l3)
+    chk("GWM SBL == CM5T-14F532-AA.vbf",
+        gwm.pick_sbl("") == "CM5T-14F532-AA.vbf", str(gwm.pick_sbl("")))
+    chk("GWM finalises (31 01 0304 seen in capture)", gwm.finalize)
+    chk("GWM SIGCFG part type is report-only (not the EXE gate)",
+        gwm.ident_did_by_type.get("SIGCFG") not in (None, "F188"),
+        str(gwm.ident_did_by_type.get("SIGCFG")))
+    # Flash-order guard. GROUND TRUTH ford/GWM/ucds_gwm_flash.log: the EXE part
+    # erases 0x8000+0x38000, which COVERS the SIGCFG load address 0x8000 — so
+    # EXE must go first. Assert the guard accepts UCDS's order and rejects the
+    # reverse one, which would silently erase the just-written config.
+    _gdir = "/home/gl/Projects/ford/GWM"
+    _exe = os.path.join(_gdir, "EG9T-14F530-DA.VBF")
+    _sig = os.path.join(_gdir, "EG9T-14F529-DA.VBF")
+    if os.path.exists(_exe) and os.path.exists(_sig):
+        ve, vs = Vbf(_exe), Vbf(_sig)
+        try:
+            _check_flash_order([ve, vs])
+            _ok_order = True
+        except SystemExit:
+            _ok_order = False
+        chk("flash order EXE-then-SIGCFG accepted (UCDS order)", _ok_order)
+        try:
+            _check_flash_order([vs, ve])
+            _bad_order = False
+        except SystemExit:
+            _bad_order = True
+        chk("flash order SIGCFG-then-EXE REFUSED (erase would wipe it)",
+            _bad_order)
+    else:
+        print("  SKIP  GWM VBFs not present for the flash-order guard")
 
     print("\n== per-ECU CAN interface selection ==")
     chk("BCM is MS-CAN and defaults to can1",
