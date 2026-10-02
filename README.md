@@ -14,6 +14,8 @@ IPMA) plus the OEM-derived secret/SBL tables from FoCCCus `ford_c346.cpp`.
 | `ecu_db.py` | **the only place ECU-specific data lives** — addresses, secrets, SBLs, quirks |
 | `ford_seckey.py` | the one universal seed→key algorithm (5-byte secret, big-endian) |
 | `vbf.py` | VBF container parser + ISO-TP transport + bus-quiet / keepalive / download |
+| `ford_keybag.py` | 343 candidate secrets transcribed from FoCCCus `bruteSecretKey()` |
+| `ford_brutekey.py` | dictionary attack on an unknown SecurityAccess secret (`--self-test` for the offline proof) |
 
 The seed→key algorithm is identical across every Ford ECU here; only the 5-byte
 **secret** and the **SBL** differ. This was proven: keys computed from the
@@ -116,6 +118,7 @@ vbflasher flash  APP.vbf                   # live; asks "are you sure? [y/N]"
 vbflasher flash  APP.vbf CAL.vbf           # several files in one session
 vbflasher flash  APP.vbf --yes             # skip the prompt (scripting)
 vbflasher flash  APP.vbf --test-sbl        # load+run SBL only, no erase/write
+vbflasher flash  GWM --test-sbl --sbl /path/to/SBL.vbf  # same, no application VBF
 
 # raw memory / EEPROM read & write (loads the SBL first, then 35 / 34+FF00)
 # PSCM EEPROM lives at 0x02000000, 1024 bytes (see PSCM_ucds_eeprom_procedure.md)
@@ -138,13 +141,88 @@ prompt), `--sbl PATH` (override the auto-selected SBL), `--sbl-dir DIR` (extra
 search dir, repeatable), `--secret 0x...` (override the seed-key secret),
 `--sec-level N` (diag security level;
 secrets can differ per level), `--hw STRING` (assume an F111 for dry-run
-planning), `--test-sbl`, `--quiet-bus`, `--force`, `--rxid`, `--erase-timeout`,
-`--tp-interval`, `--tp-id`, `--logfile`.
+planning), `--test-sbl`, `--quiet-bus`, `--decompress`, `--skip-blank`,
+`--blank-byte`, `--force`, `--rxid`,
+`--erase-timeout`, `--tp-interval`, `--tp-id`, `--logfile`.
+
+### `--decompress` — transmit a compressed payload in plain
+
+A VBF with `data_format_identifier = 0x10` carries LZSS-packed blocks. The
+default (and the OEM/UCDS-proven) path sends those bytes **verbatim**:
+`34 10 44 <addr> <compressed-len>`, and the ECU's boot loader unpacks them
+internally. `--decompress` instead expands the payload on the host and sends it
+plain — `34 00 44 <addr> <unpacked-len>` — for a boot loader that does not
+implement format 0x10. The unpacked bytes are exactly the ones the block
+CRC-16 covers, so integrity is still verified either way; the erase map and
+load addresses are unchanged, only the transferred length grows (e.g. the IPC
+`GJ5T-14C026-DL`: 3.4 MiB on the wire by default, 16.0 MiB with
+`--decompress`). For a raw (`0x00` / absent dfi) container the flag is a no-op.
+Prefer the default: sending expanded bytes to an ECU that expects compressed
+ones — or the reverse — bricks the module.
+
+### `--skip-blank [BYTES]` — don't transmit erased-blank padding
+
+Many parts are mostly padding. `HM5T-14C088-BB` (C-MAX hybrid IPC) unpacks to
+31.9 MiB of which **45% is 0xFF**, with single runs of 10.8 MiB and 1.4 MiB.
+An erased NOR cell already reads 0xFF, so writing that padding is a no-op that
+still costs wire time. `--skip-blank` splits the block around those runs and
+sends only the non-blank spans — several `34`/`36…`/`37` downloads instead of
+one:
+
+    --decompress                   1 block,  31.9 MiB
+    --decompress --skip-blank      4 blocks, 19.4 MiB   (39% less)
+
+BYTES is the minimum run length to skip, default `4096` when the flag is given
+bare. Only erased `0xFF` gaps are safe to omit. `--blank-byte` values other
+than `0xFF` are refused: reassembly over a different fill could look correct
+while the actual erased flash still contains `0xFF`.
+
+**On a compressed (dfi 0x10) part it stays compressed.** The payload is
+expanded host-side, split around the blank runs, and each fragment is then
+**re-packed with the project's own LZSS encoder**, so the wire format is still
+`34 10 44 <addr> <compressed-len>` and the ECU decompresses as usual — the
+expanded image is only ever a host-side intermediate:
+
+    default (send file as-is)        8.74 MiB on the wire
+    --skip-blank                     7.76 MiB   (11% less, still dfi 0x10)
+    --decompress --skip-blank       19.40 MiB   (plain, for a BL that can't unpack)
+
+The 11% is close to the measured ceiling: the 0xFF runs occupy 15.8% of that
+file's compressed stream, and an instrumented token map shows our encoder needs
+**1.00x** Ford's bits on the identical byte range, so almost nothing is lost in
+the re-pack. (Ford's headline 21% ratio vs our 48% on a whole block is a
+*content* difference — their stream includes the trivially-compressible padding
+we removed — not an encoder weakness.)
+
+Four safety rules, all enforced, not assumed:
+
+1. **A gap is only dropped if the part's own `erase` map covers it.** Outside an
+   erase region the pre-existing flash content is unknown, so 0xFF is a value
+   that must really be written. A region protected by `omit` does not count as
+   erased either. With no `erase` header, nothing is skipped.
+2. **Fragment bounds are aligned outward to 0x100**, so a download never starts
+   or ends mid-word/mid-page; the kept span only ever grows.
+3. **The split must be provably lossless.** Before anything is transmitted the
+   fragments are reassembled over a 0xFF canvas and compared byte-for-byte with
+   the full payload; any difference aborts the flash. (Verified to catch the
+   failure: dropping 64 real bytes mid-fragment is reported as
+   `reassembly differs … would leave a hole in flash`.)
+4. **Re-packed fragments are decoded back before use**, through the same
+   decoder the ECU implements, and the reassembly check runs on those decoded
+   bytes. A re-pack that does not round-trip aborts the flash rather than
+   reaching a module.
+
+`lzss_encode()` output is *not* bit-identical to Ford's packer and does not need
+to be — the ECU only has to decode it. Never use it to rebuild a `.vbf` whose
+stored CRCs must stay valid: those cover the decompressed bytes (preserved), but
+the container's block length would change.
 
 ## Flow
 
 1. Parse **and fully verify** every VBF (block CRC-16 + file CRC-32) before any
-   byte reaches the ECU. Files are grouped by `ecu_address` into sessions.
+   byte reaches the ECU. A mismatch aborts the flash; `--force` downgrades it
+   to a warning (for a deliberately patched file whose CRCs were not
+   recomputed). Files are grouped by `ecu_address` into sessions.
 2. Connect, read **F111** and the other identity DIDs (printed as "current
    firmware").
 3. From F111: pick the SBL VBF and the secret from `ecu_db`. Missing SBL ⇒ stop
@@ -152,8 +230,22 @@ planning), `--test-sbl`, `--quiet-bus`, `--force`, `--rxid`, `--erase-timeout`,
 4. Print the **plan**: SBL, what is erased, what is written, current firmware
    IDs. Ask **"Are you sure? [y/N]"** (skip with `--yes`).
 5. On `y`: `10 02` → `27 01/02` (seed-key) → download+start SBL → per region
-   `31 01 FF00` erase → `34/36/37` download → optional `31 01 0304` finalise →
-   `11 01` reset. `--test-sbl` stops right after the SBL starts.
+   `31 01 FF00` erase → `34/36/37` download → profile-required `31 01 0304`
+   finalise → `11 01` reset. `--test-sbl` stops right after the SBL starts.
+
+For a DM5T IPC held in PBL after an incomplete programming sequence, wait for
+any other flash session to finish and use a known-good, original MCU VBF:
+
+```bash
+vbflasher flash HM5T-14C026-BC.VBF --iface can1 \
+    --hw DM5T-14F094-AB --recovery --execute
+```
+
+`--recovery` waits for the PBL instead of probing live identity first; the
+selected F111 determines the SBL and level-1 secret. This still erases and
+rewrites MCU application flash and asks for confirmation. Check for finalise
+reply `71 01 03 04 10 02` before reset; otherwise stop rather than repeat
+flashes. OEM VBFs are supplied by the operator, not stored in this repository.
 
 ## Raw memory / EEPROM read & write
 
@@ -241,6 +333,74 @@ padding (Ford ignores short frames); `0x78`
 responsePending treated as CONTINUE with a clock that restarts on each pending;
 EXE parts gated on F188==VBF part (DATA/calibration reported only); `--quiet-bus`
 is opt-in and unconfirmed.
+
+## Finding an unknown secret
+
+When `ecu_db` has no secret for a module, `ford_brutekey.py` tries 381
+candidates: the 343 FoCCCus ships (`KEYBAG`, from `c346::bruteSecretKey()`)
+plus 38 harvested from other public Ford tools (`KEYBAG_EXT` — jakka351's
+`FG-Falcon` per-module `.key` XML files and `FG1.py` table, and the
+`Ford-ECU-Bruteforcer` C# keybag / ForScan word list). `--no-ext` restricts the
+run to the FoCCCus set.
+
+```bash
+ford_brutekey.py IPC --iface can1 --level 1 --dry-run   # plan, opens no socket
+ford_brutekey.py IPC --iface can1 --level 1 --yes       # live run
+ford_brutekey.py IPC --iface can1 --level 3 --only 000024E4DE --yes  # test one
+ford_brutekey.py --self-test                            # offline proof, no bus
+```
+
+It sends **only** `10 xx`, `27 <level>/<level+1>`, `3E 00`, and `11 01
+ECUReset` when the module locks out after its 2–3 allowed wrong keys — no
+erase, no download, no DID write. The reset is a visible cluster reboot, so the
+vehicle must be stationary. A hit is re-verified in a second session with a
+fresh seed before it is reported, and an all-zero seed (level already unlocked,
+every key accepted) is refused rather than reported as a find.
+
+This is a **dictionary**, not a brute force. But the full keyspace is NOT 2^40:
+the keygen is affine over GF(2), and the secret→key map has rank 24, so its
+kernel is 16 bits. Every secret therefore belongs to a class of 2^16 = 65536
+secrets that yield **identical keys for every seed**, and only **2^24 =
+16,777,216** classes are distinguishable. Enumerating `c << 16` for
+`c` in [0, 2^24) hits every class exactly once (verified: 4000 sampled
+representatives gave 4000 distinct key signatures, zero collisions).
+
+Measured on the C-MAX IPC: **166 tries/s** sustained (each try is `27 01` +
+`27 02`, ~3 ms each, keygen only 43 µs = 0.7% of wall time; 1 stall per 20000).
+That makes an exhaustive level-1 search **28 h worst case, 14 h expected** —
+feasible, unlike 2^40 which would take 2.1 million years at the same rate.
+
+Note that key guesses **cannot** be batched: only the first `27 02` after a
+seed is evaluated, and every later one returns `NRC 24 requestSequenceError`,
+so each try costs a fresh `27 01`.
+
+A dictionary miss means "not in this dictionary" — prefer solving the secret
+from a UCDS capture (the affine structure lets ONE seed/key pair pin the class
+exactly by Gaussian elimination) over a 14-hour search.
+
+Measured: the 381-candidate level-1 dictionary run against the **running
+application** returned `NRC 35 invalidKey` for every candidate. That says
+nothing about the PBL's separate security context. The DM5T PBL's level-1
+secret `EC6D038211` has since been validated on the live module and is
+registered in `ecu_db.py`; no key search is needed to flash this PBL.
+
+The secret required for flashing resides in the PBL, not in the application
+VBF: the application starts at `0x0000C000` and excludes the first 48 KB of
+flash. A RAM dump of the running application found its level-3 secret at
+`0x400086D3` (`01 02 03 04 05`), but not the PBL level-1 secret. Do not
+confuse a level-3 unlock of the application with level-1 access to the PBL.
+
+The PBL needs level 1 before it accepts a RAM SBL or any application download:
+
+| session | level | `34` download | `23` read |
+|---|---|---|---|
+| `10 03` extended | 3 (known) | NRC 7F, refused | works — RAM only |
+| `10 02` programming (PBL) | 1 (`EC6D038211`, live-validated) | works after unlock | NRC 11, not supported |
+
+After transferring a stock HM5T MCU application, the DM5T PBL also requires
+`31 01 0304` finalisation. Success is `71 01 03 04 10 02`: the PBL then writes
+its boot-commit marker. A positive `0x71` alone is not sufficient, and a reset
+without finalisation can leave the module in PBL despite a successful transfer.
 
 ## Adding a new ECU
 

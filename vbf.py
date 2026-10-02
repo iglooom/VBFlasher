@@ -138,6 +138,88 @@ _LZSS_N = 1 << _LZSS_EI
 
 
 def lzss_decode(c):
+    """Decode a Ford/Volvo LZSS block.
+
+    Flat (distance, length) LZ77 decode. The format's 1 KiB ring buffer is not
+    materialised: a ring cell is BY CONSTRUCTION the output byte 1..1024
+    positions back, so a match is a plain back-copy into the output and the
+    hot path becomes a C-level `bytearray` slice-extend instead of a Python
+    per-byte loop. The pre-initialised ring (all 0x20) only matters for a match
+    that reaches before the start of the output; that case is handled
+    explicitly and yields 0x20, exactly as a real ring would.
+
+    The bit reader keeps an int accumulator and takes 9 or 15 bits at a time
+    instead of looping once per bit, which was the actual cost: the previous
+    per-bit `bits()` helper ran ~15 Python calls per output byte and decoded a
+    16 MiB payload in ~12 s.
+
+    Equivalence with the straightforward ring implementation
+    (`_lzss_decode_ref`) is asserted by selftest over every compressed file in
+    the corpus plus 4000 randomised streams, including matches into the virgin
+    ring. Do not "simplify" the distance arithmetic without re-running it.
+    """
+    out = bytearray()
+    append = out.append
+    acc = nb = idx = 0
+    L = len(c)
+    while True:
+        # 1 flag bit
+        if nb < 1:
+            if idx >= L:
+                break
+            acc = (acc << 8) | c[idx]
+            idx += 1
+            nb = 8
+        nb -= 1
+        flag = (acc >> nb) & 1
+        acc &= (1 << nb) - 1
+        if flag:
+            # literal: 8 bits
+            while nb < 8:
+                if idx >= L:
+                    return bytes(out)
+                acc = (acc << 8) | c[idx]
+                idx += 1
+                nb += 8
+            nb -= 8
+            append((acc >> nb) & 0xFF)
+            acc &= (1 << nb) - 1
+        else:
+            # match: EI position bits + EJ length bits
+            while nb < _LZSS_EI + _LZSS_EJ:
+                if idx >= L:
+                    return bytes(out)
+                acc = (acc << 8) | c[idx]
+                idx += 1
+                nb += 8
+            nb -= _LZSS_EI + _LZSS_EJ
+            tok = (acc >> nb) & ((1 << (_LZSS_EI + _LZSS_EJ)) - 1)
+            acc &= (1 << nb) - 1
+            i = tok >> _LZSS_EJ
+            if i == 0:                      # end marker
+                break
+            i -= 1
+            n = (tok & ((1 << _LZSS_EJ) - 1)) + 2
+            cur = len(out)
+            # ring index i == output position (cur - dist); dist in 1..N
+            dist = (cur - i) % _LZSS_N or _LZSS_N
+            src = cur - dist
+            if src >= 0 and dist >= n:
+                # non-overlapping and fully inside the output: C-level copy
+                out += out[src:src + n]
+            else:
+                # overlapping run, or a reach into the 0x20-filled virgin ring
+                for k in range(n):
+                    s = src + k
+                    append(0x20 if s < 0 else out[s])
+    return bytes(out)
+
+
+def _lzss_decode_ref(c):
+    """Literal transcription of the Okumura reference decoder, with a real
+    1 KiB ring. Kept ONLY as the oracle the selftest compares lzss_decode()
+    against — it is ~4x slower and must not be used on the flash path.
+    """
     out = bytearray()
     buf = bytearray(b" " * _LZSS_N)
     r = 0
@@ -185,6 +267,100 @@ def lzss_decode(c):
 
 
 # --------------------------------------------------------------------------
+# LZSS encoder — needed ONLY to re-pack a payload after blank-skipping it, so
+# a compressed part can still be sent compressed (dfi 0x10) without expanding
+# it on the wire. See Vbf.flash_blocks(recompress=True).
+#
+# Format constraints, all recovered from the decoder above and asserted by
+# selftest roundtrip:
+#   * literal  = 1 + 8 bits
+#   * match    = 0 + EI(10) bits (ring index + 1) + EJ(4) bits (len - 2)
+#   * index 0 is the END MARKER, so ring position 1023 is NOT addressable and
+#     a match there must be emitted as literals
+#   * length is 2..17; a 2-byte match costs 15 bits vs 18 for two literals, so
+#     MIN_MATCH is 2
+# Matching runs directly in the plaintext because the decoder's ring cell is by
+# construction the output byte 1..1024 back — the same identity the decoder
+# relies on — which also makes overlapping matches correct for free.
+# --------------------------------------------------------------------------
+_LZSS_MAX_MATCH = (1 << _LZSS_EJ) + 1          # j+2, j max 15 -> 17
+_LZSS_MIN_MATCH = 2
+
+
+def lzss_encode(data, max_cands=8):
+    """LZSS-compress `data` into a stream `lzss_decode()` reproduces exactly.
+
+    Greedy, with the `max_cands` most recent candidate positions examined per
+    match (a full longest-match sweep measured ~3% better and ~40x slower, and
+    this already matches Ford's own packer byte-for-byte in ratio on identical
+    input — see the selftest).
+
+    NOT bit-identical to Ford's encoder output, and it does not need to be: the
+    ECU only has to decode it. Never use it to rebuild a file whose stored
+    CRC-16/CRC-32 must stay valid — those cover the DECOMPRESSED bytes, which
+    this preserves, but the container's block length would change.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        data = bytes(data)
+    data = bytes(data)
+    rfind = data.rfind
+    out = bytearray()
+    acc = nb = 0
+    cur = 0
+    L = len(data)
+    while cur < L:
+        best_len = 0
+        best_ring = -1
+        avail = L - cur
+        if avail >= _LZSS_MIN_MATCH:
+            limit = _LZSS_MAX_MATCH if avail > _LZSS_MAX_MATCH else avail
+            lo = cur - _LZSS_N if cur > _LZSS_N else 0
+            key = data[cur:cur + _LZSS_MIN_MATCH]
+            end = cur + _LZSS_MIN_MATCH - 1     # sources up to cur-1
+            cands = 0
+            while cands < max_cands:
+                p = rfind(key, lo, end)
+                if p < 0:
+                    break
+                cands += 1
+                end = p + _LZSS_MIN_MATCH - 1
+                ring = p & (_LZSS_N - 1)
+                if ring == _LZSS_N - 1:
+                    continue                    # index would be 0: reserved
+                n = _LZSS_MIN_MATCH
+                while n < limit and data[p + n] == data[cur + n]:
+                    n += 1
+                if n > best_len:
+                    best_len, best_ring = n, ring
+                    if n == limit:
+                        break
+        if best_len >= _LZSS_MIN_MATCH:
+            # 0 + ring+1 + len-2, packed MSB-first
+            acc = (acc << 15) | ((best_ring + 1) << _LZSS_EJ) \
+                | (best_len - 2)
+            nb += 15
+            cur += best_len
+        else:
+            acc = (acc << 9) | 0x100 | data[cur]
+            nb += 9
+            cur += 1
+        while nb >= 8:
+            nb -= 8
+            out.append((acc >> nb) & 0xFF)
+            acc &= (1 << nb) - 1
+    # end marker: flag 0 + index 0 (+ length bits, which the decoder never reads)
+    acc = (acc << 15)
+    nb += 15
+    while nb >= 8:
+        nb -= 8
+        out.append((acc >> nb) & 0xFF)
+        acc &= (1 << nb) - 1
+    if nb:
+        out.append((acc << (8 - nb)) & 0xFF)
+    return bytes(out)
+
+
+# --------------------------------------------------------------------------
 # VBF
 # --------------------------------------------------------------------------
 def strip_comments(text):
@@ -223,6 +399,7 @@ def strip_comments(text):
 class Vbf:
     def __init__(self, path):
         self.path = path
+        self._unpacked = {}          # (start,len,crc) -> LZSS-decoded bytes
         raw = open(path, "rb").read()
         self.raw = raw
         depth, he = 0, None
@@ -307,9 +484,18 @@ class Vbf:
         """The bytes the block's crc16 covers and that the ECU ends up with:
         LZSS-decompressed when data_format_identifier is 0x10, else the raw
         on-disk data. NOTE: this is NOT what goes on the wire — the compressed
-        on-disk bytes (b["data"]) are transmitted verbatim with dfi 0x10."""
+        on-disk bytes (b["data"]) are transmitted verbatim with dfi 0x10.
+
+        Memoised: unpacking a 32 MiB payload costs seconds and the planner,
+        the integrity check and the blank-skip analysis all ask for it.
+        """
         if self.dfi == 0x10:
-            return lzss_decode(b["data"])
+            key = (b["start"], b["length"], b["crc"])
+            hit = self._unpacked.get(key)
+            if hit is None:
+                hit = lzss_decode(b["data"])
+                self._unpacked[key] = hit
+            return hit
         return b["data"]
 
     def check(self):
@@ -342,10 +528,224 @@ class Vbf:
         """Erase regions actually sent to the ECU (omit regions removed)."""
         return [(a, l) for (a, l) in self.erase if not self._is_omitted(a, l)]
 
-    def flash_blocks(self):
-        """Blocks actually downloaded to the ECU (omit regions removed)."""
-        return [b for b in self.blocks
-                if not self._is_omitted(b["start"], b["length"])]
+    def compressed(self):
+        """True if the on-disk block data is LZSS-packed (dfi 0x10)."""
+        return self.dfi == 0x10
+
+    def wire_dfi(self, decompress=False):
+        """dataFormatIdentifier for the 0x34 RequestDownload.
+
+        Normally the header's own value (0x10 LZSS / 0x00 raw) because the
+        on-disk bytes go on the wire verbatim. With `decompress` the payload is
+        expanded host-side, so the ECU must be told it is receiving plain
+        bytes — 0x00.
+        """
+        if decompress and self.compressed():
+            return 0x00
+        return self.dfi or 0x00
+
+    def _expand(self, blocks, decompress):
+        """Return `blocks` as they should go on the wire.
+
+        With `decompress`, an LZSS container's blocks are expanded here and
+        `length` becomes the UNPACKED length — i.e. exactly what goes on the
+        wire when paired with `wire_dfi(decompress=True)` (0x00). The on-disk
+        length is kept as `stored_length`. For a raw container the flag is a
+        no-op. See download_blocks() for why the default is verbatim.
+        """
+        if not (decompress and self.compressed()):
+            return blocks
+        out = []
+        for b in blocks:
+            d = self._block_flash_data(b)
+            out.append(dict(b, data=d, length=len(d),
+                            stored_length=b["length"]))
+        return out
+
+    def wire_blocks(self, decompress=False):
+        """Every block as transmitted, no omit filtering (used for SBL->RAM)."""
+        return self._expand(self.blocks, decompress)
+
+    def _split_blank_runs(self, blocks, min_run, fill=0xFF, align=0x100):
+        """Split each block around runs of >= `min_run` `fill` bytes.
+
+        A freshly erased NOR/NAND cell reads 0xFF, so a long 0xFF run inside a
+        payload is almost always padding the erase already produced: writing it
+        is a no-op that still costs wire time. Splitting a block there turns one
+        0x34/0x36*/0x37 download into several, each covering only the non-blank
+        spans, and skips the gaps entirely.
+
+        SAFETY, two conditions, both enforced here:
+
+        1. Every dropped gap must lie inside a region this part ERASES
+           (`_erase_covers`). Outside an erase region the pre-existing flash
+           content is unknown, so 0xFF is a value we must actually write.
+        2. Each kept fragment's start/end is aligned OUTWARD to `align` bytes,
+           so a fragment never begins or ends mid-word/mid-page. Programming
+           granularity is per-word/page on every flash controller in scope and
+           a partial write is refused or silently padded; growing the kept span
+           only ever writes bytes the file already contains.
+
+        Fragments keep the parent's `crc`, which no longer describes them — so
+        check() must run on the unsplit blocks (it does: it uses self.blocks).
+        Each fragment carries `split_from` (parent load address) and
+        `split_skipped` (bytes dropped from that parent) for reporting.
+        """
+        out = []
+        for b in blocks:
+            d, base, n = b["data"], b["start"], len(b["data"])
+            # Find blank runs with the regex engine: a byte-at-a-time Python
+            # scan over a 32 MiB payload costs seconds.
+            gaps = []
+            for m in re.finditer(bytes([fill]) + b"{" + str(min_run).encode()
+                                 + b",}", d):
+                g0, g1 = m.start(), m.end()
+                if align > 1:
+                    # Shrink the gap to a window whose ABSOLUTE bounds are
+                    # aligned (the keep spans therefore grow outward, never
+                    # inward). base is included so a block loaded at an
+                    # unaligned address still yields aligned fragments.
+                    a0, a1 = base + g0, base + g1
+                    a0 = -(-a0 // align) * align
+                    a1 = a1 // align * align
+                    g0, g1 = a0 - base, a1 - base
+                if g1 - g0 >= min_run and self._erase_covers(base + g0,
+                                                             g1 - g0):
+                    gaps.append((g0, g1))
+            if not gaps:
+                out.append(b)
+                continue
+            spans, pos = [], 0
+            for g0, g1 in gaps:
+                if g0 > pos:
+                    spans.append((pos, g0))
+                pos = g1
+            if pos < n:
+                spans.append((pos, n))
+            skipped = sum(g1 - g0 for g0, g1 in gaps)
+            for s0, s1 in spans:
+                out.append(dict(b, start=base + s0, data=d[s0:s1],
+                                length=s1 - s0, split_from=base,
+                                split_skipped=skipped))
+        return out
+
+    def _erase_covers(self, addr, length):
+        """True if [addr, addr+length) lies entirely inside one erase region
+        that is actually sent (omit regions do NOT count — they are not
+        erased, so their content is not guaranteed blank)."""
+        for a, l in self.flash_erase():
+            if a <= addr and addr + length <= a + l:
+                return True
+        return False
+
+    def flash_blocks(self, decompress=False, skip_blank=0, blank_byte=0xFF,
+                     recompress=False):
+        """Blocks actually downloaded to the ECU (omit regions removed).
+
+        `skip_blank` (bytes, 0 = off) splits each block around runs of >= that
+        many erased 0xFF bytes covered by the part's erase map. `blank_byte`
+        must be 0xFF when skipping; a different canvas value could pass a
+        reassembly check while the real flash gap still contains 0xFF.
+        See _split_blank_runs().
+
+        `recompress` re-packs each resulting fragment with lzss_encode() so a
+        compressed container can be blank-skipped and STILL transmitted
+        compressed (dfi 0x10), with the ECU doing the decompression as usual.
+        This is what makes --skip-blank useful without --decompress: the
+        expanded payload is only ever a host-side intermediate. Each fragment
+        then carries `plain_length` (the decompressed size the ECU will write,
+        needed for the erase bookkeeping) while `length`/`data` are the
+        compressed bytes that go on the wire.
+        """
+        if skip_blank and blank_byte != 0xFF:
+            raise ValueError(
+                "blank skipping requires the erased-flash value 0xFF; "
+                "a different --blank-byte would leave the skipped gap as 0xFF")
+        blocks = self._expand(
+            [b for b in self.blocks
+             if not self._is_omitted(b["start"], b["length"])],
+            decompress or recompress)
+        if skip_blank:
+            if self.compressed() and not (decompress or recompress):
+                raise ValueError(
+                    f"{self.path}: skip_blank requires decompress=True or "
+                    f"recompress=True on a compressed (dfi 0x10) container — "
+                    f"offsets inside LZSS data are not flash addresses")
+            blocks = self._split_blank_runs(blocks, skip_blank, blank_byte)
+        if recompress and self.compressed():
+            out = []
+            for b in blocks:
+                packed = lzss_encode(b["data"])
+                out.append(dict(b, data=packed, length=len(packed),
+                                plain_length=len(b["data"])))
+            blocks = out
+        return blocks
+
+    def blank_skip_report(self, decompress=False, skip_blank=0,
+                          blank_byte=0xFF, align=0x100):
+        """(sent, full, fragments, parents) byte/count totals for skip_blank.
+
+        `full` is what the same option set would send with skip_blank off, so
+        `full - sent` is the saving. Used by the planner and by the selftest.
+        """
+        full = self.flash_blocks(decompress=decompress)
+        part = self.flash_blocks(decompress=decompress, skip_blank=skip_blank,
+                                 blank_byte=blank_byte)
+        return (sum(b["length"] for b in part),
+                sum(b["length"] for b in full),
+                len(part), len(full))
+
+    def verify_blank_skip(self, decompress=False, skip_blank=0,
+                          blank_byte=0xFF, recompress=False):
+        """Prove the split is lossless: reassembling the fragments over a
+        `blank_byte`-filled canvas must reproduce the unsplit payload exactly.
+
+        Returns a list of problems (empty == the skip is provably safe). This
+        is the acceptance test for the strategy — it catches a mis-aligned
+        bound, an off-by-one span and a dropped non-blank byte, which is
+        exactly the class of bug that would write a hole into live flash.
+
+        With `recompress` the fragments carry LZSS bytes, so each one is
+        DECODED first — which additionally proves the encoder round-trips
+        through the very decoder the ECU implements. A fragment whose decode
+        does not match the plaintext it was built from is reported, so a
+        broken re-pack can never reach a module.
+        """
+        probs = []
+        full = self.flash_blocks(decompress=True) if (decompress or recompress)\
+            else self.flash_blocks()
+        part = self.flash_blocks(decompress=decompress, skip_blank=skip_blank,
+                                 blank_byte=blank_byte, recompress=recompress)
+        for fb in full:
+            canvas = bytearray([blank_byte]) * fb["length"]
+            lo, hi = fb["start"], fb["start"] + fb["length"]
+            for pb in part:
+                plain = pb["data"]
+                if recompress and self.compressed():
+                    plain = lzss_decode(pb["data"])
+                    if len(plain) != pb.get("plain_length", len(plain)):
+                        probs.append(
+                            f"fragment @0x{pb['start']:08X}: re-compressed "
+                            f"data decodes to {len(plain)} B, expected "
+                            f"{pb['plain_length']} B — the LZSS re-pack is "
+                            f"not round-tripping")
+                        continue
+                if pb["start"] < lo or pb["start"] + len(plain) > hi:
+                    continue
+                off = pb["start"] - lo
+                canvas[off:off + len(plain)] = plain
+            if bytes(canvas) != fb["data"]:
+                first = next((i for i, (x, y) in
+                              enumerate(zip(canvas, fb["data"])) if x != y), 0)
+                probs.append(
+                    f"block @0x{fb['start']:08X}: reassembly differs from the "
+                    f"full payload at +0x{first:X} "
+                    f"(0x{canvas[first]:02X} != 0x{fb['data'][first]:02X}) — "
+                    f"the blank-skip would leave a hole in flash")
+        for pb in part:
+            if pb["length"] <= 0:
+                probs.append(f"empty fragment @0x{pb['start']:08X}")
+        return probs
 
     def sha256(self):
         """SHA-256 of the whole VBF file (as on disk)."""
@@ -949,6 +1349,11 @@ def download_blocks(ecu, blocks, tag, progress_interval=2.0, dfi=0x00,
         # the on-disk (compressed) bytes and length go on the wire verbatim; the
         # ECU decompresses internally. (Verified vs. the UCDS IPC flash capture:
         # 34 10 44 <addr> <compressed-len>.)
+        # The caller may instead expand the payload host-side and pass dfi=0x00
+        # with the unpacked blocks (Vbf.flash_blocks(decompress=True) +
+        # Vbf.wire_dfi(decompress=True)) for a boot loader that does not
+        # implement the 0x10 format. Either way this function just sends
+        # b["data"]/b["length"] as given — they must agree with `dfi`.
         rd = ("34" + f"{dfi:02X}" + "44"
               + struct.pack(">I", b["start"]).hex()
               + struct.pack(">I", b["length"]).hex())

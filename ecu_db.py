@@ -15,6 +15,14 @@ Provenance of the data in this file
       BCM  0x726  level1  64000B0C59   (verified on the bench BCM)
       PSCM 0x730  level1  00009B2533   (published; UNVERIFIED on the module)
       IPMA 0x706          00009875CA   (solved from two captured sessions)
+      IPC  0x720  level3  0102030405   (DM5T-14F094 application: stored in
+                                        live RAM at 0x400086D3 and confirmed
+                                        from captured seed/key pairs)
+      IPC  0x720  level1  EC6D038211   (DM5T-14F094 PBL: unlocked the live
+                                        module and recovered the stock MCU
+                                        application; the earlier 381-candidate
+                                        miss was against the application, not
+                                        this PBL security context)
 * The seed->key algorithm is a SINGLE universal LFSR keygen parameterised by a
   5-byte big-endian secret. keygen_equivalence proved BCM==PSCM==IPMA keys are
   byte-identical under that mapping, so a per-ECU keygen is never needed — only
@@ -77,8 +85,17 @@ class EcuProfile:
     # the IPMA ground-truth capture sends only the HIGH 16 bits. Per-ECU.
     sbl_call_halfword: bool = False
     # Run routine 0304 (checkProgrammingDependencies / finalise) after the last
-    # TransferExit and before reset. Measured required on PSCM/IPMA/PCM/TCM/ABS.
+    # TransferExit and before reset. The DM5T IPC PBL stamps its boot marker here.
     finalize: bool = False
+    # Some PBLs return a status after the positive routine response. Merely
+    # seeing SID 71 is not proof that the application was accepted for boot.
+    finalize_response: Optional[bytes] = None
+    # Exact programming-session reply from the PBL, when known. In recovery,
+    # a custom application may also answer 50 02 but cannot flash memory.
+    recovery_session_response: Optional[bytes] = None
+    # Optional start-SBL routine response from the proven PBL. A custom
+    # application may return a shorter 71 01 03 01 without starting the SBL.
+    sbl_start_response: Optional[bytes] = None
 
     def resp_id(self):
         return self.rxid if self.rxid is not None else self.txid + 8
@@ -133,6 +150,8 @@ ECUS = {
             SecretRule("", 3, "8408F57701"),
             SecretRule("EJ7T-14F094", 3, "0000DCBF06"),
             SecretRule("EJ7T-14F094", 1, "00004A7722"),
+            SecretRule("DM5T-14F094", 3, "0102030405"),
+            SecretRule("DM5T-14F094", 1, "EC6D038211"),
         ),
         sbls=(
             SblRule("BM5T-14C226-C", "BM5T-14C025-AD.vbf"),
@@ -144,10 +163,16 @@ ECUS = {
             SblRule("F1ET-14F094-A", "F1ET-14C025-AB.vbf"),
             SblRule("GJ5T-14F094-B", "GJ5T-14C025-BB.vbf"),
             SblRule("EJ7T-14F094", "DP5T-14C025-CA.vbf"),
+            SblRule("DM5T-14F094", "FM5T-14C025-AA.vbf"),
         ),
+        # DM5T PBL writes its application boot-commit marker only after this
+        # routine succeeds; without it the next reset returns to the PBL.
+        # The same six-byte success response is captured on an EJ7T IPC.
+        finalize=True,
+        finalize_response=bytes.fromhex("710103041002"),
     ),
     0x726: EcuProfile(
-        name="BCM (body control)", txid=0x726, bus="MS-CAN", rxid=0x72E,
+        name="BCM (body control)", txid=0x726, bus="HS-CAN", rxid=0x72E,
         aliases=("BCM",),
         secrets=(
             SecretRule("BV6N", None, "F311454C73"),
@@ -196,7 +221,8 @@ ECUS = {
     0x706: EcuProfile(
         name="IPMA (front camera)", txid=0x706, bus="HS-CAN", rxid=0x70E,
         aliases=("IPMA",),
-        ident_dids=("F113", "F188", "F108", "F10A", "F111", "F18C", "F190"),
+        ident_dids=("F113", "F188", "F120", "F124", "F125", "F108", "F10A",
+                    "F111", "F18C", "F190"),
         secrets=(SecretRule("", None, "00009875CA"),),
         default_sbl="CV4T-14F399-AF.VBF",
         sbl_call_halfword=False,
@@ -275,6 +301,12 @@ ECUS = {
         ident_did_by_type={"EXE": "F188", "DATA": "F124",
                            "SIGCFG": "F108", "SBL": "F188"},
         finalize=True,
+        # Captured PBL replies 50 02 00 19 01 F4; the custom application
+        # replies 50 02 00 32 01 F4 and does not successfully flash.
+        recovery_session_response=bytes.fromhex("5002001901F4"),
+        # The PBL reports status 0x10 after launching the SBL. The custom
+        # application responds 71 01 03 01 but never reaches the SBL erase.
+        sbl_start_response=bytes.fromhex("7101030110"),
     ),
 }
 

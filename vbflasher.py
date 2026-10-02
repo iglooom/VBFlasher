@@ -9,7 +9,7 @@ this file hardcodes an ECU.
 
 WHAT IT DOES, IN ORDER
   1. Parse and fully verify EVERY VBF given (block CRC-16 + file CRC-32).
-     A corrupt file is refused before the ECU is touched.
+     A corrupt file is refused before the ECU is touched, unless --force.
   2. Group the files by their ecu_address; each group is one flash session.
   3. Connect, read F111 (and the other identity DIDs) from the live module.
   4. From F111, pick the SBL VBF and the seed-key secret from ecu_db.
@@ -236,6 +236,42 @@ def _is_virtual_map(v):
     return len(starts) != len(set(starts))
 
 
+def _wire_blocks_for(v, args):
+    """The blocks to download for `v` under the current options, with the
+    blank-skip PROVEN lossless before it is allowed to change anything.
+
+    Plan and execute both go through here so the dry run can never describe a
+    different transfer from the one that happens.
+    """
+    dec = getattr(args, "decompress", False)
+    skip = getattr(args, "skip_blank", 0)
+    bb = getattr(args, "blank_byte", 0xFF)
+    if skip and bb != 0xFF:
+        raise SystemExit("--blank-byte must be 0xFF for blank skipping: "
+                         "an erased flash gap reads as 0xFF")
+    if not skip:
+        return v.flash_blocks(decompress=dec), 0
+    # A compressed container keeps its dfi 0x10 wire format: expand, split off
+    # the erased-blank padding, then RE-PACK each fragment. --decompress stays
+    # the explicit opt-out for a boot loader that cannot decompress.
+    rec = v.compressed() and not dec
+    probs = v.verify_blank_skip(decompress=dec, skip_blank=skip, blank_byte=bb,
+                                recompress=rec)
+    if probs:
+        raise SystemExit(
+            f"--skip-blank is not lossless for {os.path.basename(v.path)}:\n   "
+            + "\n   ".join(probs)
+            + "\n   Refusing to flash a partial image. Drop --skip-blank.")
+    blocks = v.flash_blocks(decompress=dec, skip_blank=skip, blank_byte=bb,
+                            recompress=rec)
+    sent = sum(b["length"] for b in blocks)
+    # Compare against what this option set would otherwise put on the wire:
+    # the on-disk compressed bytes when re-packing, else the plain payload.
+    full = (sum(b["length"] for b in v.flash_blocks())
+            if rec else sum(b["length"] for b in v.flash_blocks(decompress=dec)))
+    return blocks, full - sent
+
+
 def _check_flash_order(to_flash, force=False):
     """Refuse an ordering where a later part's ERASE wipes an earlier part's
     freshly written blocks.
@@ -278,8 +314,105 @@ def _check_flash_order(to_flash, force=False):
                     raise SystemExit(
                         f"flash order would destroy data: {msg} "
                         f"Use --force to flash in this order anyway.")
-        for b in v.flash_blocks():
+        # The on-wire length may be LZSS-compressed, but the ECU writes the
+        # expanded bytes at these addresses. Compare against that flash span.
+        for b in v.flash_blocks(decompress=True):
             written.append((name, b["start"], b["start"] + b["length"]))
+
+
+def _check_integrity(vbfs, force=False):
+    """Verify every VBF (block CRC-16 + file CRC-32) before the ECU is touched.
+
+    A mismatch normally aborts: transmitting a file whose own checksums do not
+    describe its contents is how a module ends up with an image neither the
+    tool nor the ECU can account for.
+
+    `force` downgrades a mismatch to a loud warning, for the one legitimate
+    case: a DELIBERATELY modified file (a patched calibration, a hand-edited
+    block) whose CRC fields were not recomputed. Hand-patched images that the
+    ECU itself will checksum can still be rejected at finalise (31 01 0304) or
+    simply refuse to run, so this says the file is intentional — not that it
+    is sound.
+    """
+    bad = []
+    for v in vbfs:
+        print(v.describe())
+        probs = v.check()
+        if not probs:
+            print("   integrity   OK (block CRC-16 + file CRC-32)\n")
+            continue
+        if force:
+            print("   !! INTEGRITY FAILURE — flashing anyway (--force):")
+            for p in probs:
+                print("      " + p)
+            print("      The file's own CRCs do not match its contents. The "
+                  "ECU may reject\n      it at finalise or boot a broken "
+                  "image. Only proceed if you edited\n      this file on "
+                  "purpose.\n")
+            continue
+        print("   !! INTEGRITY FAILURE — refusing to transmit:")
+        for p in probs:
+            print("      " + p)
+        bad.append(os.path.basename(v.path))
+    if bad:
+        raise SystemExit(
+            f"integrity check failed for {', '.join(bad)}. Fix the file (or "
+            f"recompute its CRCs); use --force to transmit it as-is.")
+
+
+def enter_programming_session(ecu, args):
+    """Catch a briefly available PBL with repeated physical 10 02 requests.
+
+    Normal flashes retain their bounded wake retry. Recovery intentionally
+    waits until a positive answer (or Ctrl-C), with no other diagnostic probes
+    before the session request.
+    """
+    r = None
+    attempts = 0
+    while args.recovery or attempts < args.wake_tries:
+        attempts += 1
+        try:
+            r = ecu.req("1002", timeout=0.2 if args.recovery else 1.0,
+                        pending_timeout=0.2 if args.recovery else 30.0,
+                        busy_retries=0 if args.recovery else 5,
+                        what=f"10 02 programmingSession {attempts}")
+        except TimeoutError:
+            if not args.recovery:
+                raise
+            # ISO-TP can time out in send() while the ECU is unpowered;
+            # Ecu.req() only turns recv() timeouts into None.
+            r = None
+        if r is not None and len(r) >= 2 and r[:2] == b"\x50\x02":
+            profile = ecu_db.get_profile(ecu.txid) if args.recovery else None
+            want = profile.recovery_session_response if profile else None
+            if want is not None and r != want:
+                if attempts == 1 or attempts % 25 == 0:
+                    print(f"   50 02 from non-PBL responder ({fmt(r)}); "
+                          "waiting for power-cycle", flush=True)
+                time.sleep(0.02)
+                continue
+            print(f"   OK   10 02 programmingSession        {fmt(r)} "
+                  f"(attempt {attempts})")
+            return
+        if args.recovery:
+            if attempts == 1 or attempts % 25 == 0:
+                print(f"   waiting for PBL: {attempts} attempts, "
+                      f"last response {fmt(r)} (Ctrl-C to stop)", flush=True)
+            time.sleep(0.02)
+        else:
+            time.sleep(0.1)
+    raise SystemExit(f"10 02 programmingSession: {fmt(r)} "
+                     f"(no session after {attempts} tries)")
+
+
+def check_finalize_response(profile, response):
+    """Do not confuse a positive RoutineControl SID with an accepted image."""
+    expected = profile.finalize_response
+    if expected is not None and response != expected:
+        raise SystemExit(
+            f"{profile.name}: finalise answered {fmt(response)}, expected "
+            f"{fmt(expected)} (status 10 02 = accepted for boot). "
+            "Do not treat this flash as successful or reset into it.")
 
 
 def flash_session(txid, files, args):
@@ -297,15 +430,7 @@ def flash_session(txid, files, args):
     print(f"TARGET  {profile.name}   tx=0x{txid:03X} rx=0x{rxid:03X}   "
           f"bus={profile.bus} iface={iface}")
     print("=" * 72)
-    for v in vbfs:
-        print(v.describe())
-        probs = v.check()
-        if probs:
-            print("   !! INTEGRITY FAILURE — refusing to transmit:")
-            for p in probs:
-                print("      " + p)
-            raise SystemExit(2)
-        print("   integrity   OK (block CRC-16 + file CRC-32)\n")
+    _check_integrity(vbfs, force=args.force)
 
     # order: non-SBL application/data parts get flashed; erase-bearing first
     to_flash = [v for v in vbfs if v.ptype != "SBL"]
@@ -335,7 +460,12 @@ def flash_session(txid, files, args):
 
     hw = args.hw or ""
     ident = {}
-    if args.execute:
+    if args.execute and args.recovery:
+        # The PBL may only accept requests briefly after power-up. Do not
+        # spend that window waking the bus or reading identity DIDs first.
+        print("\n== recovery: skipping live identity reads ==")
+        print("   Power-cycle the ECU after the prompt; waiting for 10 02.")
+    elif args.execute:
         ident = read_identity(ecu, profile, args.wake_tries, args.wake_timeout)
         hw = args.hw or ident.get("F111") or ""
         if not hw and not args.sbl:
@@ -352,7 +482,11 @@ def flash_session(txid, files, args):
                    or "(none registered)"))
     else:
         print("\n== current firmware / identity ==")
-        print("   [dry run] F111 would be read here to choose SBL + secret.")
+        if args.recovery:
+            print("   [recovery dry run] live F111 reads are skipped; supply "
+                  "--hw or explicit --sbl and --secret for a live run.")
+        else:
+            print("   [dry run] F111 would be read here to choose SBL + secret.")
         if hw:
             print(f"   using --hw {hw!r} for planning")
 
@@ -396,6 +530,11 @@ def flash_session(txid, files, args):
         print(f"   secret       {secret.hex().upper()}  ({secret_reason})")
     else:
         print(f"   secret       (dry run — {secret_reason})")
+    if args.recovery:
+        print("   MODE         --recovery: skip identity/wake probes; repeatedly "
+              "send 10 02 until the ECU answers (Ctrl-C to stop).")
+        print("   WARNING      live software identity cannot be checked; "
+              "verify the target and VBF yourself before confirming.")
     if args.test_sbl:
         print("   MODE         --test-sbl: load + start the SBL ONLY. "
               "NO erase, NO write.")
@@ -421,11 +560,43 @@ def flash_session(txid, files, args):
                       f"(not erased/written):")
                 for a, l in omitted:
                     print(f"         0x{a:08X}  len 0x{l:06X} ({human(l)})")
-            wblocks = v.flash_blocks()
+            wblocks, saved = _wire_blocks_for(v, args)
             wpayload = sum(b["length"] for b in wblocks)
-            print(f"      WRITE {len(wblocks)} block(s), {human(wpayload)}:")
+            dfi = v.wire_dfi(args.decompress)
+            recomp = v.compressed() and not args.decompress and args.skip_blank
+            if v.compressed():
+                if args.decompress:
+                    print(f"      WRITE {len(wblocks)} block(s), "
+                          f"{human(wpayload)} "
+                          f"(--decompress: LZSS expanded on the host, sent "
+                          f"PLAIN as 34 {dfi:02X}):")
+                elif recomp:
+                    print(f"      WRITE {len(wblocks)} block(s), "
+                          f"{human(wpayload)} "
+                          f"(LZSS re-packed on the host after blank-skipping, "
+                          f"sent COMPRESSED as 34 {dfi:02X}; the ECU unpacks):")
+                else:
+                    print(f"      WRITE {len(wblocks)} block(s), "
+                          f"{human(wpayload)} "
+                          f"(LZSS, sent verbatim as 34 {dfi:02X}; the ECU "
+                          f"unpacks):")
+            else:
+                print(f"      WRITE {len(wblocks)} block(s), {human(wpayload)}:")
+            if saved:
+                print(f"      --skip-blank 0x{args.skip_blank:X}: "
+                      f"{human(saved)} less on the wire "
+                      f"({100.0 * saved / (wpayload + saved):.0f}% of "
+                      + ("the compressed stream" if recomp else
+                         f"0x{args.blank_byte:02X} padding")
+                      + ", verified lossless by reassembly)")
             for b in wblocks:
-                print(f"         -> 0x{b['start']:08X}  {human(b['length'])}")
+                if recomp:
+                    print(f"         -> 0x{b['start']:08X}  "
+                          f"{human(b['length'])} compressed "
+                          f"({human(b['plain_length'])} written)")
+                else:
+                    print(f"         -> 0x{b['start']:08X}  "
+                          f"{human(b['length'])}")
             gate = profile.ident_did_by_type.get(v.ptype, "F188")
             if ident:
                 gdid, live, verdict = resolve_gate_did(v, ident, profile)
@@ -496,8 +667,9 @@ def flash_session(txid, files, args):
         print(f"   keepalive: TesterPresent 3E 80 every {args.tp_interval:.1f}s "
               f"-> {where}")
     progress = FlashProgress(
-        sbl.total_payload() + sum(sum(b["length"] for b in v.flash_blocks())
-                                  for v in ([] if args.test_sbl else to_flash)),
+        sum(b["length"] for b in sbl.wire_blocks(args.decompress))
+        + sum(sum(b["length"] for b in _wire_blocks_for(v, args)[0])
+              for v in ([] if args.test_sbl else to_flash)),
         interval=args.progress_interval)
     try:
         progress.start()
@@ -533,19 +705,9 @@ def flash_session(txid, files, args):
                       f"(no readable software DID); proceeding")
 
         print("\n== session + security ==")
-        # A just-woken module can still drop the first programmingSession
-        # request; retry a few times (bounded) before giving up.
-        r = None
-        for i in range(1, args.wake_tries + 1):
-            r = ecu.req("1002", timeout=1.0, what=f"10 02 programmingSession {i}")
-            if r is not None and r[0] == 0x50:
-                break
+        enter_programming_session(ecu, args)
+        if not args.recovery:
             time.sleep(0.1)
-        if not (r is not None and r[0] == 0x50):
-            raise SystemExit(f"10 02 programmingSession: {fmt(r)} "
-                             f"(no session after {args.wake_tries} tries)")
-        print(f"   OK   10 02 programmingSession        {fmt(r)}")
-        time.sleep(0.1)
         r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
                        timeout=5.0)
         seed = list(r[2:5])
@@ -563,15 +725,22 @@ def flash_session(txid, files, args):
 
         progress.stage_name("SBL -> RAM")
         print("\n== SBL -> RAM ==")
-        download_blocks(ecu, sbl.blocks, "sbl", args.progress_interval,
-                        dfi=sbl.dfi or 0x00,
+        download_blocks(ecu, sbl.wire_blocks(args.decompress),
+                        "sbl", args.progress_interval,
+                        dfi=sbl.wire_dfi(args.decompress),
                         progress=progress if progress.enabled else None)
         if profile.sbl_call_halfword:
             call_arg = f"{(sbl.call >> 16) & 0xFFFF:04X}"
         else:
             call_arg = f"{sbl.call:08X}"
-        ecu.expect("31010301" + call_arg, 0x71, "31 01 0301 start SBL",
-                   timeout=10.0)
+        r = ecu.expect("31010301" + call_arg, 0x71, "31 01 0301 start SBL",
+                       timeout=10.0)
+        if profile.sbl_start_response is not None and r != profile.sbl_start_response:
+            raise SystemExit(
+                f"SBL start answered {fmt(r)}, not the proven PBL response "
+                f"{fmt(profile.sbl_start_response)}. The application may have "
+                "answered without starting the SBL; refusing to erase. "
+                "Use --recovery and power-cycle the ECU to catch the PBL.")
         print(f"   SBL running (call 0x{sbl.call:08X})")
 
         if args.test_sbl:
@@ -595,15 +764,22 @@ def flash_session(txid, files, args):
                                pending_timeout=args.erase_timeout)
                 progress.stage_name("download")
                 print(f"\n== download {os.path.basename(v.path)} ==")
-                download_blocks(ecu, v.flash_blocks(), v.part or "app",
-                                args.progress_interval, dfi=v.dfi or 0x00,
+                dblocks, dsaved = _wire_blocks_for(v, args)
+                if dsaved:
+                    print(f"   --skip-blank: {len(dblocks)} fragment(s), "
+                          f"{human(dsaved)} of blank padding skipped")
+                download_blocks(ecu, dblocks, v.part or "app",
+                                args.progress_interval,
+                                dfi=v.wire_dfi(args.decompress),
                                 progress=progress if progress.enabled else None)
 
             if profile.finalize:
                 progress.stage_name("finalise")
                 print("\n== finalise (31 01 0304) ==")
-                ecu.expect("31010304", 0x71, "31 01 0304 finalise",
-                           timeout=15.0, pending_timeout=args.erase_timeout)
+                response = ecu.expect("31010304", 0x71, "31 01 0304 finalise",
+                                      timeout=15.0,
+                                      pending_timeout=args.erase_timeout)
+                check_finalize_response(profile, response)
 
         progress.stage_name("reset")
         print("\n== reset ==")
@@ -706,8 +882,9 @@ def _open_sbl_session(profile, args, need_secret=True):
 
     ka.start()
     print("\n== SBL -> RAM ==")
-    download_blocks(ecu, sbl.blocks, "sbl", args.progress_interval,
-                    dfi=sbl.dfi or 0x00)
+    dec = getattr(args, "decompress", False)
+    download_blocks(ecu, sbl.wire_blocks(dec), "sbl", args.progress_interval,
+                    dfi=sbl.wire_dfi(dec))
     call_arg = (f"{(sbl.call >> 16) & 0xFFFF:04X}" if profile.sbl_call_halfword
                 else f"{sbl.call:08X}")
     ecu.expect("31010301" + call_arg, 0x71, "31 01 0301 start SBL",
@@ -822,19 +999,50 @@ def do_memwrite(args):
 # --------------------------------------------------------------------------
 # subcommands
 # --------------------------------------------------------------------------
+def _split_flash_targets(args):
+    """Split the positionals into VBF paths and bare ECU selectors.
+
+    `--test-sbl` has nothing to flash, so there may be no VBF at all: the
+    target is then named directly (`flash GWM --test-sbl`). A token is only
+    read as a selector when it is not a file on disk, --test-sbl is in effect
+    and the registry knows it — anything else stays a (missing) file, so a
+    typo'd path still reports "not found" instead of "unknown ECU".
+    """
+    files, txids = [], []
+    for t in args.vbf:
+        if os.path.exists(t):
+            files.append(t)
+            continue
+        profile = ecu_db.resolve(t) if args.test_sbl else None
+        if profile is None:
+            raise SystemExit(f"{t}: not found")
+        if profile.txid not in txids:
+            txids.append(profile.txid)
+    if not files and not txids:
+        raise SystemExit("flash requires VBF file(s), or an ECU name/id with "
+                         "--test-sbl (e.g. `flash GWM --test-sbl`).")
+    return files, txids
+
+
 def do_flash(args):
-    files = args.vbf
-    for f in files:
-        if not os.path.exists(f):
-            raise SystemExit(f"{f}: not found")
+    files, sel_txids = _split_flash_targets(args)
     # group by ecu_address
-    groups = {}
+    groups = {t: [] for t in sel_txids}
     for f in files:
         v = Vbf(f)
         if v.ecu is None:
             raise SystemExit(f"{f}: VBF has no ecu_address; cannot target it.")
         groups.setdefault(v.ecu, []).append(f)
-    if len(groups) > 1:
+    if args.recovery:
+        if len(groups) != 1:
+            raise SystemExit("--recovery requires exactly one target ECU")
+        if args.quiet_bus:
+            raise SystemExit("--recovery cannot use --quiet-bus: it sends "
+                             "functional traffic before the PBL is caught")
+        if args.execute and not (args.hw or (args.sbl and args.secret is not None)):
+            raise SystemExit("--recovery skips live F111 reads: pass --hw "
+                             "<known F111>, or both --sbl PATH and --secret VALUE")
+    elif len(groups) > 1:
         print(f"NOTE: {len(files)} files target {len(groups)} different ECUs: "
               + ", ".join(f"0x{e:03X}" for e in groups))
     for txid, gfiles in groups.items():
@@ -1449,9 +1657,10 @@ def _completion_model(parser):
             for a in sp._actions:
                 flags.extend(a.option_strings)
                 if not a.option_strings:  # positional
-                    if a.metavar == "ECU":
+                    parts = (a.metavar or "").split("|")
+                    if "ECU" in parts:
                         takes_ecu = True
-                    elif a.metavar == "FILE":
+                    if "FILE" in parts:
                         takes_file = True
             opts[name] = sorted(set(flags))
             ecu_first[name] = takes_ecu
@@ -1666,6 +1875,51 @@ def selftest():
     ipma = ecu_db.get_profile(0x706)
     chk("IPMA secret == 00009875CA",
         ipma.pick_secret("anything", 1) == bytes.fromhex("00009875CA"))
+    # IPC DM5T-14F094 (C-MAX Energi hybrid): level-3 secret solved from the
+    # UCDS 2E writedid captures in IPC/c-max_el/hybrid/. Three independent
+    # seed/key pairs from the same module must all reproduce, which is what
+    # distinguishes a solved secret from one that fits a single session.
+    # IPC DM5T-14F094 (C-MAX Energi hybrid): the stored level-3 secret, read
+    # out of live RAM at 0x400086D3 with 23 ReadMemoryByAddress and confirmed
+    # on the module. The three UCDS captures in IPC/c-max_el/hybrid/ pin only
+    # the keygen CLASS (2^16 secrets share every key), so the solver's
+    # representative 000024E4DE is equally valid -- assert BOTH reproduce the
+    # captured pairs, and that they are genuinely interchangeable.
+    _ipc = ecu_db.get_profile(0x720)
+    assert _ipc is not None
+    _ipc_dm5t = _ipc.pick_secret("DM5T-14F094-AB", 3)
+    chk("IPC DM5T level3 secret registered",
+        _ipc_dm5t == bytes.fromhex("0102030405"), (_ipc_dm5t or b"").hex())
+    chk("the solver's class representative is keygen-equivalent",
+        all(ford_seckey.key_from_seed(bytes([a, b, c]), _ipc_dm5t or b"\0" * 5)
+            == ford_seckey.key_from_seed(bytes([a, b, c]),
+                                        bytes.fromhex("000024E4DE"))
+            for a, b, c in ((0, 0, 1), (0x36, 0xCB, 0x31), (0xFF, 0xFF, 0xFF),
+                            (0x12, 0x34, 0x56))))
+    for _seed, _key in (("36CB31", "a6d25e"), ("C721E8", "ce1fc2"),
+                        ("C5D162", "6a9802")):
+        _got = ford_seckey.key_from_seed(bytes.fromhex(_seed),
+                                        _ipc_dm5t or b"\0" * 5).hex()
+        chk(f"IPC DM5T level3 reproduces {_seed} -> {_key.upper()}",
+            _got == _key, _got)
+    # The generic IPC rules must not be shadowed by (or shadow) the new one.
+    chk("IPC generic level3 secret unchanged for other hardware",
+        _ipc.pick_secret("CM5T-14F094-AA", 3) == bytes.fromhex("8408F57701"))
+    chk("IPC EJ7T level1 secret unchanged",
+        _ipc.pick_secret("EJ7T-14F094-BB", 1) == bytes.fromhex("00004A7722"))
+    # The DM5T PBL level-1 secret unlocked the live module; it is distinct
+    # from the level-3 secret extracted from RAM.
+    chk("IPC DM5T level1 PBL secret registered",
+        _ipc.pick_secret("DM5T-14F094-AB", 1) == bytes.fromhex("EC6D038211"))
+    chk("IPC finalises and requires the boot-commit success status",
+        _ipc.finalize and _ipc.finalize_response == bytes.fromhex("710103041002"))
+    check_finalize_response(_ipc, bytes.fromhex("710103041002"))
+    try:
+        check_finalize_response(_ipc, bytes.fromhex("710103041001"))
+    except SystemExit:
+        chk("IPC rejects a positive SID with an unsuccessful boot status", True)
+    else:
+        chk("IPC rejects a positive SID with an unsuccessful boot status", False)
     # GROUND TRUTH candump-stock-flash.log: 706#1008310103010082 + 21 00 00
     # reassembles to 31 01 0301 00 82 00 00 -> FULL 4-byte call address, NOT
     # the high-half (a FirstFrame-only misread earned NRC 22 at SBL-start).
@@ -1761,9 +2015,9 @@ def selftest():
             not _is_virtual_map(Vbf(_exe)))
 
     print("\n== per-ECU CAN interface selection ==")
-    chk("BCM is MS-CAN and defaults to can1",
-        getattr(bcm, "bus", None) == "MS-CAN"
-        and getattr(bcm, "default_iface", lambda: None)() == "can1")
+    chk("BCM is HS-CAN and defaults to can0",
+        getattr(bcm, "bus", None) == "HS-CAN"
+        and getattr(bcm, "default_iface", lambda: None)() == "can0")
     chk("IPC is MS-CAN and defaults to can1",
         getattr(ecu_db.get_profile(0x720), "bus", None) == "MS-CAN"
         and getattr(ecu_db.get_profile(0x720), "default_iface", lambda: None)()
@@ -1775,7 +2029,7 @@ def selftest():
         getattr(ecu_db.get_profile(0x7E0), "bus", None) == "HS-CAN"
         and getattr(ecu_db.get_profile(0x7E0), "default_iface", lambda: None)()
         == "can0")
-    _expected_ms = {0x720, 0x726, 0x727, 0x733, 0x7A5}
+    _expected_ms = {0x720, 0x727, 0x733, 0x7A5}
     _actual_ms = {txid for txid, p in ecu_db.ECUS.items() if p.bus == "MS-CAN"}
     chk("all registered MS-CAN modules default to can1",
         _actual_ms == _expected_ms
@@ -1788,7 +2042,7 @@ def selftest():
     chk("interface resolver exists", callable(_iface_for))
     if callable(_iface_for):
         chk("interface resolver uses profile default",
-            _iface_for(bcm, None) == "can1")
+            _iface_for(bcm, None) == "can0")
         chk("--iface overrides profile default",
             _iface_for(bcm, "vcan7") == "vcan7")
     _all_iface_fn = globals().get("_all_ifaces")
@@ -2296,6 +2550,267 @@ def selftest():
     else:
         print("  SKIP  Lincoln IPC VBFs not present for the gate test")
 
+    # DECOMPRESS OPTION: by default a dfi-0x10 container goes on the wire
+    # verbatim (34 10 <addr> <compressed-len>); --decompress expands it on the
+    # host and must then declare dfi 0x00 with the UNPACKED length.
+    print("\n== --decompress: plain transmission of an LZSS payload ==")
+    import binascii as _ba
+    _lz = "/home/gl/Projects/ford/IPC/GJ5T-14C026-DL.vbf"
+    if os.path.exists(_lz):
+        vz = Vbf(_lz)
+        chk("the test file is LZSS-compressed (dfi 0x10)", vz.compressed(),
+            f"dfi={vz.dfi}")
+        chk("default wire dfi is the header's 0x10", vz.wire_dfi() == 0x10,
+            f"0x{vz.wire_dfi():02X}")
+        chk("--decompress declares dfi 0x00",
+            vz.wire_dfi(True) == 0x00, f"0x{vz.wire_dfi(True):02X}")
+        pk = vz.flash_blocks()
+        pl = vz.flash_blocks(decompress=True)
+        chk("same block count either way", len(pk) == len(pl),
+            f"{len(pk)} vs {len(pl)}")
+        chk("unpacked blocks are larger than the stored ones",
+            sum(b["length"] for b in pl) > sum(b["length"] for b in pk),
+            f"{sum(b['length'] for b in pl)} vs "
+            f"{sum(b['length'] for b in pk)}")
+        chk("unpacked length == len(data) (what 34 declares)",
+            all(b["length"] == len(b["data"]) for b in pl))
+        chk("stored_length keeps the on-disk length",
+            all(b["stored_length"] == o["length"] for b, o in zip(pl, pk)))
+        chk("load addresses are unchanged by --decompress",
+            [b["start"] for b in pl] == [b["start"] for b in pk])
+        chk("the expanded bytes are the ones the block CRC-16 covers",
+            all(_ba.crc_hqx(b["data"], 0xFFFF) == b["crc"] for b in pl))
+        # A raw container must be byte-identical with and without the flag.
+        _raw = next((p for p in (os.path.join(SBL_DIR, n)
+                                 for n in sorted(os.listdir(SBL_DIR)))
+                     if p.lower().endswith(".vbf") and not Vbf(p).compressed()),
+                    None)
+        if _raw:
+            vr = Vbf(_raw)
+            chk("--decompress is a no-op for a raw container",
+                vr.wire_dfi(True) == vr.wire_dfi()
+                and vr.flash_blocks(decompress=True) == vr.flash_blocks(),
+                os.path.basename(_raw))
+    else:
+        print(f"  SKIP  {os.path.basename(_lz)} not present")
+
+    # LZSS DECODER: the fast path must be byte-identical to the literal
+    # Okumura reference decoder. lzss_decode() drops the materialised ring in
+    # favour of back-copies into the output, which is only valid because a ring
+    # cell IS the output byte 1..1024 back — assert it instead of trusting it,
+    # on real blocks and on crafted streams that exercise the virgin ring.
+    print("\n== LZSS decoder: fast path == reference ==")
+    import random as _rnd
+
+    def _enc(bits):
+        o = bytearray()
+        a = n = 0
+        for b in bits:
+            a = (a << 1) | b
+            n += 1
+            if n == 8:
+                o.append(a)
+                a = n = 0
+        if n:
+            o.append(a << (8 - n))
+        return bytes(o)
+
+    def _lit(ch):
+        return [1] + [(ch >> k) & 1 for k in range(7, -1, -1)]
+
+    def _mat(i, j):
+        return ([0] + [(i >> k) & 1 for k in range(9, -1, -1)]
+                + [(j >> k) & 1 for k in range(3, -1, -1)])
+
+    # a match as the very first token reads the 0x20-filled virgin ring
+    _virgin = _enc(_mat(1, 3))
+    chk("a match into the virgin ring yields 0x20 spaces",
+        _vbf.lzss_decode(_virgin) == _vbf._lzss_decode_ref(_virgin) == b"     ",
+        repr(_vbf.lzss_decode(_virgin)))
+    _rnd.seed(7)
+    _bad = 0
+    for _ in range(600):
+        _bits = []
+        for _ in range(_rnd.randint(1, 40)):
+            if _rnd.random() < 0.5:
+                _bits += _lit(_rnd.randrange(256))
+            else:
+                _bits += _mat(_rnd.randrange(1, 1024), _rnd.randrange(16))
+        _d = _enc(_bits)
+        if _vbf.lzss_decode(_d) != _vbf._lzss_decode_ref(_d):
+            _bad += 1
+    chk("600 randomised streams decode identically", _bad == 0,
+        f"{_bad} mismatches")
+
+    # The ENCODER must round-trip through both decoders — it is the thing a
+    # module will be asked to unpack, so a bad token here is a brick.
+    _ebad = []
+    _ecases = [b"", b"A", b"AB", b"\xFF" * 5000, bytes(range(256)) * 8,
+               b"ABCABCABC" * 200, b"\x00" * 4096 + b"\xAA" * 9,
+               b"\xFF" * 1023 + b"\x01",      # ring pos 1023 unaddressable
+               b"\xFF" * 1024 + b"\x01",
+               b"\xFF" * 1025 + b"\x01"]
+    _rnd.seed(11)
+    for _ in range(150):
+        _n = _rnd.randint(1, 3000)
+        _ecases.append(bytes(_rnd.randrange(_rnd.choice([2, 4, 256]))
+                             for _ in range(_n)))
+    for _d in _ecases:
+        _packed = _vbf.lzss_encode(_d)
+        if _vbf.lzss_decode(_packed) != _d \
+                or _vbf._lzss_decode_ref(_packed) != _d:
+            _ebad.append(len(_d))
+    chk(f"lzss_encode round-trips {len(_ecases)} payloads through BOTH decoders",
+        not _ebad, f"failed at lengths {_ebad[:5]}")
+    _ff = _vbf.lzss_encode(b"\xFF" * 5000)
+    chk("an all-0xFF payload compresses hard (match coding works)",
+        len(_ff) < 5000 // 8, f"{len(_ff)} B for 5000")
+    if os.path.exists(_lz):
+        # reuse the Vbf from the --decompress section: its LZSS result is
+        # memoised, so this costs no second 16 MiB decode
+        _blk = vz.blocks[0]
+        # the reference is slow, so prove equivalence on a prefix of a REAL
+        # block (the full-corpus comparison is a separate manual run)
+        _pre = _blk["data"][:200000]
+        chk("a real compressed block decodes identically to the reference",
+            _vbf.lzss_decode(_pre) == _vbf._lzss_decode_ref(_pre))
+        _t0 = time.time()
+        _full = _vbf.lzss_decode(_blk["data"])
+        _dt = time.time() - _t0
+        chk("the full real block still matches its stored CRC-16",
+            _ba.crc_hqx(_full, 0xFFFF) == _blk["crc"])
+        print(f"        {len(_blk['data']) / 1048576:.1f} MiB -> "
+              f"{len(_full) / 1048576:.1f} MiB in {_dt:.2f}s "
+              f"({len(_full) / _dt / 1048576:.0f} MiB/s)")
+
+    # BLANK-SKIP: a long 0xFF run inside an ERASED region need not be
+    # transmitted. The acceptance test is reassembly: fragments laid over a
+    # 0xFF canvas must reproduce the full payload byte-for-byte.
+    print("\n== --skip-blank: omit erased-blank padding ==")
+    _bb = ("/home/gl/Projects/ford/IPC/c-max_el/hybrid/"
+           "HM5T-14C088-BB.VBF")
+    if os.path.exists(_bb):
+        vb = Vbf(_bb)
+        full = vb.flash_blocks(decompress=True)
+        part = vb.flash_blocks(decompress=True, skip_blank=0x1000)
+        fl = sum(b["length"] for b in full)
+        pl = sum(b["length"] for b in part)
+        chk("the split produces more, smaller fragments",
+            len(part) > len(full) and pl < fl,
+            f"{len(full)}->{len(part)} blocks, {fl}->{pl} B")
+        chk("LOSSLESS: fragments reassemble to the full payload",
+            vb.verify_blank_skip(decompress=True, skip_blank=0x1000) == [],
+            str(vb.verify_blank_skip(decompress=True, skip_blank=0x1000)))
+        chk("every fragment length == len(its data)",
+            all(b["length"] == len(b["data"]) for b in part))
+        chk("every fragment is non-empty",
+            all(b["length"] > 0 for b in part))
+        chk("fragments stay inside the parent block's address range",
+            all(full[0]["start"] <= b["start"]
+                and b["start"] + b["length"] <= full[0]["start"] + fl
+                for b in part))
+        chk("fragments are ordered and non-overlapping",
+            all(part[i]["start"] + part[i]["length"] <= part[i + 1]["start"]
+                for i in range(len(part) - 1)))
+        chk("every fragment start is 0x100-aligned (write granularity)",
+            all(b["start"] % 0x100 == 0 for b in part[1:]),
+            str([hex(b["start"]) for b in part]))
+        chk("every skipped gap lies inside an erase region",
+            all(vb._erase_covers(part[i]["start"] + part[i]["length"],
+                                 part[i + 1]["start"]
+                                 - (part[i]["start"] + part[i]["length"]))
+                for i in range(len(part) - 1)))
+        chk("no NON-0xFF byte is ever dropped",
+            all(b == 0xFF for i in range(len(part) - 1)
+                for b in vb.flash_blocks(decompress=True)[0]["data"][
+                    part[i]["start"] + part[i]["length"] - full[0]["start"]:
+                    part[i + 1]["start"] - full[0]["start"]]))
+        sent, fullb, nf, np_ = vb.blank_skip_report(decompress=True,
+                                                    skip_blank=0x1000)
+        chk("report agrees with the block lists",
+            (sent, fullb, nf, np_) == (pl, fl, len(part), len(full)))
+        print(f"        saving: {fl / 1048576:.1f} -> {pl / 1048576:.1f} MiB "
+              f"({100.0 * (fl - pl) / fl:.0f}% less) in {len(part)} fragments")
+        # The library still refuses a bare split on compressed data: without
+        # decompress OR recompress an offset inside LZSS data is not an address.
+        try:
+            vb.flash_blocks(skip_blank=0x1000)
+            chk("skip_blank refused on compressed data without "
+                "decompress/recompress", False, "no exception")
+        except ValueError as e:
+            chk("skip_blank refused on compressed data without "
+                "decompress/recompress", "recompress=True" in str(e))
+        # A compressed container is now blank-skipped by expand -> split ->
+        # RE-PACK, so it still goes on the wire as dfi 0x10. The plain
+        # (--decompress) route stays available as the explicit opt-out.
+        _rc = vb.flash_blocks(skip_blank=0x1000, recompress=True)
+        _on_disk = sum(b["length"] for b in vb.flash_blocks())
+        _wire = sum(b["length"] for b in _rc)
+        chk("recompress keeps the fragment count of the plain split",
+            len(_rc) == len(part), f"{len(_rc)} vs {len(part)}")
+        chk("every re-packed fragment carries plain_length",
+            all("plain_length" in b for b in _rc))
+        chk("re-packed fragments decode back to the kept plaintext",
+            all(_vbf.lzss_decode(r["data"]) == p["data"]
+                for r, p in zip(_rc, part)))
+        chk("the re-packed wire size is SMALLER than sending the file as-is",
+            _wire < _on_disk,
+            f"{_wire / 1048576:.2f} vs {_on_disk / 1048576:.2f} MiB")
+        _rcp = vb.verify_blank_skip(skip_blank=0x1000, recompress=True)
+        chk("LOSSLESS with recompress (decode + reassemble)", _rcp == [],
+            str(_rcp))
+        print(f"        compressed route: {_on_disk / 1048576:.2f} MiB as-is "
+              f"-> {_wire / 1048576:.2f} MiB re-packed "
+              f"({100.0 * (_on_disk - _wire) / _on_disk:.0f}% less), "
+              f"{sum(b['plain_length'] for b in _rc) / 1048576:.1f} MiB written")
+        # skip_blank=0 must be bit-identical to not passing it at all.
+        chk("skip_blank=0 is a no-op",
+            vb.flash_blocks(decompress=True, skip_blank=0) == full)
+    else:
+        print(f"  SKIP  {os.path.basename(_bb)} not present")
+
+    # The erase-coverage rule is the whole safety argument, so prove it is
+    # load-bearing on a synthetic part rather than hoping a corpus file
+    # exercises it: a blank run OUTSIDE the erase map must be transmitted,
+    # because there the pre-existing flash content is unknown.
+    def _synth(erase):
+        sv = Vbf.__new__(Vbf)
+        sv.path, sv.dfi, sv.omit, sv._unpacked = "<synthetic>", None, [], {}
+        d = (b"\xAA" * 0x100 + b"\xFF" * 0x2000 + b"\xBB" * 0x100
+             + b"\xFF" * 0x2000 + b"\xCC" * 0x100)
+        sv.blocks = [dict(start=0x1000, length=len(d), crc=0, data=d)]
+        sv.erase = erase
+        return sv
+    _s1 = _synth([(0x1000, 0x2200)])      # covers the 1st blank run only
+    chk("a blank run OUTSIDE the erase map is NOT skipped",
+        len(_s1.flash_blocks(skip_blank=0x1000)) == 2,
+        f"{len(_s1.flash_blocks(skip_blank=0x1000))} fragments")
+    _s2 = _synth([(0x1000, 0x5000)])      # covers both runs
+    chk("both blank runs are skipped when both are erased",
+        len(_s2.flash_blocks(skip_blank=0x1000)) == 3,
+        f"{len(_s2.flash_blocks(skip_blank=0x1000))} fragments")
+    chk("with NO erase map nothing is skipped",
+        len(_synth([]).flash_blocks(skip_blank=0x1000)) == 1)
+    chk("the synthetic splits are lossless too",
+        _s1.verify_blank_skip(skip_blank=0x1000) == []
+        and _s2.verify_blank_skip(skip_blank=0x1000) == [])
+    # An omit region is NOT erased, so a blank run in it must be transmitted.
+    # Layout: two blocks, one of which sits in the omitted (protected) erase
+    # region — that block is not downloaded at all, and the remaining block's
+    # blank run is only skippable via the NON-omitted erase region.
+    _s4 = _synth([(0x1000, 0x2200), (0x8000, 0x2200)])
+    _s4.omit = [(0x8000, 0x2200)]
+    _d = (b"\xAA" * 0x100 + b"\xFF" * 0x2000 + b"\xBB" * 0x100)
+    _s4.blocks = [dict(start=0x1000, length=len(_d), crc=0, data=_d),
+                  dict(start=0x8000, length=len(_d), crc=0, data=_d)]
+    _f4 = _s4.flash_blocks(skip_blank=0x1000)
+    chk("the OMIT-protected block is not downloaded at all",
+        all(b["start"] < 0x8000 for b in _f4),
+        str([hex(b["start"]) for b in _f4]))
+    chk("_erase_covers ignores an omitted erase region",
+        _s4._erase_covers(0x1100, 0x2000)
+        and not _s4._erase_covers(0x8100, 0x2000))
+
     # STALE-FRAME DRAIN: a frame that is neither the positive nor the negative
     # response to THIS request (e.g. a duplicated 50 02 programmingSession
     # still queued when we send 27 01) must be discarded, not returned.
@@ -2355,6 +2870,48 @@ def selftest():
                 for b in vp.flash_blocks()))
     else:
         print(f"  SKIP  {os.path.basename(_pcm)} not present")
+
+    # INTEGRITY GATE: a CRC mismatch aborts, --force downgrades it to a
+    # warning (a deliberately patched file whose CRCs were not recomputed).
+    print("\n== integrity gate: --force override ==")
+    import tempfile
+    _sbl = os.path.join(SBL_DIR, "AM5T-14C025-AF.vbf")
+    if os.path.exists(_sbl):
+        _raw = bytearray(open(_sbl, "rb").read())
+        _good = Vbf(_sbl)
+        chk("the pristine SBL passes its own CRCs", not _good.check())
+        # Flip one payload byte: breaks both the block CRC-16 and file CRC-32
+        # without disturbing the block walk (start/length fields untouched).
+        _off = _good.data_start + 8
+        _raw[_off] ^= 0xFF
+        _tmp = os.path.join(tempfile.gettempdir(), "vbflasher_crcbad.vbf")
+        with open(_tmp, "wb") as fh:
+            fh.write(_raw)
+        _badv = Vbf(_tmp)
+        _probs = _badv.check()
+        chk("the flipped byte is detected (block CRC-16 + file CRC-32)",
+            len(_probs) == 2, "; ".join(_probs))
+        try:
+            _check_integrity([_badv])
+            _refused = False
+        except SystemExit:
+            _refused = True
+        chk("a CRC mismatch is REFUSED without --force", _refused)
+        try:
+            _check_integrity([_badv], force=True)
+            _forced_crc = True
+        except SystemExit:
+            _forced_crc = False
+        chk("--force downgrades the CRC mismatch to a warning", _forced_crc)
+        try:
+            _check_integrity([_good])
+            _clean = True
+        except SystemExit:
+            _clean = False
+        chk("a clean file still passes with no --force", _clean)
+        os.unlink(_tmp)
+    else:
+        print(f"  SKIP  {os.path.basename(_sbl)} not present")
 
     # Header COMMENTS must never be parsed as declarations. Ford ships the
     # F1FT IPMA calibration with its whole `erase = {...};` block commented
@@ -2453,7 +3010,8 @@ def selftest():
             pass
         h = buf.getvalue()
         for flag in ("--iface", "--sbl", "--sbl-dir", "--secret", "--dry-run",
-                     "--force", "--test-sbl", "--quiet-bus", "--erase-timeout",
+                     "--force", "--test-sbl", "--recovery", "--quiet-bus",
+                     "--decompress", "--skip-blank", "--erase-timeout",
                      "--tp-interval", "--rxid", "--logfile", "--yes", "--hw"):
             chk(f"flash accepts {flag}", flag in h)
     finally:
@@ -2637,9 +3195,11 @@ def build_parser():
                    help="skip the 31 01 0304 verify routine after writing")
 
     s = sub.add_parser("flash", help="flash one or more VBF files")
-    s.add_argument("vbf", nargs="+", metavar="FILE",
+    s.add_argument("vbf", nargs="*", metavar="FILE|ECU",
                    help="VBF file(s) to upload. Multiple allowed; grouped by "
-                        "ecu_address. SBL-type files are used as the SBL.")
+                        "ecu_address. SBL-type files are used as the SBL. "
+                        "With --test-sbl there is nothing to flash, so an ECU "
+                        "name or id may be given instead (e.g. GWM).")
     s.add_argument("--iface", default=None,
                    help="override SocketCAN interface (default: HS-CAN=can0, "
                         "MS-CAN=can1)")
@@ -2659,17 +3219,42 @@ def build_parser():
                         "dry-run planning)")
     s.add_argument("--test-sbl", action="store_true",
                    help="load and start the SBL only; NO erase, NO write")
+    s.add_argument("--recovery", action="store_true",
+                   help="skip live identity/wake reads and repeatedly send "
+                        "10 02 to catch the PBL after power-up; requires "
+                        "--hw or both --sbl and --secret (Ctrl-C to stop)")
     s.add_argument("--dry-run", "-n", action="store_true",
                    help="print the plan only; connect to nothing, send nothing")
     s.add_argument("--yes", "-y", action="store_true",
                    help="skip the 'are you sure?' confirmation (for scripting)")
     s.add_argument("--force", action="store_true",
-                   help="downgrade refusals to warnings: an EXE identity "
-                        "mismatch, and a flash-order overlap where a later "
-                        "part's erase covers an earlier part's blocks")
+                   help="downgrade refusals to warnings: a VBF checksum "
+                        "mismatch (block CRC-16 / file CRC-32), an EXE "
+                        "identity mismatch, and a flash-order overlap where a "
+                        "later part's erase covers an earlier part's blocks")
     s.add_argument("--quiet-bus", action="store_true",
                    help="silence other modules for the flash (functional "
                         "10 82; unconfirmed, network-wide; off by default)")
+    s.add_argument("--decompress", action="store_true",
+                   help="LZSS-expand a compressed payload on the host and "
+                        "transmit it in plain (34 00 ... with the UNPACKED "
+                        "length) instead of sending the on-disk compressed "
+                        "bytes with dfi 0x10. Only for a boot loader that "
+                        "cannot decompress; the proven Ford path is verbatim.")
+    s.add_argument("--skip-blank", nargs="?", type=lambda x: int(x, 0),
+                   const=0x1000, default=0, metavar="BYTES",
+                   help="speed up the download by NOT transmitting runs of "
+                        "0xFF at least BYTES long (default 4096 when the flag "
+                        "is given bare) that the part's own erase map already "
+                        "leaves blank: the block is split into several "
+                        "downloads around them. A compressed part is expanded, "
+                        "split and RE-PACKED, so it still goes on the wire as "
+                        "dfi 0x10 (add --decompress to send it plain instead). "
+                        "Refused unless the split is proven lossless by "
+                        "reassembly.")
+    s.add_argument("--blank-byte", type=lambda x: int(x, 0), default=0xFF,
+                   help="erased-flash byte for --skip-blank; only 0xFF is "
+                        "supported (other values are refused for safety)")
     s.add_argument("--erase-timeout", type=float, default=60.0,
                    help="seconds of SILENCE that ends an erase/finalise wait")
     s.add_argument("--wake-tries", type=int, default=8,
