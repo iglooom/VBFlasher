@@ -14,7 +14,13 @@ Provenance of the data in this file
   the working per-ECU flashers verbatim:
       BCM  0x726  level1  64000B0C59   (verified on the bench BCM)
       PSCM 0x730  level1  00009B2533   (published; UNVERIFIED on the module)
-      IPMA 0x706          00009875CA   (solved from two captured sessions)
+      IPMA 0x706  level1  00009875CA   (solved from two captured flash sessions;
+                                        works on both CV4T and F1FT modules)
+      IPMA 0x706  level3  0000E727FB   (solved from two captured UCDS Direct
+                                        Configuration sessions on F1FT-14F403-AE,
+                                        seeds 3636B8/1C8ABA; required even to
+                                        READ the config DIDs. See
+                                        IPMA/Research/IPMA_camera_alignment.md)
       IPC  0x720  level3  0102030405   (DM5T-14F094 application: stored in
                                         live RAM at 0x400086D3 and confirmed
                                         from captured seed/key pairs)
@@ -223,7 +229,14 @@ ECUS = {
         aliases=("IPMA",),
         ident_dids=("F113", "F188", "F120", "F124", "F125", "F108", "F10A",
                     "F111", "F18C", "F190"),
-        secrets=(SecretRule("", None, "00009875CA"),),
+        # level 1 = flash/programming (27 01/02). level 3 = the Direct
+        # Configuration DID set (27 03/04), which the IPMA requires even to
+        # READ D700/D701/DE00-DE03/FD05-FD08. Keep the level-agnostic rule last
+        # so any other level still resolves to the flash secret as before.
+        secrets=(
+            SecretRule("", 3, "0000E727FB"),
+            SecretRule("", None, "00009875CA"),
+        ),
         default_sbl="CV4T-14F399-AF.VBF",
         sbl_call_halfword=False,
         finalize=True,
@@ -247,7 +260,7 @@ ECUS = {
     ),
     0x7A5: EcuProfile(
         name="FCDIM / FDIM (display)", txid=0x7A5, bus="MS-CAN",
-        aliases=("FCDIM", "FDIM", "APIM"),
+        aliases=("FCDIM", "FDIM"),
         secrets=(
             SecretRule("CM5T-14F180-C", None, "50C86A49F1"),
             SecretRule("BM5T-14D356-C", None, "50C86A49F1"),
@@ -260,6 +273,16 @@ ECUS = {
             SblRule("DM5T-14D356-G", "DM5T-14D360-CA.vbf"),
             SblRule("BM5T-14D356-C", "BM5T-14D360-CA.vbf"),
             SblRule("CM5T-14F180-C", "BM5T-14D360-CB.vbf"),
+        ),
+    ),
+    0x7D0: EcuProfile(
+        name="APIM", txid=0x7D0, bus="MS-CAN",
+        aliases=("APIM"),
+        secrets=(
+            SecretRule("", 3, "9A78563412"),
+            SecretRule("", 1, "50C86A49F1"),
+        ),
+        sbls=(
         ),
     ),
     0x7E0: EcuProfile(
