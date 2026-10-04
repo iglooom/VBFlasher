@@ -54,6 +54,7 @@ import time
 # project dir — sibling modules (ecu_db, vbf) and sbl/ live next to the script.
 HERE = os.path.dirname(os.path.realpath(__file__))
 SBL_DIR = os.path.join(HERE, "sbl")   # default location for SBL VBF files
+LOG_DIR = os.path.join(HERE, "logs")  # one log file per run lands here
 sys.path.insert(0, HERE)
 
 import ecu_db                                            # noqa: E402
@@ -81,6 +82,37 @@ def settle_before_seed(delay=SEED_DELAY):
         print(f"   settling {delay:.1f}s before requestSeed "
               f"(module may still be entering its bootloader)")
         time.sleep(delay)
+
+
+# --------------------------------------------------------------------------
+# run log: one file per invocation, named <date>-<time>_<ECU>_<op>.log so a
+# long session never appends into a single multi-hundred-MB vbflasher.log.
+# --------------------------------------------------------------------------
+def run_log_path(ecu_name, op, when=None):
+    """Per-run log path: logs/20260704-153012_BCM_flash.log."""
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(when))
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(ecu_name or "ECU")).strip("_")
+    return os.path.join(LOG_DIR, f"{stamp}_{safe or 'ECU'}_{op}.log")
+
+
+def open_run_log(args, ecu_name, op, header=""):
+    """Open this run's trace log and write its banner.
+
+    --logfile unset  -> auto per-run file (see run_log_path)
+    --logfile PATH   -> that exact path (appended, as before)
+    --logfile ''     -> logging disabled, returns None
+    """
+    spec = getattr(args, "logfile", None)
+    if spec is not None and not str(spec).strip():
+        return None
+    path = spec if spec else run_log_path(ecu_name, op)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    logf = open(path, "a")
+    logf.write(f"\n==== {time.strftime('%F %T')} {ecu_name} "
+               f"{op}{(' ' + header) if header else ''} ====\n")
+    logf.flush()
+    print(f"   log: {path}")
+    return logf
 
 
 # --------------------------------------------------------------------------
@@ -465,12 +497,8 @@ def flash_session(txid, files, args):
                              f"`ip link` or pass --iface.")
 
     # --- connect + identity (needs the live F111 to choose SBL/secret) -----
-    logf = None
-    if args.logfile:
-        os.makedirs(os.path.dirname(args.logfile) or ".", exist_ok=True)
-        logf = open(args.logfile, "a")
-        logf.write(f"\n==== {time.strftime('%F %T')} {profile.name} "
-                   f"tx=0x{txid:03X} rx=0x{rxid:03X} ====\n")
+    logf = open_run_log(args, profile.name, "flash",
+                        f"tx=0x{txid:03X} rx=0x{rxid:03X}")
 
     ecu = Ecu(iface, txid, rxid, execute=args.execute, logfile=logf)
 
@@ -841,12 +869,9 @@ def _open_sbl_session(profile, args, need_secret=True):
     iface = _profile_iface(profile, args.iface)
     _check_iface(iface)
 
-    logf = None
-    if getattr(args, "logfile", None):
-        os.makedirs(os.path.dirname(args.logfile) or ".", exist_ok=True)
-        logf = open(args.logfile, "a")
-        logf.write(f"\n==== {time.strftime('%F %T')} {profile.name} "
-                   f"mem tx=0x{txid:03X} rx=0x{rxid:03X} ====\n")
+    logf = open_run_log(args, profile.name,
+                        getattr(args, "cmd", None) or "mem",
+                        f"tx=0x{txid:03X} rx=0x{rxid:03X}")
 
     ecu = Ecu(iface, txid, rxid, execute=True, logfile=logf)
     ident = read_identity(ecu, profile, getattr(args, "wake_tries", 8),
@@ -3207,8 +3232,10 @@ def build_parser():
         sp.add_argument("--erase-timeout", type=float, default=60.0)
         sp.add_argument("--yes", "-y", action="store_true",
                         help="skip the confirmation prompt")
-        sp.add_argument("--logfile",
-                        default=os.path.join(HERE, "logs", "vbflasher.log"))
+        sp.add_argument("--logfile", default=None,
+                        help="trace log path; default is a fresh per-run file "
+                             "logs/<date>-<time>_<ECU>_<cmd>.log. Pass an "
+                             "empty string to disable logging.")
         return sp
 
     s = add_sbl_flags(sub.add_parser(
@@ -3317,9 +3344,11 @@ def build_parser():
                    help="broadcast CAN ID for TesterPresent/quiet-bus "
                         "(default: physical via ISO-TP; pass 0x7DF for "
                         "broadcast)")
-    s.add_argument("--logfile",
-                   default=os.path.join(HERE, "logs", "vbflasher.log"),
-                   help="append a timestamped request/response trace here")
+    s.add_argument("--logfile", default=None,
+                   help="append a timestamped request/response trace here; "
+                        "default is a fresh per-run file "
+                        "logs/<date>-<time>_<ECU>_flash.log (pass an empty "
+                        "string to disable logging)")
     return ap
 
 

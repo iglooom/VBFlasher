@@ -145,6 +145,11 @@ planning), `--test-sbl`, `--quiet-bus`, `--decompress`, `--skip-blank`,
 `--blank-byte`, `--force`, `--rxid`,
 `--erase-timeout`, `--tp-interval`, `--tp-id`, `--logfile`.
 
+Every live run writes its own trace log — `logs/<YYYYMMDD>-<HHMMSS>_<ECU>_<cmd>.log`
+(e.g. `logs/20260704-153012_BCM_flash.log`) — so logs never pile into one huge
+file. `--logfile PATH` pins an explicit path (appended); `--logfile ''` disables
+logging entirely.
+
 ### `--decompress` — transmit a compressed payload in plain
 
 A VBF with `data_format_identifier = 0x10` carries LZSS-packed blocks. The
