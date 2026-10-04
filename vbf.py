@@ -1339,8 +1339,24 @@ class FlashProgress:
 # --------------------------------------------------------------------------
 # download stage: 34 RequestDownload -> 36 TransferData (chunked) -> 37 exit
 # --------------------------------------------------------------------------
+def transfer_exit_crc(resp):
+    """Return the CRC-16 a 0x77 TransferExit response echoes, or None.
+
+    Ground truth (UCDS CCM flash, CCM/GV6T/uscds.log + ucds_flash.log): this
+    module answers RequestTransferExit with `77 <crc16-hi> <crc16-lo>`, where
+    the value is CRC-16/CCITT-FALSE over the bytes it just received — it
+    matched the VBF's own stored block CRC on all three transfers of the
+    capture (SBL 0xC404, app blocks 0x226F and 0xDDEF). That makes the echo a
+    free end-to-end check that what landed in flash is what we sent. Other
+    bootloaders answer a bare `77`, so absence is not an error.
+    """
+    if resp is None or len(resp) < 3 or resp[0] != 0x77:
+        return None
+    return (resp[1] << 8) | resp[2]
+
+
 def download_blocks(ecu, blocks, tag, progress_interval=2.0, dfi=0x00,
-                    progress=None):
+                    progress=None, exit_crc=False, force=False):
     total = sum(b["length"] for b in blocks)
     done = 0
     t0 = time.time()
@@ -1398,7 +1414,41 @@ def download_blocks(ecu, blocks, tag, progress_interval=2.0, dfi=0x00,
                          (done / el / 1024) if el else 0), end="", flush=True)
         if ecu.execute and progress is None:
             print()
-        ecu.expect("37", 0x77, f"{tag} blk{bi} 37 TransferExit", timeout=15.0)
+        r = ecu.expect("37", 0x77, f"{tag} blk{bi} 37 TransferExit",
+                       timeout=15.0)
+        if ecu.execute:
+            got = transfer_exit_crc(r)
+            if got is None:
+                if exit_crc:
+                    msg = (f"{tag} blk{bi}: 37 TransferExit answered {fmt(r)} "
+                           f"with no CRC-16; this ECU is registered as echoing "
+                           f"one, so the transfer is UNVERIFIED.")
+                    if force:
+                        print(f"      WARNING (--force): {msg}")
+                    else:
+                        raise SystemExit(msg + " Use --force to continue.")
+            else:
+                # The ECU CRCs what it received. Accept either the CRC of the
+                # bytes we put on the wire or the block's stored CRC: for a
+                # compressed block sent verbatim the stored CRC covers the
+                # DECOMPRESSED payload the ECU ends up with, not the wire bytes.
+                sent = binascii.crc_hqx(b["data"][:b["length"]], 0xFFFF)
+                ok = {sent}
+                if b.get("crc") is not None:
+                    ok.add(b["crc"])
+                if got in ok:
+                    print(f"      TransferExit CRC-16 0x{got:04X} OK "
+                          f"(matches the transmitted payload)")
+                else:
+                    msg = (f"{tag} blk{bi}: the ECU computed CRC-16 0x{got:04X} "
+                           f"over what it received, but we sent 0x{sent:04X}"
+                           + (f" (block declares 0x{b['crc']:04X})"
+                              if b.get("crc") is not None else "")
+                           + ". The data in flash does NOT match the file.")
+                    if force:
+                        print(f"      WARNING (--force): {msg}")
+                    else:
+                        raise SystemExit(msg)
 
 
 # --------------------------------------------------------------------------

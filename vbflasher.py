@@ -66,6 +66,22 @@ from vbf import (Vbf, Ecu, BusQuiet, Keepalive, FlashProgress, download_blocks, 
 
 TP_INTERVAL = 1.5
 
+# Pause between entering a diagnostic session and 27 xx requestSeed, for EVERY
+# module. A Ford module that answers 50 02 jumps into its primary bootloader and
+# needs a moment to come up; the first requestSeed sent too early can time out or
+# be refused even though the identical request succeeds moments later. UCDS waits
+# ~1.0 s here (CCM/GV6T/ucds_flash.log: 50 02 at t=9.111, 27 01 at t=10.129), so
+# match it rather than the 0.1 s we used to use. Cost is one second per flash.
+SEED_DELAY = 1.0
+
+
+def settle_before_seed(delay=SEED_DELAY):
+    """Wait out the post-session bootloader settle before requestSeed."""
+    if delay > 0:
+        print(f"   settling {delay:.1f}s before requestSeed "
+              f"(module may still be entering its bootloader)")
+        time.sleep(delay)
+
 
 # --------------------------------------------------------------------------
 # SBL resolution
@@ -706,7 +722,12 @@ def flash_session(txid, files, args):
 
         print("\n== session + security ==")
         enter_programming_session(ecu, args)
+        # Settle before requestSeed on EVERY module (see SEED_DELAY). The one
+        # exception is --recovery: the skill's recovery procedure continues
+        # immediately once the PBL answers, so it keeps the short wait.
         if not args.recovery:
+            settle_before_seed(args.seed_delay)
+        else:
             time.sleep(0.1)
         r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
                        timeout=5.0)
@@ -728,7 +749,8 @@ def flash_session(txid, files, args):
         download_blocks(ecu, sbl.wire_blocks(args.decompress),
                         "sbl", args.progress_interval,
                         dfi=sbl.wire_dfi(args.decompress),
-                        progress=progress if progress.enabled else None)
+                        progress=progress if progress.enabled else None,
+                        exit_crc=profile.transfer_exit_crc, force=args.force)
         if profile.sbl_call_halfword:
             call_arg = f"{(sbl.call >> 16) & 0xFFFF:04X}"
         else:
@@ -771,7 +793,9 @@ def flash_session(txid, files, args):
                 download_blocks(ecu, dblocks, v.part or "app",
                                 args.progress_interval,
                                 dfi=v.wire_dfi(args.decompress),
-                                progress=progress if progress.enabled else None)
+                                progress=progress if progress.enabled else None,
+                                exit_crc=profile.transfer_exit_crc,
+                                force=args.force)
 
             if profile.finalize:
                 progress.stage_name("finalise")
@@ -867,7 +891,7 @@ def _open_sbl_session(profile, args, need_secret=True):
     if not (r is not None and r[0] == 0x50):
         raise SystemExit(f"10 02 programmingSession: {fmt(r)}")
     print(f"   OK   10 02 programmingSession        {fmt(r)}")
-    time.sleep(0.1)
+    settle_before_seed(getattr(args, "seed_delay", SEED_DELAY))
     r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
                    timeout=5.0)
     seed = list(r[2:5])
@@ -884,7 +908,9 @@ def _open_sbl_session(profile, args, need_secret=True):
     print("\n== SBL -> RAM ==")
     dec = getattr(args, "decompress", False)
     download_blocks(ecu, sbl.wire_blocks(dec), "sbl", args.progress_interval,
-                    dfi=sbl.wire_dfi(dec))
+                    dfi=sbl.wire_dfi(dec),
+                    exit_crc=profile.transfer_exit_crc,
+                    force=getattr(args, "force", False))
     call_arg = (f"{(sbl.call >> 16) & 0xFFFF:04X}" if profile.sbl_call_halfword
                 else f"{sbl.call:08X}")
     ecu.expect("31010301" + call_arg, 0x71, "31 01 0301 start SBL",
@@ -1174,6 +1200,9 @@ def _session_and_unlock(args, profile, ecu):
         ecu.expect("10%02X" % args.session, 0x50,
                    "10 %02X diagnosticSession" % args.session, timeout=5.0)
         time.sleep(0.1)
+        entered_session = True
+    else:
+        entered_session = False
     if not getattr(args, "unlock", False):
         return
     level = args.sec_level if args.sec_level is not None else 1
@@ -1192,6 +1221,10 @@ def _session_and_unlock(args, profile, ecu):
             raise SystemExit(
                 f"--unlock: no secret for {profile.name} F111 {hw!r} "
                 f"level {level}; pass --secret 0x.... or --hw <F111>")
+    # Settle only when we actually changed session: in the default session the
+    # module is not entering a bootloader, so the wait would be pure cost.
+    if entered_session:
+        settle_before_seed(getattr(args, "seed_delay", SEED_DELAY))
     r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
                    timeout=5.0)
     seed = list(r[2:5])
@@ -3077,6 +3110,9 @@ def build_parser():
                         "default level 1 when unlocking)")
     s.add_argument("--hw", default=None,
                    help="assume this F111 for secret selection under --unlock")
+    s.add_argument("--seed-delay", type=float, default=SEED_DELAY,
+                   help="seconds between a --session change and 27 xx "
+                        f"requestSeed (default {SEED_DELAY}; 0 disables)")
     s.add_argument("--timeout", type=float, default=5.0,
                    help="per-DID response timeout in seconds (default 5)")
 
@@ -3097,6 +3133,9 @@ def build_parser():
                         "default level 1 when unlocking)")
     s.add_argument("--hw", default=None,
                    help="assume this F111 for secret selection under --unlock")
+    s.add_argument("--seed-delay", type=float, default=SEED_DELAY,
+                   help="seconds between a --session change and 27 xx "
+                        f"requestSeed (default {SEED_DELAY}; 0 disables)")
     s.add_argument("--timeout", type=float, default=5.0,
                    help="response timeout in seconds (default 5)")
     s.add_argument("--yes", "-y", action="store_true",
@@ -3155,6 +3194,9 @@ def build_parser():
         sp.add_argument("--sec-level", type=lambda x: int(x, 0), default=1)
         sp.add_argument("--hw", default=None,
                         help="assume this F111 (skip the live read)")
+        sp.add_argument("--seed-delay", type=float, default=SEED_DELAY,
+                        help="seconds between session entry and 27 xx "
+                             f"requestSeed (default {SEED_DELAY}; 0 disables)")
         sp.add_argument("--addr-len-fmt", type=lambda x: int(x, 0), default=0x44,
                         help="addressAndLengthFormatId (default 0x44 = 4+4)")
         sp.add_argument("--quiet-bus", action="store_true")
@@ -3255,6 +3297,11 @@ def build_parser():
     s.add_argument("--blank-byte", type=lambda x: int(x, 0), default=0xFF,
                    help="erased-flash byte for --skip-blank; only 0xFF is "
                         "supported (other values are refused for safety)")
+    s.add_argument("--seed-delay", type=float, default=SEED_DELAY,
+                   help=f"seconds to wait between entering the programming "
+                        f"session and 27 xx requestSeed (default "
+                        f"{SEED_DELAY}; UCDS waits ~1 s while the module "
+                        f"enters its bootloader). 0 disables.")
     s.add_argument("--erase-timeout", type=float, default=60.0,
                    help="seconds of SILENCE that ends an erase/finalise wait")
     s.add_argument("--wake-tries", type=int, default=8,

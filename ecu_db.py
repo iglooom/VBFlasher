@@ -29,6 +29,13 @@ Provenance of the data in this file
                                         application; the earlier 381-candidate
                                         miss was against the application, not
                                         this PBL security context)
+      ABS  0x760  level1  42434D5932   (accepted in four FORScan flashes and
+                                        recoveries; distinct captured seeds
+                                        and keys have regression tests)
+      CCM  0x764  level1  AACCCC3355   (keybag value, CONFIRMED by the UCDS
+                                        flash capture CCM/GV6T/ucds_flash.log:
+                                        seed AC47B6 -> key E0876D was accepted
+                                        with 67 02)
 * The seed->key algorithm is a SINGLE universal LFSR keygen parameterised by a
   5-byte big-endian secret. keygen_equivalence proved BCM==PSCM==IPMA keys are
   byte-identical under that mapping, so a per-ECU keygen is never needed — only
@@ -102,6 +109,11 @@ class EcuProfile:
     # Optional start-SBL routine response from the proven PBL. A custom
     # application may return a shorter 71 01 03 01 without starting the SBL.
     sbl_start_response: Optional[bytes] = None
+    # This bootloader answers 37 RequestTransferExit with `77 <crc16>` over the
+    # bytes it received, so the echo can be checked against the file. Set only
+    # where a capture proves it; a bare `77` is normal elsewhere. A MISMATCHED
+    # echo aborts on every ECU — this flag only makes its ABSENCE an error.
+    transfer_exit_crc: bool = False
 
     def resp_id(self):
         return self.rxid if self.rxid is not None else self.txid + 8
@@ -218,11 +230,50 @@ ECUS = {
         # SBL AE9T-14D051-AA loads to RAM at 0x03FF9000.
         name="CCM (cruise control module / ESR radar)", txid=0x764,
         bus="HS-CAN", rxid=0x76C, aliases=("CCM", "ESR", "ACC"),
-        # NOT YET VERIFIED against a live module or a UCDS capture: rxid is the
-        # Ford txid+8 convention, and no secret/SBL rule is claimed here.
-        # Reads (22) need neither, so `readdid` is safe; flashing this ECU
-        # requires a SecretRule + SBL established from ground truth first.
+        # GROUND TRUTH: UCDS flash captures in CCM/GV6T/. ucds_flash.log holds
+        # the full prologue (an AD downgrade), uscds.log the BD download:
+        #   22 F113 -> AG9N-9G768-BF      (hardware part; this module answers
+        #                                  F113, NOT F111 — hw stays '' here,
+        #                                  so keep every rule prefix blank)
+        #   22 F188 -> GV6T-14D049-BD
+        #   7DF 02 10 82  x71 @ ~50 ms, then 10 02 ~50 ms later
+        #   10 02   -> 50 02 00 19 01 F4
+        #   (UCDS waits ~1.0 s here before requestSeed)
+        #   27 01   -> 67 01 AC47B6 ; 27 02 E0876D -> 67 02   (secret verified)
+        #   34 00 44 03FF9000 00001500 -> 74 20 0082   (128-byte transfers)
+        #   36 x42 (= 0x1500, byte-identical to sbl/AE9T-14D051-AA.vbf)
+        #   37      -> 7F 37 78 then 77 C404
+        #   31 01 0301 03FF9000 -> 71 01 0301 10       (FULL 4-byte call addr)
+        #   31 01 FF00 00008000 00058000 -> 7F 31 78, 71 01 FF00 10
+        #   31 01 FF00 00FF8000 00004000 -> 71 01 FF00 10
+        #   31 01 FF00 00FFC800 00003800 -> 71 01 FF00 10
+        #   34 00 44 00008000 00058000 -> 74 20 0082, then 36 x2816
+        #   37      -> 77 226F        (= block 0's stored CRC-16)
+        #   34 00 44 00FFC800 00003800 -> 74 20 0082, then 36 x112
+        #   37      -> 77 DDEF        (= block 1's stored CRC-16)
+        #   31 01 0304 -> 71 01 0304 10 02    (finalise ACCEPTED)
+        #   11 01   -> 51 01
+        #   keepalive: 7DF 02 3E 80 every ~2.0 s; the rest of the bus keeps
+        #   transmitting normally throughout, so the 10 82 arm silences little.
+        # Every 37 echoes `77 <crc16>` over the bytes the module received, and
+        # all three matched the VBF's own stored block CRC (SBL C404, app 226F
+        # and DDEF) -> a free end-to-end verification, enforced here.
+        # Each 36 answers 7F 36 78 then 76 <seq> ~185 ms later: 0.68 KiB/s, so
+        # the whole 366 KiB part took ~9.1 min on the wire. seq wraps FF -> 00.
+        # The final 37 of block 0 went pending for 3.05 s; finalise took 0.47 s.
         default_sbl="AE9T-14D051-AA.VBF",
+        # Level 1 is capture-verified. No other level has been captured; the
+        # level-agnostic rule stays as the keybag fallback for those.
+        secrets=(
+            SecretRule("", 1, "AACCCC3355"),
+            SecretRule("", None, "AACCCC3355"),
+        ),
+        sbl_call_halfword=False,
+        recovery_session_response=bytes.fromhex("5002001901F4"),
+        sbl_start_response=bytes.fromhex("7101030110"),
+        finalize=True,
+        finalize_response=bytes.fromhex("710103041002"),
+        transfer_exit_crc=True,
     ),
     0x706: EcuProfile(
         name="IPMA (front camera)", txid=0x706, bus="HS-CAN", rxid=0x70E,
@@ -251,11 +302,47 @@ ECUS = {
     ),
     0x760: EcuProfile(
         name="ABS", txid=0x760, bus="HS-CAN", aliases=("ABS",),
-        secrets=(SecretRule("", None, "42434D5932"),),
+        # FORScan 0x760/0x768 captures in ford/ABS/forscan_*.log: four
+        # independent level-1 seeds were unlocked with this existing secret.
+        # No F111 was read in those logs, so do not invent an F111 prefix.
+        # The level-agnostic FoCCCus rule remains as the legacy fallback;
+        # only level 1 is independently proven by these captures.
+        secrets=(
+            SecretRule("", 1, "42434D5932"),
+            SecretRule("", None, "42434D5932"),
+        ),
         sbls=(
             SblRule("BV61-14C227", "BV61-14C039-AA.vbf"),
             SblRule("F1FC-14F067", "E3B1-14C039-AA.vbf"),
         ),
+        # All four captures transferred the BV61 SBL to 0x004003AC and
+        # received 71 01 03 01 10 after starting it. Both full-application
+        # and SIGCFG recoveries ended with 71 01 03 04 10 02, followed by
+        # D100 changing from 02 to 01. These signatures are only evidenced
+        # for the captured CV61/BV61 bootloader, NOT the F1FC variant; do not
+        # impose profile-wide recovery/finalise response gates on both.
+        #
+        # FINALISE IS REQUIRED and is already on: 31 01 0304 -> 71 01 0304 10 02
+        # appears in forscan_flash2, forscan_recovery and forscan_recovery2
+        # (flash_mod's capture stops before it). It answers instantly, unlike
+        # the CCM's 0.47 s. A functional 11 81 reset follows, then D100 flips
+        # 02 -> 01 — that DID is a post-flash readback worth polling.
+        #
+        # This bootloader ALSO echoes a CRC-16 in 37 RequestTransferExit, and
+        # it is the VBF's own stored block CRC. Verified against the files:
+        #   77 2D63  BV61-14C039-AA   SBL  @0x004003AC len 0x4F4
+        #   77 2079  CV61-14C381-AH   blk0 @0x00020000 len 0x4000
+        #   77 919E  CV61-14C381-AE   blk0 @0x00020000 len 0x4000
+        #   77 F1D1 / 5008 / EEC2 / E490   CV61-14C036-AH blk0..blk4
+        # forscan_flash_mod echoed 3631 and EB59 for the 0xD8668 application
+        # and the 0xFFFFFF02 trailer: an AH-derived PATCHED build that is not
+        # any file currently on disk (AH-gate04 would give 47B9/292C). So the
+        # echo pins down exactly which image is on the module.
+        # transfer_exit_crc is deliberately NOT set here: that flag only makes
+        # a MISSING echo an error, and absence is unproven for the F1FC
+        # bootloader. The mismatch check runs unconditionally, so ABS already
+        # gets the verification without risking a refused F1FC flash.
+        # maxNumberOfBlockLength is 74 20 03FF -> 1021 payload bytes/transfer.
         finalize=True,
     ),
     0x7A5: EcuProfile(
