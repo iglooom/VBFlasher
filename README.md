@@ -16,6 +16,9 @@ IPMA) plus the OEM-derived secret/SBL tables from FoCCCus `ford_c346.cpp`.
 | `vbf.py` | VBF container parser + ISO-TP transport + bus-quiet / keepalive / download |
 | `ford_keybag.py` | 343 candidate secrets transcribed from FoCCCus `bruteSecretKey()` |
 | `ford_brutekey.py` | dictionary attack on an unknown SecurityAccess secret (`--self-test` for the offline proof) |
+| `sbl/` | Secondary Bootloader VBFs looked up by the registry (the only VBFs tracked in git) |
+| `test_*.py` | offline unit tests — all CAN transport is mocked (see [Tests](#tests)) |
+| `logs/` | per-run trace logs (git-ignored) |
 
 The seed→key algorithm is identical across every Ford ECU here; only the 5-byte
 **secret** and the **SBL** differ. This was proven: keys computed from the
@@ -89,6 +92,10 @@ vbflasher readdid PCM F111 F18C DE00      # several DIDs; binary-safe output
 vbflasher writedid BCM DE01 01A0FF        # write a DID (2E) from hex (asks y/N)
 vbflasher writedid PCM F1AB 0011 --session 0x03 --unlock  # some DIDs need session+auth
 
+# RoutineControl (31) — several ids run in order, --wait s apart, TesterPresent kept up
+vbflasher routine ABS 0E08 0E06 --session 0x03 --sec-level 3   # ABS CCC learn (asks y/N)
+vbflasher routine ABS 0E08 --sub 0x03 --session 0x03 --sec-level 3  # requestRoutineResults
+
 # DTCs — no VBF needed; select ECU by name or CAN id
 vbflasher dtc      BCM                     # actual faults only (default)
 vbflasher dtc      ALL                     # per-module actual-DTC count overview
@@ -119,6 +126,8 @@ vbflasher flash  APP.vbf CAL.vbf           # several files in one session
 vbflasher flash  APP.vbf --yes             # skip the prompt (scripting)
 vbflasher flash  APP.vbf --test-sbl        # load+run SBL only, no erase/write
 vbflasher flash  GWM --test-sbl --sbl /path/to/SBL.vbf  # same, no application VBF
+vbflasher flash  APIM --test-sbl --skip-security --sbl sbl/X.vbf  # no 27 seed/key at all
+vbflasher flash  APP.vbf --recovery --hw <F111>   # catch a PBL after power-up (see Flow)
 
 # raw memory / EEPROM read & write (loads the SBL first, then 35 / 34+FF00)
 # PSCM EEPROM lives at 0x02000000, 1024 bytes (see PSCM_ucds_eeprom_procedure.md)
@@ -140,10 +149,13 @@ Key flags: `--iface IFACE` (override the automatic bus interface),
 prompt), `--sbl PATH` (override the auto-selected SBL), `--sbl-dir DIR` (extra
 search dir, repeatable), `--secret 0x...` (override the seed-key secret),
 `--sec-level N` (diag security level;
-secrets can differ per level), `--hw STRING` (assume an F111 for dry-run
-planning), `--test-sbl`, `--quiet-bus`, `--decompress`, `--skip-blank`,
-`--blank-byte`, `--force`, `--rxid`,
-`--erase-timeout`, `--tp-interval`, `--tp-id`, `--logfile`.
+secrets can differ per level), `--skip-security` (programming session without
+`27` seed/key — only for modules that allow it; no secret needed), `--hw STRING`
+(assume an F111 for dry-run planning / recovery), `--test-sbl`, `--recovery`,
+`--flood-interval`, `--catch-probe`, `--quiet-bus`, `--decompress`,
+`--skip-blank`, `--blank-byte`, `--force`, `--rxid`, `--seed-delay`,
+`--erase-timeout`, `--wake-tries`, `--wake-timeout`, `--progress-interval`,
+`--tp-interval`, `--tp-id`, `--logfile`. `vbflasher <cmd> -h` is authoritative.
 
 Every live run writes its own trace log — `logs/<YYYYMMDD>-<HHMMSS>_<ECU>_<cmd>.log`
 (e.g. `logs/20260704-153012_BCM_flash.log`) — so logs never pile into one huge
@@ -234,23 +246,51 @@ the container's block length would change.
    with instructions. `--sbl`/`--secret` override.
 4. Print the **plan**: SBL, what is erased, what is written, current firmware
    IDs. Ask **"Are you sure? [y/N]"** (skip with `--yes`).
-5. On `y`: `10 02` → `27 01/02` (seed-key) → download+start SBL → per region
-   `31 01 FF00` erase → `34/36/37` download → profile-required `31 01 0304`
-   finalise → `11 01` reset. `--test-sbl` stops right after the SBL starts.
+5. On `y`: `10 02` → `27 01/02` (seed-key; omitted with `--skip-security`) →
+   download+start SBL → per region `31 01 FF00` erase → `34/36/37` download
+   (each `37` CRC-16 echo is checked against the file) → profile-required
+   `31 01 0304` finalise → `11 01` reset. `--test-sbl` stops right after the
+   SBL starts.
 
 For a DM5T IPC held in PBL after an incomplete programming sequence, wait for
 any other flash session to finish and use a known-good, original MCU VBF:
 
 ```bash
 vbflasher flash HM5T-14C026-BC.VBF --iface can1 \
-    --hw DM5T-14F094-AB --recovery --execute
+    --hw DM5T-14F094-AB --recovery
 ```
 
 `--recovery` waits for the PBL instead of probing live identity first; the
-selected F111 determines the SBL and level-1 secret. This still erases and
+selected F111 (`--hw`) determines the SBL and level-1 secret. Without `--hw`,
+give `--sbl` plus `--secret` (or `--skip-security`). `--recovery` forces
+`--quiet-bus` on. This still erases and
 rewrites MCU application flash and asks for confirmation. Check for finalise
 reply `71 01 03 04 10 02` before reset; otherwise stop rather than repeat
 flashes. OEM VBFs are supplied by the operator, not stored in this repository.
+
+### How the PBL is caught
+
+The catch is FORScan's, reproduced from the ABS captures
+(`ford/ABS/forscan_recovery2.log`): a **continuous functional programmingSession
+flood** — `7DF#02 10 82`, i.e. session 0x02 with the suppressPositiveResponse
+bit, every 12 ms — that never waits for a reply. Two reasons it works where a
+request/response loop fails:
+
+* it cannot miss the few-millisecond window after power-up, because nothing
+  blocks on a response (~83 requests/second instead of a handful);
+* it holds every other module in programmingSession, so **the bus goes quiet**.
+  A busy bus is the main reason the window is missed, which is why `--recovery`
+  now forces `--quiet-bus` instead of forbidding it.
+
+While the flood runs, the target is probed on its physical ISO-TP socket:
+`22 D100` (`62 D1 00 02` = bootloader, `01` = application — FORScan's own
+oracle) and a short `10 02`. Either a `D100 == 02` or any `50 02` ends the
+catch; a negative response or silence on D100 proves nothing and never stops
+it. After the catch the normal flow resumes: physical `10 02`, seed/key, SBL to
+RAM, erase, download, finalise, reset — with its usual checks.
+
+Tunables: `--flood-interval` (default 0.012 s, 0 disables the flood and probes
+only) and `--catch-probe` (pause between probe rounds, default 0.05 s).
 
 ## Raw memory / EEPROM read & write
 
@@ -283,7 +323,8 @@ vbflasher memwrite PSCM --addr 0x02000000 -i pscm_eeprom.bin
 
 Reconstructed from a UCDS capture (`../BCM/Research/ucds_read_ccc.log`). The
 whole session runs in the **default session after SecurityAccess level 1**
-(secret `64000B0C59`) — no SBL, no programming session. UCDS:
+(the registry's DV6T/F1FT/F1DT secret, `16C0BF803D`) — no SBL, no programming
+session. UCDS:
 
 1. reads `22 D12B` → `00 00 80 00`: the address of the upload/result buffer;
 2. `34/36/37`-downloads a ~13 KB helper applet to RAM `0x40002000` (len
@@ -337,7 +378,7 @@ opts out and opens no socket; `--yes` skips the prompt for scripting); DLC=8
 padding (Ford ignores short frames); `0x78`
 responsePending treated as CONTINUE with a clock that restarts on each pending;
 EXE parts gated on F188==VBF part (DATA/calibration reported only); `--quiet-bus`
-is opt-in and unconfirmed.
+is opt-in for normal flashes and forced on by `--recovery`.
 
 ## Finding an unknown secret
 
@@ -425,13 +466,40 @@ Append one `EcuProfile` to `ECUS` in `ecu_db.py` — nothing else changes:
 )
 ```
 
-Registered today: IPC 0x720, BCM 0x726, ACM 0x727, PSCM 0x730, DEATC/HVAC
-0x733, RCM 0x737, ABS 0x760, FCDIM 0x7A5, PCM 0x7E0, TCM 0x7E1, IPMA 0x706.
+Registered today (`vbflasher list`): IPMA 0x706, GWM 0x716, IPC 0x720,
+BCM 0x726, ACM 0x727, PSCM 0x730, DEATC/HVAC 0x733, HCM 0x734 (diagnostics
+only — no secret/SBL established), RCM 0x737, ABS 0x760, CCM 0x764,
+FCDIM 0x7A5, APIM 0x7D0, PCM 0x7E0, TCM 0x7E1.
+
+After adding a module, extend the MS-CAN set in `--selftest` if it lives on
+MS-CAN, add a `test_*.py` for anything capture-derived, and regenerate the
+shell completion.
+
+## Tests
+
+Everything runs offline — CAN sockets, sleeps and the ECU are mocked:
+
+```bash
+python3 vbflasher.py --selftest                  # registry, keygen, parser, primitives
+python3 -m unittest discover -p 'test_*.py'      # capture regressions + CLI flows
+```
+
+| file | covers |
+|---|---|
+| `test_flash_cli.py` | flash planning/dry-run, family gate, `--skip-security`, `--skip-blank`, flash-order guard |
+| `test_recovery.py` | `--recovery` PBL catch (`7DF 10 82` flood, `22 D100` / `10 02` probes) |
+| `test_progress.py` | progress bar, speed/ETA, total-time report |
+| `test_seed_delay.py` | settle before `requestSeed` |
+| `test_routine.py` | `routine` (31 RoutineControl) |
+| `test_abs_capture.py` / `test_ccm_capture.py` | secrets, SBL/finalise signatures, `37` CRC echoes from FORScan / UCDS captures |
+| `test_hcm_profile.py` | HCM registry entry + `readdid` |
+
+Tests that need OEM VBFs outside the repo (`../ABS/*.vbf`) skip when absent.
 
 ## Provenance
 
 Secrets/SBLs: FoCCCus `ford_c346.cpp` (`getSecret`, `getSblFilename`, keyed on
-F111). Hardware-relevant, matching the working per-ECU flashers verbatim: BCM
-`64000B0C59` (verified), PSCM `00009B2533` (published, unverified on the module
+F111). Hardware-relevant: BCM `16C0BF803D` (DV6T/F1FT/F1DT level 1; supersedes the
+older `64000B0C59`), PSCM `00009B2533` (published, unverified on the module
 — treat the first live `27 02` as the test), IPMA `00009875CA` (solved from two
 captured sessions).

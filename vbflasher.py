@@ -61,7 +61,7 @@ import ecu_db                                            # noqa: E402
 import ford_seckey                                       # noqa: E402
 from vbf import (Vbf, Ecu, BusQuiet, Keepalive, FlashProgress, download_blocks,  # noqa: E402
                  human, fmt, iface_is_up, dtc_code, dtc_status_str,
-                 dtc_is_actual, functional_broadcast,
+                 dtc_is_actual, functional_broadcast, PblFlood,
                  upload_block, download_raw_block, erase_region,
                  verify_routine)
 
@@ -74,6 +74,11 @@ TP_INTERVAL = 1.5
 # ~1.0 s here (CCM/GV6T/ucds_flash.log: 50 02 at t=9.111, 27 01 at t=10.129), so
 # match it rather than the 0.1 s we used to use. Cost is one second per flash.
 SEED_DELAY = 1.0
+
+# --recovery PBL catch (see recovery_catch_pbl / vbf.PblFlood). 12 ms is
+# FORScan's measured rate in the ABS recovery captures (171 frames in 2.058 s).
+FLOOD_INTERVAL = 0.012
+CATCH_PROBE = 0.05
 
 
 def settle_before_seed(delay=SEED_DELAY):
@@ -408,47 +413,143 @@ def _check_integrity(vbfs, force=False):
             f"recompute its CRCs); use --force to transmit it as-is.")
 
 
-def enter_programming_session(ecu, args):
-    """Catch a briefly available PBL with repeated physical 10 02 requests.
+BOOT_MODE_DID = "D100"      # Ford "which image is running" DID
+BOOT_MODE_APP = 0x01        # 62 D1 00 01 — application
+BOOT_MODE_PBL = 0x02        # 62 D1 00 02 — primary bootloader
 
-    Normal flashes retain their bounded wake retry. Recovery intentionally
-    waits until a positive answer (or Ctrl-C), with no other diagnostic probes
-    before the session request.
+
+def read_boot_mode(ecu, timeout=0.2):
+    """Physical 22 D100 probe: which image is running. Returns the mode byte,
+    or None when the module stays silent OR answers a negative response.
+
+    This is only ever a HINT. FORScan uses it as its PBL oracle (ABS capture:
+    62 D1 00 02 in the bootloader, 62 D1 00 01 once the application is back),
+    but plenty of modules do not support D100 at all, and a module that refuses
+    the DID can still be sitting in its bootloader. An NRC here must therefore
+    never end the catch.
     """
+    try:
+        r = ecu.req("22" + BOOT_MODE_DID, timeout=timeout,
+                    pending_timeout=timeout, busy_retries=0,
+                    what="22 D100 boot mode (hint)")
+    except TimeoutError:
+        return None
+    if (r is not None and len(r) >= 4 and r[0] == 0x62
+            and r[1] == 0xD1 and r[2] == 0x00):
+        return r[3]
+    return None
+
+
+def _try_session(ecu, what):
+    """One short, non-blocking-ish physical 10 02. None when unanswered."""
+    try:
+        return ecu.req("1002", timeout=0.2, pending_timeout=0.2,
+                       busy_retries=0, what=what)
+    except TimeoutError:
+        # ISO-TP can time out in send() while the ECU is unpowered;
+        # Ecu.req() only turns recv() timeouts into None.
+        return None
+
+
+def recovery_catch_pbl(ecu, args):
+    """Catch a briefly-available primary bootloader, FORScan's way.
+
+    Strategy taken from the ABS recovery captures (forscan_recovery2.log): run
+    a continuous FUNCTIONAL programmingSession flood — 7DF#02 10 82, positive
+    response suppressed, every ~12 ms — and probe the target on the side while
+    it runs. The flood is the whole point:
+
+      * it never blocks on a reply, so the few-millisecond window right after
+        power-up cannot be missed (a request/response loop manages a handful of
+        tries per second; this manages ~83);
+      * it holds every other module in programmingSession, so the bus goes
+        QUIET. A busy bus is the main reason the window is missed.
+
+    The ONLY job here is to catch the bootloader; the normal flash flow takes
+    over afterwards and does its own checking. Anything that proves the module
+    is listening ends the catch:
+      * 22 D100 == 02  -> bootloader running (FORScan's own oracle), or
+      * any 50 02 answer to 10 02.
+    A negative response or silence on D100 proves nothing and never aborts.
+
+    Runs until caught or Ctrl-C.
+    """
+    can_id = getattr(args, "tp_id", -1)
+    can_id = can_id if can_id >= 0 else FUNCTIONAL_ID
+    interval = max(0.0, getattr(args, "flood_interval", FLOOD_INTERVAL))
+    probe_pause = max(0.0, getattr(args, "catch_probe", CATCH_PROBE))
+
+    print(f"   flood: functional {can_id:03X}#02 10 82 every "
+          f"{interval * 1000:.0f} ms (programmingSession, response suppressed)")
+    print("          — catches the power-up window AND keeps the bus quiet")
+    print("   POWER-CYCLE THE ECU NOW  (Ctrl-C to stop)", flush=True)
+
+    flood = PblFlood(ecu.iface, can_id=can_id, interval=interval,
+                     execute=ecu.execute, log=ecu.logfile)
+    rounds = 0
+    try:
+        flood.start()
+        while True:
+            rounds += 1
+            mode = read_boot_mode(ecu)
+            if mode == BOOT_MODE_PBL:
+                print(f"   OK   22 D100 = 02 bootloader running "
+                      f"(round {rounds}, {flood.sent} flood frames)")
+                return "D100=02"
+            r = _try_session(ecu, f"10 02 programmingSession probe {rounds}")
+            if r is not None and len(r) >= 2 and r[:2] == b"\x50\x02":
+                print(f"   OK   10 02 programmingSession  {fmt(r)} "
+                      f"(round {rounds}, {flood.sent} flood frames)")
+                return "10 02"
+            if rounds == 1 or rounds % 20 == 0:
+                print(f"   waiting for PBL: round {rounds}, "
+                      f"{flood.sent} flood frames sent, D100="
+                      + ("--" if mode is None else f"{mode:02X}")
+                      + f", 10 02 -> {fmt(r)} (Ctrl-C to stop)", flush=True)
+            if probe_pause > 0:
+                time.sleep(probe_pause)
+    finally:
+        flood.stop()
+        print(f"   flood stopped after {flood.sent} frames")
+
+
+def enter_programming_session(ecu, args):
+    """Get the module into programmingSession.
+
+    Normal flashes use a bounded physical 10 02 wake retry. --recovery first
+    catches the PBL with the functional flood (recovery_catch_pbl), then opens
+    the physical session the rest of the flow needs.
+    """
+    if getattr(args, "recovery", False):
+        recovery_catch_pbl(ecu, args)
+        # The PBL is awake; establish/confirm the PHYSICAL session that
+        # requestSeed and the SBL download run in. FORScan sends this same
+        # 10 02 repeatedly right after the flood (24x in forscan_recovery.log).
+        r = None
+        for attempt in range(1, max(5, args.wake_tries) + 1):
+            r = _try_session(ecu, f"10 02 programmingSession (confirm "
+                                  f"{attempt})")
+            if r is not None and len(r) >= 2 and r[:2] == b"\x50\x02":
+                print(f"   OK   10 02 programmingSession        {fmt(r)} "
+                      f"(confirm {attempt})")
+                return
+            time.sleep(0.02)
+        raise SystemExit(
+            f"PBL caught but 10 02 then answered {fmt(r)}. The window closed "
+            "before the physical session opened — power-cycle and retry "
+            "(a quiet bus and --flood-interval 0.012 give the best odds).")
+
     r = None
     attempts = 0
-    while args.recovery or attempts < args.wake_tries:
+    while attempts < args.wake_tries:
         attempts += 1
-        try:
-            r = ecu.req("1002", timeout=0.2 if args.recovery else 1.0,
-                        pending_timeout=0.2 if args.recovery else 30.0,
-                        busy_retries=0 if args.recovery else 5,
-                        what=f"10 02 programmingSession {attempts}")
-        except TimeoutError:
-            if not args.recovery:
-                raise
-            # ISO-TP can time out in send() while the ECU is unpowered;
-            # Ecu.req() only turns recv() timeouts into None.
-            r = None
+        r = ecu.req("1002", timeout=1.0, pending_timeout=30.0, busy_retries=5,
+                    what=f"10 02 programmingSession {attempts}")
         if r is not None and len(r) >= 2 and r[:2] == b"\x50\x02":
-            profile = ecu_db.get_profile(ecu.txid) if args.recovery else None
-            want = profile.recovery_session_response if profile else None
-            if want is not None and r != want:
-                if attempts == 1 or attempts % 25 == 0:
-                    print(f"   50 02 from non-PBL responder ({fmt(r)}); "
-                          "waiting for power-cycle", flush=True)
-                time.sleep(0.02)
-                continue
             print(f"   OK   10 02 programmingSession        {fmt(r)} "
                   f"(attempt {attempts})")
             return
-        if args.recovery:
-            if attempts == 1 or attempts % 25 == 0:
-                print(f"   waiting for PBL: {attempts} attempts, "
-                      f"last response {fmt(r)} (Ctrl-C to stop)", flush=True)
-            time.sleep(0.02)
-        else:
-            time.sleep(0.1)
+        time.sleep(0.1)
     raise SystemExit(f"10 02 programmingSession: {fmt(r)} "
                      f"(no session after {attempts} tries)")
 
@@ -528,7 +629,8 @@ def flash_session(txid, files, args):
         print("\n== current firmware / identity ==")
         if args.recovery:
             print("   [recovery dry run] live F111 reads are skipped; supply "
-                  "--hw or explicit --sbl and --secret for a live run.")
+                  "--hw or explicit --sbl and --secret (or --skip-security) "
+                  "for a live run.")
         else:
             print("   [dry run] F111 would be read here to choose SBL + secret.")
         if hw:
@@ -550,7 +652,10 @@ def flash_session(txid, files, args):
         raise SystemExit(2)
 
     level = args.sec_level
-    if args.secret is not None:
+    if args.skip_security:
+        secret = None
+        secret_reason = "SecurityAccess skipped"
+    elif args.secret is not None:
         secret = args.secret.to_bytes(5, "big") if isinstance(args.secret, int) \
             else args.secret
         secret_reason = "explicit --secret"
@@ -570,13 +675,19 @@ def flash_session(txid, files, args):
     print(f"   SBL          {sbl_name}  ({sbl_reason})")
     print(f"                call=0x{sbl.call:08X}, {len(sbl.blocks)} block(s), "
           f"{human(sbl.total_payload())} to RAM")
-    if secret is not None:
+    if args.skip_security:
+        print("   security     SKIPPED (--skip-security): programming session "
+              "only; no 27 seed/key exchange")
+    elif secret is not None:
         print(f"   secret       {secret.hex().upper()}  ({secret_reason})")
     else:
         print(f"   secret       (dry run — {secret_reason})")
     if args.recovery:
-        print("   MODE         --recovery: skip identity/wake probes; repeatedly "
-              "send 10 02 until the ECU answers (Ctrl-C to stop).")
+        print("   MODE         --recovery: skip identity/wake probes; flood "
+              f"functional 10 82 every {args.flood_interval * 1000:.0f} ms "
+              "until the PBL is caught (Ctrl-C to stop).")
+        print("                probes 22 D100 (==02 bootloader) and 10 02 "
+              "between flood frames; an NRC on D100 does not stop the catch.")
         print("   WARNING      live software identity cannot be checked; "
               "verify the target and VBF yourself before confirming.")
     if args.test_sbl:
@@ -750,6 +861,7 @@ def flash_session(txid, files, args):
 
         print("\n== session + security ==")
         enter_programming_session(ecu, args)
+        # Keep the bootloader settle even when SecurityAccess is skipped.
         # Settle before requestSeed on EVERY module (see SEED_DELAY). The one
         # exception is --recovery: the skill's recovery procedure continues
         # immediately once the PBL answers, so it keeps the short wait.
@@ -757,18 +869,21 @@ def flash_session(txid, files, args):
             settle_before_seed(args.seed_delay)
         else:
             time.sleep(0.1)
-        r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
-                       timeout=5.0)
-        seed = list(r[2:5])
-        if seed == [0, 0, 0]:
-            print("   seed 000000 -> already unlocked")
+        if args.skip_security:
+            print("   SecurityAccess SKIPPED (--skip-security)")
         else:
-            key = ford_seckey.key_from_seed(seed, secret)
-            print(f"   seed {bytes(seed).hex().upper()} -> "
-                  f"key {key.hex().upper()}")
-            ecu.expect(f"27{level + 1:02X}" + key.hex(), 0x67,
-                       f"27 {level + 1:02X} sendKey", timeout=5.0)
-        print("   unlocked")
+            r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
+                           timeout=5.0)
+            seed = list(r[2:5])
+            if seed == [0, 0, 0]:
+                print("   seed 000000 -> already unlocked")
+            else:
+                key = ford_seckey.key_from_seed(seed, secret)
+                print(f"   seed {bytes(seed).hex().upper()} -> "
+                      f"key {key.hex().upper()}")
+                ecu.expect(f"27{level + 1:02X}" + key.hex(), 0x67,
+                           f"27 {level + 1:02X} sendKey", timeout=5.0)
+            print("   unlocked")
 
         ka.start()
 
@@ -1087,12 +1202,21 @@ def do_flash(args):
     if args.recovery:
         if len(groups) != 1:
             raise SystemExit("--recovery requires exactly one target ECU")
-        if args.quiet_bus:
-            raise SystemExit("--recovery cannot use --quiet-bus: it sends "
-                             "functional traffic before the PBL is caught")
-        if args.execute and not (args.hw or (args.sbl and args.secret is not None)):
+        if args.execute and not (args.hw or (args.sbl and
+                                  (args.skip_security or args.secret is not None))):
             raise SystemExit("--recovery skips live F111 reads: pass --hw "
-                             "<known F111>, or both --sbl PATH and --secret VALUE")
+                             "<known F111>, or --sbl PATH with --secret VALUE "
+                             "or --skip-security")
+        # A QUIET bus is what makes the power-up window catchable: the PBL
+        # answers for a few milliseconds and loses the race against normal
+        # vehicle traffic. The catch flood (7DF 10 82) silences the other
+        # modules on its own, so quiet-bus is forced ON here rather than
+        # forbidden — it keeps them in programmingSession between flood bursts
+        # and releases them with the functional 11 81 FORScan also sends.
+        if not args.quiet_bus:
+            args.quiet_bus = True
+            print("NOTE: --recovery forces --quiet-bus; a busy bus loses the "
+                  "PBL window.")
     elif len(groups) > 1:
         print(f"NOTE: {len(files)} files target {len(groups)} different ECUs: "
               + ", ".join(f"0x{e:03X}" for e in groups))
@@ -1348,6 +1472,78 @@ def do_writedid(args):
             print("   verified: read-back matches written data.")
         else:
             print("   !! read-back does NOT match written data.")
+
+
+def do_routine(args):
+    """RoutineControl (31) — start/stop/requestResults an ECU routine.
+
+    Generic because the routine id space is per-module. Several ids may be
+    given and are run in order with --wait seconds between them, which is
+    exactly the shape of the captured Ford procedures (e.g. the ABS CCC learn
+    is `31 01 0E08`, wait ~15 s, `31 01 0E06`). A TesterPresent keepalive runs
+    for the whole run so a non-default session does not time out in the gap.
+
+    A positive 71 means the routine was ACCEPTED, not that it succeeded — the
+    status byte(s) after the echoed id are the module's verdict (the ABS learn
+    answers `71 01 0E08 10`).
+    """
+    rids = []
+    for rid in args.routine:
+        r = rid.upper().replace("0X", "").replace(" ", "")
+        if len(r) != 4 or any(c not in "0123456789ABCDEF" for c in r):
+            raise SystemExit(f"{rid}: not a 2-byte routine id (4 hex digits)")
+        rids.append(r)
+    payload = args.data.replace("0x", "").replace("0X", "").replace(" ", "")
+    if len(payload) % 2 or any(c not in "0123456789abcdefABCDEF" for c in payload):
+        raise SystemExit(f"--data {args.data!r}: not valid hex bytes")
+
+    profile, ecu = _connect_by_selector(args)
+    print(f"== {profile.name}  tx=0x{profile.txid:03X} rx=0x{ecu.rxid:03X} ==")
+    for r in rids:
+        print(f"   ROUTINE 31 {args.sub:02X} {r}"
+              + (f" {payload.upper()}" if payload else ""))
+    if not args.yes:
+        ans = input(f"Run {len(rids)} routine(s) on {profile.name}? "
+                    "[y/N] ").strip().lower()
+        if ans != "y":
+            print("aborted by user.")
+            return
+
+    ecu.wake(tries=getattr(args, "wake_tries", 8),
+             timeout=getattr(args, "wake_timeout", 0.5))
+    _session_and_unlock(args, profile, ecu)
+
+    ka_can_id = None if args.tp_id < 0 else args.tp_id
+    ka = Keepalive(ecu, period=args.tp_interval, can_id=ka_can_id).start()
+    rc = 0
+    try:
+        for i, r in enumerate(rids):
+            if i:
+                print(f"   ... waiting {args.wait:g} s")
+                time.sleep(args.wait)
+            resp = ecu.req("31%02X%s%s" % (args.sub, r, payload),
+                           timeout=args.timeout,
+                           pending_timeout=args.pending_timeout,
+                           what="31 %02X %s routineControl" % (args.sub, r))
+            if resp is None:
+                print(f"   FAIL {r}: <no response / timeout>")
+                rc = 1
+                continue
+            if resp[0] == 0x7F:
+                print(f"   FAIL {r}: {fmt(resp)}")
+                rc = 1
+                continue
+            if resp[0] != 0x71:
+                print(f"   FAIL {r}: unexpected {resp.hex().upper()}")
+                rc = 1
+                continue
+            status = resp[4:]
+            print(f"   OK   71 {resp[1]:02X} {resp[2]:02X}{resp[3]:02X}"
+                  + (f"  status={status.hex().upper()}" if status else "")
+                  + "   (accepted; status is the module's verdict)")
+    finally:
+        ka.stop()
+    return rc
 
 
 def _ident_all(args):
@@ -1917,8 +2113,8 @@ def selftest():
     chk("PSCM 0x730 present", ecu_db.get_profile(0x730) is not None)
     chk("IPMA 0x706 present", ecu_db.get_profile(0x706) is not None)
     bcm = ecu_db.get_profile(0x726)
-    chk("BCM DV6T level1 secret == 64000B0C59",
-        bcm.pick_secret("DV6T-14C245-FF", 1) == bytes.fromhex("64000B0C59"),
+    chk("BCM DV6T level1 secret == 16C0BF803D",
+        bcm.pick_secret("DV6T-14C245-FF", 1) == bytes.fromhex("16C0BF803D"),
         (bcm.pick_secret("DV6T-14C245-FF", 1) or b"").hex())
     chk("BCM DV6T level3 secret == CD0D52F64D",
         bcm.pick_secret("DV6T-14C245-FF", 3) == bytes.fromhex("CD0D52F64D"))
@@ -2087,7 +2283,7 @@ def selftest():
         getattr(ecu_db.get_profile(0x7E0), "bus", None) == "HS-CAN"
         and getattr(ecu_db.get_profile(0x7E0), "default_iface", lambda: None)()
         == "can0")
-    _expected_ms = {0x720, 0x727, 0x733, 0x7A5}
+    _expected_ms = {0x720, 0x727, 0x733, 0x7A5, 0x7D0}
     _actual_ms = {txid for txid, p in ecu_db.ECUS.items() if p.bus == "MS-CAN"}
     chk("all registered MS-CAN modules default to can1",
         _actual_ms == _expected_ms
@@ -3141,6 +3337,47 @@ def build_parser():
     s.add_argument("--timeout", type=float, default=5.0,
                    help="per-DID response timeout in seconds (default 5)")
 
+    s = add_ecu_diag_parser(
+        "routine", "run a RoutineControl (31) routine, e.g. the ABS CCC learn")
+    s.add_argument("routine", nargs="+", metavar="RID",
+                   help="2-byte routine id(s) in hex, run in order with "
+                        "--wait between them (ABS CCC learn: 0E08 0E06)")
+    s.add_argument("--sub", type=lambda x: int(x, 0), default=0x01,
+                   help="routineControl subfunction: 01 start (default), "
+                        "02 stop, 03 requestRoutineResults")
+    s.add_argument("--data", default="",
+                   help="extra request bytes after the routine id, as hex")
+    s.add_argument("--wait", type=float, default=15.0,
+                   help="seconds between consecutive routines (default 15, "
+                        "the captured ABS learn gap)")
+    s.add_argument("--session", type=lambda x: int(x, 0), default=None,
+                   help="enter diagnosticSession first (ABS learn: 0x03)")
+    s.add_argument("--unlock", action="store_true",
+                   help="SecurityAccess unlock before the routine")
+    s.add_argument("--secret", type=lambda x: int(x, 0), default=None,
+                   help="override the seed-key secret (implies --unlock)")
+    s.add_argument("--sec-level", type=lambda x: int(x, 0), default=None,
+                   help="SecurityAccess request level (implies --unlock; "
+                        "ABS learn: 3)")
+    s.add_argument("--hw", default=None,
+                   help="assume this F111 for secret selection under --unlock")
+    s.add_argument("--seed-delay", type=float, default=SEED_DELAY,
+                   help="seconds between a --session change and 27 xx "
+                        f"requestSeed (default {SEED_DELAY}; 0 disables)")
+    s.add_argument("--timeout", type=float, default=5.0,
+                   help="first-response timeout in seconds (default 5)")
+    s.add_argument("--pending-timeout", type=float, default=60.0,
+                   help="silence that ends a 7F xx 78 responsePending wait; "
+                        "the clock restarts on every pending (default 60)")
+    s.add_argument("--tp-interval", type=float, default=TP_INTERVAL,
+                   help=f"TesterPresent period (default {TP_INTERVAL}; 0 off)")
+    s.add_argument("--tp-id", type=lambda x: int(x, 0), default=-1,
+                   help="broadcast CAN ID for TesterPresent (default: "
+                        "physical via ISO-TP; pass 0x7DF for broadcast, "
+                        "which is what the UCDS capture does)")
+    s.add_argument("-y", "--yes", action="store_true",
+                   help="skip the confirmation prompt")
+
     s = add_ecu_diag_parser("writedid",
                             "write a DID (2E) with hex data")
     s.add_argument("did", metavar="DID", help="2-byte DID in hex, e.g. F190")
@@ -3280,18 +3517,30 @@ def build_parser():
                    help="extra directory to search for the selected SBL "
                         "(repeatable)")
     s.add_argument("--secret", type=lambda x: int(x, 0), default=None,
-                   help="override the 40-bit seed-key secret, e.g. 0x64000B0C59")
+                   help="override the 40-bit seed-key secret, e.g. 0x16C0BF803D")
     s.add_argument("--sec-level", type=lambda x: int(x, 0), default=1,
                    help="SecurityAccess request level (odd; default 1)")
+    s.add_argument("--skip-security", action="store_true",
+                   help="enter programming session but skip SecurityAccess "
+                        "(27 seed/key); no secret required. Only for modules "
+                        "that permit programming without unlocking.")
     s.add_argument("--hw", default=None,
                    help="assume this F111 string (skip the live read / for "
                         "dry-run planning)")
     s.add_argument("--test-sbl", action="store_true",
                    help="load and start the SBL only; NO erase, NO write")
     s.add_argument("--recovery", action="store_true",
-                   help="skip live identity/wake reads and repeatedly send "
-                        "10 02 to catch the PBL after power-up; requires "
-                        "--hw or both --sbl and --secret (Ctrl-C to stop)")
+                   help="skip live identity/wake reads and catch the PBL with "
+                        "a functional 10 82 flood after power-up; forces "
+                        "--quiet-bus; requires --hw or both --sbl and "
+                        "--secret (or --skip-security) (Ctrl-C to stop)")
+    s.add_argument("--flood-interval", type=float, default=FLOOD_INTERVAL,
+                   help=f"--recovery: seconds between functional 10 82 flood "
+                        f"frames (default {FLOOD_INTERVAL}, FORScan's rate; "
+                        f"0 disables the flood)")
+    s.add_argument("--catch-probe", type=float, default=CATCH_PROBE,
+                   help=f"--recovery: extra pause between 22 D100 / 10 02 "
+                        f"probe rounds while flooding (default {CATCH_PROBE})")
     s.add_argument("--dry-run", "-n", action="store_true",
                    help="print the plan only; connect to nothing, send nothing")
     s.add_argument("--yes", "-y", action="store_true",
@@ -3366,6 +3615,7 @@ def main():
         args.execute = not args.dry_run
     return {"info": do_info, "verify": do_verify, "ident": do_ident,
             "readdid": do_readdid, "writedid": do_writedid,
+            "routine": do_routine,
             "dtc": do_dtc, "cleardtc": do_cleardtc, "reset": do_reset,
             "silence": do_silence,
             "memread": do_memread, "memwrite": do_memwrite,

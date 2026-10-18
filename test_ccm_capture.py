@@ -43,9 +43,6 @@ class CcmCaptureTests(unittest.TestCase):
 
     def test_pbl_signatures_from_the_capture(self):
         p = self.profile()
-        # 10 02 -> 50 02 00 19 01 F4
-        self.assertEqual(p.recovery_session_response,
-                         bytes.fromhex("5002001901F4"))
         # 31 01 0301 03FF9000 -> 71 01 0301 10, full 4-byte call address
         self.assertEqual(p.sbl_start_response, bytes.fromhex("7101030110"))
         self.assertFalse(p.sbl_call_halfword)

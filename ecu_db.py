@@ -12,7 +12,9 @@ Provenance of the data in this file
   design here does.
 * Three secrets are additionally HARDWARE-relevant to this workspace and match
   the working per-ECU flashers verbatim:
-      BCM  0x726  level1  64000B0C59   (verified on the bench BCM)
+      BCM  0x726  level1  16C0BF803D   (DV6T/F1FT/F1DT; replaces the older
+                                        64000B0C59 the per-ECU BCM flasher
+                                        used)
       PSCM 0x730  level1  00009B2533   (published; UNVERIFIED on the module)
       IPMA 0x706  level1  00009875CA   (solved from two captured flash sessions;
                                         works on both CV4T and F1FT modules)
@@ -103,9 +105,6 @@ class EcuProfile:
     # Some PBLs return a status after the positive routine response. Merely
     # seeing SID 71 is not proof that the application was accepted for boot.
     finalize_response: Optional[bytes] = None
-    # Exact programming-session reply from the PBL, when known. In recovery,
-    # a custom application may also answer 50 02 but cannot flash memory.
-    recovery_session_response: Optional[bytes] = None
     # Optional start-SBL routine response from the proven PBL. A custom
     # application may return a shorter 71 01 03 01 without starting the SBL.
     sbl_start_response: Optional[bytes] = None
@@ -195,11 +194,11 @@ ECUS = {
         secrets=(
             SecretRule("BV6N", None, "F311454C73"),
             SecretRule("AV6N", None, "F311454C73"),
-            SecretRule("DV6T", 1, "64000B0C59"),
+            SecretRule("DV6T", 1, "16C0BF803D"),
             SecretRule("DV6T", 3, "CD0D52F64D"),
-            SecretRule("F1FT", 1, "64000B0C59"),
+            SecretRule("F1FT", 1, "16C0BF803D"),
             SecretRule("F1FT", 3, "CD0D52F64D"),
-            SecretRule("F1DT", 1, "64000B0C59"),
+            SecretRule("F1DT", 1, "16C0BF803D"),
             SecretRule("F1DT", 3, "CD0D52F64D"),
         ),
         sbls=(
@@ -269,7 +268,8 @@ ECUS = {
             SecretRule("", None, "AACCCC3355"),
         ),
         sbl_call_halfword=False,
-        recovery_session_response=bytes.fromhex("5002001901F4"),
+        # PBL answers 10 02 with 50 02 00 19 01 F4 (informational: the
+        # --recovery catch accepts any 50 02 and lets later steps verify).
         sbl_start_response=bytes.fromhex("7101030110"),
         finalize=True,
         finalize_response=bytes.fromhex("710103041002"),
@@ -292,6 +292,15 @@ ECUS = {
         sbl_call_halfword=False,
         finalize=True,
     ),
+    0x734: EcuProfile(
+        name="HCM (headlamp control module)", txid=0x734, bus="HS-CAN",
+        rxid=0x73C, aliases=("HCM",),
+        # Address pair captured in ../CANBus/read_pid (3B03/3B05 reads on
+        # can0); physical HS-CAN placement corroborated by CAN-HS.dbc.
+        # Diagnostic registration only: no HCM-specific programming capture,
+        # hardware-qualified secret or SBL has been established here.
+        # Leave those unset rather than guessing a flash/recovery recipe.
+    ),
     0x737: EcuProfile(
         name="RCM (restraints)", txid=0x737, bus="HS-CAN", aliases=("RCM",),
         secrets=(
@@ -302,18 +311,14 @@ ECUS = {
     ),
     0x760: EcuProfile(
         name="ABS", txid=0x760, bus="HS-CAN", aliases=("ABS",),
-        # FORScan 0x760/0x768 captures in ford/ABS/forscan_*.log: four
-        # independent level-1 seeds were unlocked with this existing secret.
-        # No F111 was read in those logs, so do not invent an F111 prefix.
-        # The level-agnostic FoCCCus rule remains as the legacy fallback;
-        # only level 1 is independently proven by these captures.
         secrets=(
             SecretRule("", 1, "42434D5932"),
-            SecretRule("", None, "42434D5932"),
+            SecretRule("", 3, "B83F247FFF"),
         ),
         sbls=(
             SblRule("BV61-14C227", "BV61-14C039-AA.vbf"),
             SblRule("F1FC-14F067", "E3B1-14C039-AA.vbf"),
+            SblRule("CV61-14C227", "BV61-14C039-AA.vbf"),
         ),
         # All four captures transferred the BV61 SBL to 0x004003AC and
         # received 71 01 03 01 10 after starting it. Both full-application
@@ -364,12 +369,13 @@ ECUS = {
     ),
     0x7D0: EcuProfile(
         name="APIM", txid=0x7D0, bus="MS-CAN",
-        aliases=("APIM"),
+        aliases=("APIM",),
         secrets=(
             SecretRule("", 3, "9A78563412"),
-            SecretRule("", 1, "50C86A49F1"),
+            SecretRule("", 1, "08306155AA"),
         ),
         sbls=(
+            SblRule("HL1T-14G380", "GB5T-14G376-AA.VBF"),
         ),
     ),
     0x7E0: EcuProfile(
@@ -412,8 +418,9 @@ ECUS = {
                            "SIGCFG": "F108", "SBL": "F188"},
         finalize=True,
         # Captured PBL replies 50 02 00 19 01 F4; the custom application
-        # replies 50 02 00 32 01 F4 and does not successfully flash.
-        recovery_session_response=bytes.fromhex("5002001901F4"),
+        # replies 50 02 00 32 01 F4 and does not successfully flash. The
+        # --recovery catch accepts either; sbl_start_response below is the
+        # gate that rejects the custom application.
         # The PBL reports status 0x10 after launching the SBL. The custom
         # application responds 71 01 03 01 but never reaches the SBL erase.
         sbl_start_response=bytes.fromhex("7101030110"),

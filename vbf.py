@@ -400,7 +400,8 @@ class Vbf:
     def __init__(self, path):
         self.path = path
         self._unpacked = {}          # (start,len,crc) -> LZSS-decoded bytes
-        raw = open(path, "rb").read()
+        with open(path, "rb") as fh:
+            raw = fh.read()
         self.raw = raw
         depth, he = 0, None
         for i, c in enumerate(raw):
@@ -1143,6 +1144,84 @@ class Keepalive:
         if self._raw:
             self._raw.close()
             self._raw = None
+
+
+class PblFlood:
+    """Background flood of functional programmingSession frames (7DF#02 10 82).
+
+    This is how FORScan catches a primary bootloader (ABS captures
+    forscan_recovery.log / forscan_recovery2.log): the request carries the
+    suppressPositiveResponse bit (0x80 | session 0x02 = 0x82), is addressed
+    FUNCTIONALLY on 0x7DF, and is repeated every ~12 ms with NO wait for a
+    reply. Two things fall out of that:
+
+      * the power-up window cannot be missed — the tester never blocks on a
+        response, so it is hammering at ~83 requests/second instead of the few
+        per second a request/response loop manages;
+      * every OTHER module on the bus is held in programmingSession and goes
+        quiet, which is what makes the window catchable at all. A busy bus is
+        the main reason a recovery attempt fails.
+
+    Runs on its own raw socket and thread, so a physical ISO-TP probe can be
+    issued on the target's socket while the flood continues (FORScan's capture
+    shows exactly that interleaving). Fire-and-forget: nothing is collected.
+    """
+
+    def __init__(self, iface, can_id=0x7DF, interval=0.012, execute=True,
+                 log=None, payload=(0x10, 0x82)):
+        self.iface, self.can_id = iface, can_id
+        self.interval = interval
+        self.execute = execute
+        self.log = log
+        self.payload = bytes(payload)
+        self.sent = 0
+        self._stop = threading.Event()
+        self._t = None
+        self._sock = None
+
+    def start(self):
+        if not self.execute or self.interval <= 0:
+            return self
+        self._sock = _raw_can(self.iface)
+        sock = self._sock
+        frame = _frame(self.can_id, _single(self.payload))
+
+        def run():
+            while not self._stop.is_set():
+                try:
+                    sock.send(frame)
+                except OSError:
+                    return
+                self.sent += 1
+                if self._stop.wait(self.interval):
+                    return
+
+        self._t = threading.Thread(target=run, daemon=True)
+        self._t.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        if self._t:
+            self._t.join(timeout=max(self.interval, 0.05) + 1.0)
+            self._t = None
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+        # ONE summary line, never one line per frame: a 12 ms flood would
+        # otherwise add thousands of useless lines to the run log.
+        if self.log and self.sent:
+            self.log.write(f"{time.strftime('%H:%M:%S')} ~> {self.can_id:03X}#"
+                           f"{self.payload.hex().upper()} x{self.sent} "
+                           f"(PBL flood, {self.interval * 1000:.0f} ms)\n")
+            self.log.flush()
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
 
 
 # --------------------------------------------------------------------------

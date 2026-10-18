@@ -11,6 +11,53 @@ from vbf import Vbf, lzss_encode
 
 
 class FlashCliTests(unittest.TestCase):
+    def test_security_is_enabled_by_default(self):
+        args = vbflasher.build_parser().parse_args(["flash", "APP.vbf"])
+        self.assertFalse(args.skip_security)
+
+    def test_recovery_skip_security_needs_sbl_but_not_secret(self):
+        args = vbflasher.build_parser().parse_args(
+            ["flash", "APIM", "--test-sbl", "--recovery", "--skip-security",
+             "--sbl", "sbl/CM5T-14F532-AA.vbf"])
+        args.execute = True
+        with (patch.object(vbflasher, "flash_session") as session,
+              contextlib.redirect_stdout(io.StringIO())):
+            vbflasher.do_flash(args)
+        session.assert_called_once_with(0x7D0, [], args)
+        args.sbl = None
+        with patch.object(vbflasher, "flash_session") as session:
+            with self.assertRaisesRegex(SystemExit, "--hw"):
+                vbflasher.do_flash(args)
+        session.assert_not_called()
+
+    def test_skip_security_enters_programming_and_loads_sbl_without_secret(self):
+        args = vbflasher.build_parser().parse_args(
+            ["flash", "APIM", "--test-sbl", "--skip-security", "--yes",
+             "--sbl", "sbl/CM5T-14F532-AA.vbf", "--logfile", "",
+             "--tp-interval", "0"])
+        args.execute = True
+        ecu = Mock()
+        out = io.StringIO()
+        with (patch.object(vbflasher, "iface_is_up", return_value=True),
+              patch.object(vbflasher, "Ecu", return_value=ecu),
+              patch.object(vbflasher, "read_identity", return_value={}),
+              patch.object(ecu_db.EcuProfile, "pick_secret",
+                           side_effect=AssertionError("must not resolve a secret")),
+              patch.object(vbflasher, "enter_programming_session") as session,
+              patch.object(vbflasher, "BusQuiet"),
+              patch.object(vbflasher, "Keepalive"),
+              patch.object(vbflasher, "time"),
+              patch.object(vbflasher, "download_blocks") as download,
+              contextlib.redirect_stdout(out)):
+            vbflasher.do_flash(args)
+        session.assert_called_once_with(ecu, args)
+        download.assert_called_once()
+        requests = [c.args[0] for c in ecu.expect.call_args_list]
+        self.assertTrue(any(r.startswith("31010301") for r in requests))
+        self.assertFalse(any(r.startswith("27") for r in requests))
+        self.assertIn("SKIPPED (--skip-security)", out.getvalue())
+        self.assertNotIn("   unlocked", out.getvalue())
+
     def test_ipma_reads_software_dids_for_family_gate(self):
         profile = ecu_db.get_profile(0x706)
         values = {"F188": "F1FT-14F397-AA", "F120": "F1FT-14F397-AB",

@@ -24,16 +24,17 @@ class AbsCaptureTests(unittest.TestCase):
                 self.assertEqual(key_from_seed(bytes.fromhex(seed), secret),
                                  bytes.fromhex(key))
 
-    def test_uncaptured_levels_keep_the_existing_fallback(self):
+    def test_level_three_secret_and_profile_gates(self):
         profile = ecu_db.get_profile(0x760)
         assert profile is not None
         self.assertEqual(profile.pick_secret("", 3),
-                         bytes.fromhex("42434D5932"))
+                         bytes.fromhex("B83F247FFF"))
+        self.assertEqual(profile.pick_sbl("CV61-14C227-AA"),
+                         "BV61-14C039-AA.vbf")
         self.assertEqual(profile.pick_sbl("BV61-14C227-AA"),
                          "BV61-14C039-AA.vbf")
         self.assertTrue(profile.finalize)
         # The CV61/BV61 PBL replies are not yet proven for F1FC hardware.
-        self.assertIsNone(profile.recovery_session_response)
         self.assertIsNone(profile.sbl_start_response)
         self.assertIsNone(profile.finalize_response)
         # Same reason: do not demand the 37 CRC echo be PRESENT profile-wide.
