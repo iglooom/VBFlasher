@@ -17,7 +17,7 @@ IPMA) plus the OEM-derived secret/SBL tables from FoCCCus `ford_c346.cpp`.
 | `ford_keybag.py` | 343 candidate secrets transcribed from FoCCCus `bruteSecretKey()` |
 | `ford_brutekey.py` | dictionary attack on an unknown SecurityAccess secret (`--self-test` for the offline proof) |
 | `sbl/` | Secondary Bootloader VBFs looked up by the registry (the only VBFs tracked in git) |
-| `test_*.py` | offline unit tests — all CAN transport is mocked (see [Tests](#tests)) |
+| `.tests/` | offline unit tests, all CAN transport mocked (git-ignored, local only; see [Tests](#tests)) |
 | `logs/` | per-run trace logs (git-ignored) |
 
 The seed→key algorithm is identical across every Ford ECU here; only the 5-byte
@@ -472,16 +472,18 @@ only — no secret/SBL established), RCM 0x737, ABS 0x760, CCM 0x764,
 FCDIM 0x7A5, APIM 0x7D0, PCM 0x7E0, TCM 0x7E1.
 
 After adding a module, extend the MS-CAN set in `--selftest` if it lives on
-MS-CAN, add a `test_*.py` for anything capture-derived, and regenerate the
+MS-CAN, add a `.tests/test_*.py` for anything capture-derived, and regenerate the
 shell completion.
 
 ## Tests
 
-Everything runs offline — CAN sockets, sleeps and the ECU are mocked:
+Everything runs offline — CAN sockets, sleeps and the ECU are mocked. The unit
+tests live in `.tests/`, which is git-ignored (local working copy only); each
+file puts the repo root on `sys.path`, so discovery works from any directory:
 
 ```bash
 python3 vbflasher.py --selftest                  # registry, keygen, parser, primitives
-python3 -m unittest discover -p 'test_*.py'      # capture regressions + CLI flows
+python3 -m unittest discover -s .tests           # capture regressions + CLI flows
 ```
 
 | file | covers |

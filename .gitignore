@@ -14,3 +14,6 @@ logs/
 # ...except the Secondary Bootloaders kept in sbl/ (needed by the flasher)
 !sbl/*.vbf
 !sbl/*.VBF
+
+# Local offline test suite (kept out of git)
+.tests/
