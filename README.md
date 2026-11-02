@@ -89,12 +89,14 @@ vbflasher ident  BCM                      # read a live module's IDs (name or id
 vbflasher ident  ALL                      # iterate every module, print each ident
 vbflasher readdid BCM F190                # read one DID (hex + sanitized ascii)
 vbflasher readdid PCM F111 F18C DE00      # several DIDs; binary-safe output
+vbflasher readdid IPMA 41BB --poll 1 --changes      # watch a DID: one timestamped line per change
+vbflasher readdid IPMA 41BB --poll 1 --until 0205   # ...and stop when it reads 02 05
 vbflasher writedid BCM DE01 01A0FF        # write a DID (2E) from hex (asks y/N)
 vbflasher writedid PCM F1AB 0011 --session 0x03 --unlock  # some DIDs need session+auth
 
 # RoutineControl (31) — several ids run in order, --wait s apart, TesterPresent kept up
+# (ready-made module procedures: see "Service procedures" below)
 vbflasher routine ABS 0E08 0E06 --session 0x03 --sec-level 3   # ABS CCC learn (asks y/N)
-vbflasher routine ABS 0E08 --sub 0x03 --session 0x03 --sec-level 3  # requestRoutineResults
 
 # DTCs — no VBF needed; select ECU by name or CAN id
 vbflasher dtc      BCM                     # actual faults only (default)
@@ -292,6 +294,165 @@ RAM, erase, download, finalise, reset — with its usual checks.
 Tunables: `--flood-interval` (default 0.012 s, 0 disables the flood and probes
 only) and `--catch-probe` (pause between probe rounds, default 0.05 s).
 
+## Service procedures
+
+Post-repair / configuration procedures, reproduced with the generic `routine`
+command plus `cleardtc` / `reset`. Each one is taken from a capture of a vendor
+tool (UCDS) on this vehicle; the routine ids are **per module and per part
+number** — do not reuse them on another variant. A positive `71` only means the
+routine was *accepted*; the trailing status byte(s) are the module's verdict.
+Every command asks `y/N` unless `--yes` is given.
+
+### ABS — central car configuration (CCC) learn
+
+Ford/Teves ATE MK61 (`CV61-14C036`, tx `0x760` / rx `0x768`, HS-CAN). Source:
+`../ABS/ucds_abs_reset_CCC.log`; routine map in
+`../ABS/ABS_MK61_target_identification.md` §4e. Run it after changing the CCC /
+As-Built (e.g. the cruise-control byte) so the ABS re-learns the `0x40A`
+broadcast.
+
+```bash
+vbflasher routine ABS 0E08 0E06 --session 0x03 --sec-level 3 --wait 15 --tp-id 0x7DF
+vbflasher cleardtc ABS --yes          # the capture clears DTCs afterwards
+vbflasher dtc ABS                     # expect no U2300
+```
+
+| step | bytes | expected |
+|---|---|---|
+| extended session | `10 03` | `50 03 00 32 01 F4` |
+| SecurityAccess **level 3** | `27 03` / `27 04 <key>` | `67 04` |
+| full learn (steps 1+2+3) | `31 01 0E08` | `71 01 0E08 10` |
+| 15 s gap, `3E 80` on `7DF` | — | — |
+| DTC re-evaluation (step 2) | `31 01 0E06` | `71 01 0E06 10` |
+
+Level 3 uses the ABS secret `B83F247FFF` from `ecu_db.py`; the level-1
+flashing secret (`42434D5932`) is rejected. To re-run only the DTC
+re-evaluation: `vbflasher routine ABS 0E06 --session 0x03 --sec-level 3`.
+
+### HCM — headlamp levelling learn and actuator tests
+
+HCM `7S71-13K031-CC` (tx `0x734` / rx `0x73C`, HS-CAN). Source:
+`../HCM/hscan_learn_level.log`, `hscan_test_up.log`, `hscan_test_down.log`;
+full analysis in `../HCM/HCM_PROCEDURES.md`. Extended session only — **no
+SecurityAccess**: do not add `--unlock`, `--sec-level` or `--data`.
+
+```bash
+# level learn — the captured sequence: clear DTCs, learn, reset, clear DTCs
+vbflasher cleardtc HCM --yes
+vbflasher routine  HCM 200D --session 0x03 --tp-id 0x7DF
+vbflasher reset    HCM --yes          # 11 01, ~1.2 s after the learn in the capture
+vbflasher cleardtc HCM --yes
+
+# actuator tests — move the headlamp levelling motors
+vbflasher routine  HCM 2017 --session 0x03    # up
+vbflasher routine  HCM 2018 --session 0x03    # down
+```
+
+| operation | request | captured response |
+|---|---|---|
+| level learn | `31 01 200D` | `71 01 200D 00 00` |
+| up test | `31 01 2017` | `71 01 2017 00 00` |
+| down test | `31 01 2018` | `71 01 2018 00 00` |
+
+Before the learn, put the vehicle in the levelling condition (unladen, level
+floor, settled); the capture does not encode it. Check the height sensors
+before and after with `vbflasher readdid HCM 3B03 3B05` (front / rear, raw
+`uint16_be − 200` = mm). The IDS sensor-height procedure uses a different
+routine (`0x2054`) for other platforms — it is **not** this module's learn.
+
+### IPMA — front camera alignment learn (drive)
+
+F1FT IPMA (tx `0x706` / rx `0x70E`, HS-CAN). Source: IDS capture
+`../IPMA/Research/ids_ipma_calib.log`; routine and DID analysis in
+`../IPMA/Research/IPMA_camera_alignment.md` §7. Needs extended session +
+SecurityAccess **level 3** (secret `0000E727FB`; the level-1 flashing secret
+does not work). Run it after the camera or windscreen bracket was moved or
+replaced. Proven once on this car: complete after ~6.5 min of driving on
+marked roads.
+
+**1. Measure the wheel-arch heights** (FL, FR, RL, RR, in mm, at the points
+the Ford procedure specifies, car standing level). They are the body
+attitude reference: an error here becomes the same error in learned pitch.
+Encode each as a big-endian u16 (hex), in that order:
+
+    790, 790, 810, 810  ->  0316 0316 032A 032A  ->  --data 03160316032A032A
+
+**2. Check it is idle, then start the learn — exactly once:**
+
+```bash
+vbflasher readdid IPMA 41BB 41BA                  # 41BB must be 00 xx (idle)
+vbflasher routine IPMA 2050 --data 03160316032A032A --session 0x03 --sec-level 3
+```
+
+Expect `71 01 2050 10`. Routine `2050` is a **toggle**: sending it while an
+alignment is running *aborts* it (that is also the only way to cancel:
+the same command, the height bytes are ignored on the clearing call). Never
+re-send it "to make sure"; check `41BB` instead. The heights live in RAM until
+the learn completes — a power cycle mid-drive loses the run.
+
+**3. Drive, and watch it progress** — start the watch right away; it holds the
+extended session and level-3 security with TesterPresent, the way IDS does,
+and re-unlocks automatically if the context is lost:
+
+```bash
+vbflasher readdid IPMA 41BB FD05 --poll 1 --changes --until 0205 \
+    --session 0x03 --sec-level 3
+```
+
+`41BB` (Camera Alignment Status), 2 bytes:
+
+| byte 0 — state | byte 1 — progress |
+|---|---|
+| `00` idle / not aligning | `00` <20 % |
+| `01` **running** | `01` 20–39 % |
+| `02` **complete** | `02` 40–59 % |
+| `03` unobserved (failure/abort suspected) | `03` 60–79 %, `04` 80–99 %, `05` ≥100 % |
+
+The proven run: `00 00` → `01 00` once the car moved (6 s) → `01 01` at 140 s →
+`01 02` 263 s → `01 03` 307 s → `01 04` 345 s → **`02 05` at 393 s**. Progress
+depends on lane-marking quality, not distance. `--until 0205` ends the watch
+at completion; drop `FD05` (and the session/security flags) to watch `41BB`
+alone without unlocking.
+
+**4. Verify it committed:**
+
+```bash
+vbflasher readdid IPMA 41BA                                  # = the heights you sent
+vbflasher readdid IPMA FD05 --session 0x03 --sec-level 3     # learned angles
+```
+
+`41BA` changes to the heights you entered only when the result is written to
+NVM — the independent proof of commit. `FD05` (20 bytes: pitch / roll / yaw
+float32 BE degrees, then Z / Y / X int16 mm, pad, quality) gets new angles and
+its last byte goes `FF` → `00`; the X/Y/Z mount offsets are left untouched.
+Decoded output, an automatic "already running" guard and CSV/JSON logging are
+in `../IPMA/Research/work/ipma_align.py run --heights 790,790,810,810`.
+
+### HVAC (DEATC 0x733) — flashing
+
+Two hardware generations answer on 0x733 (MS-CAN, `can1`):
+
+| generation | software (F188) | SBL | secret level 1 / 3 | evidence |
+|---|---|---|---|---|
+| paged (older) | `CJ5T-18D619-*`, F111 `AM5T-14C239-*` | `AM5T-18D618-BB` | `415249414E` (any level) | SBL from FoCCCus; the secret is an **unverified** registry guess (FoCCCus has no 0x733 secret) |
+| Visteon V850E2/Fx4-L | `GJ5T-18D619-*` | `F1ET-18D618-AA` (V850 Fx4-L flash driver, RAM 0xFEDF8000) | `AFFE55EFFA` / `C346C346AA` | secrets read from the GJ5T application's SecurityAccess table (0xADE8 in AK); its keygen is the standard Ford LFSR (`test_hvac_profile`). SBL family match, not capture-proven |
+
+The V850 module's F111 lives in an EOL-written flash page and is not known, so this generation is chosen
+by the **software** part: the live F188 when it can be read, otherwise the part number of the VBF
+(dry run, `--recovery`). A VBF whose software part selects a different generation from the live F188
+(e.g. a GJ5T image on a CJ5T module — both are family `18D619`) is refused unless `--force`.
+
+```bash
+vbflasher flash GJ5T-18D619-AK_seatheat.vbf --dry-run      # plan: F1ET SBL, AFFE55EFFA
+vbflasher flash GJ5T-18D619-AK_seatheat.vbf                # live (asks before erase)
+vbflasher flash GJ5T-18D619-AK.vbf --recovery              # stock image back, PBL catch
+```
+
+Not yet proven on a module: the PBL accepting the application's level-1 secret, the F1ET SBL on GJ5T
+hardware, and the `31 01 0304` finalise answer (no response gate is set). The first live run is the
+test — keep the stock `GJ5T-18D619-AK.vbf` at hand. The patched HVAC image and its internal checksums are
+described in `../HVAC/docs/HVAC_GJ5T_firmware_reference.md`.
+
 ## Raw memory / EEPROM read & write
 
 `memread` / `memwrite` reuse the exact proven preamble (session → security →
@@ -460,6 +621,9 @@ Append one `EcuProfile` to `ECUS` in `ecu_db.py` — nothing else changes:
         SecretRule("", None, "0000000000"),       # ''=any prefix, None=any level
     ),
     sbls=(SblRule("HWPREFIX", "MY-SBL.vbf"),),     # by F111 prefix
+    # F111 unknown? key a rule on the SOFTWARE part instead (live F188/F120...,
+    # else the VBF being flashed):  SblRule("", "SBL.vbf", sw_prefix="GJ5T-18D619")
+    # and SecretRule("", 1, "...", sw_prefix="GJ5T-18D619")
     default_sbl="MY-SBL.vbf",                      # fallback
     finalize=True,          # run 31 01 0304 before reset (PCM/TCM/ABS/PSCM/IPMA)
     sbl_call_halfword=False,# start SBL with high 16 bits only (no known ECU; default full 4-byte addr)
@@ -493,8 +657,10 @@ python3 -m unittest discover -s .tests           # capture regressions + CLI flo
 | `test_progress.py` | progress bar, speed/ETA, total-time report |
 | `test_seed_delay.py` | settle before `requestSeed` |
 | `test_routine.py` | `routine` (31 RoutineControl) |
+| `test_readdid_poll.py` | `readdid --poll` (periodic watch, `--until`, `--changes`, session recovery) |
 | `test_abs_capture.py` / `test_ccm_capture.py` | secrets, SBL/finalise signatures, `37` CRC echoes from FORScan / UCDS captures |
 | `test_hcm_profile.py` | HCM registry entry + `readdid` |
+| `test_hvac_profile.py` | HVAC generations, software-keyed SBL/secret, generation guard, keygen vs the GJ5T application (`../HVAC/work/AK.bin`, skips when absent) |
 
 Tests that need OEM VBFs outside the repo (`../ABS/*.vbf`) skip when absent.
 

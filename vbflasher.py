@@ -140,27 +140,70 @@ def find_sbl_file(name, sbl_dirs):
     return None
 
 
-def resolve_sbl(profile, hw, args, sbl_dirs):
+def _sel_desc(hw, sw):
+    """Human description of what an SBL/secret selection was keyed on."""
+    d = f"F111 {hw!r}"
+    if sw:
+        d += f", software {'/'.join(sw)}"
+    return d
+
+
+def live_sw_parts(ident):
+    """Software part numbers the live module reports (F188/F120/...)."""
+    return tuple(ident[d].strip() for d in SW_IDENT_DIDS if ident.get(d))
+
+
+def select_sw(profile, hw, ident, vbfs):
+    """Software parts used for sw_prefix rules: the LIVE module's when they
+    resolve an SBL rule, else the parts of the VBFs being flashed (dry run,
+    --recovery, or a module that refuses its ident DIDs)."""
+    live = live_sw_parts(ident or {})
+    if live and profile.pick_sbl(hw, live) != profile.pick_sbl(hw, ()):
+        return live
+    return tuple(v.part for v in vbfs if v.part)
+
+
+def check_generation(profile, hw, ident, vbfs, force=False):
+    """Refuse a VBF whose software part selects a different SBL (= a different
+    hardware generation) from the one the live module reports, e.g. a V850
+    GJ5T-18D619 HVAC image sent to a paged CJ5T-18D619 module: the 18D619
+    family gate alone cannot tell them apart."""
+    live = live_sw_parts(ident or {})
+    files = tuple(v.part for v in vbfs if v.part)
+    if not live or not files:
+        return
+    # software-keyed selection only: a matching F111 rule would mask the clash
+    a, b = profile.pick_sbl("", live), profile.pick_sbl("", files)
+    if a != b:
+        msg = (f"{profile.name}: the module reports {'/'.join(live)} (SBL {a or 'by F111'}) "
+               f"but the VBF is {'/'.join(files)} (SBL {b or 'by F111'}) - a different "
+               f"hardware generation.")
+        if not force:
+            raise SystemExit(msg + " Refusing; --force overrides.")
+        print("!! WARNING (--force): " + msg)
+
+
+def resolve_sbl(profile, hw, args, sbl_dirs, sw=()):
     """Return (sbl_path, sbl_name, reason). Raises SystemExit if unresolved."""
     if args.sbl:
         if not os.path.exists(args.sbl):
             raise SystemExit(f"--sbl {args.sbl}: file not found")
         return args.sbl, os.path.basename(args.sbl), "explicit --sbl"
 
-    name = profile.pick_sbl(hw)
+    name = profile.pick_sbl(hw, sw)
     if not name:
         raise SystemExit(
-            f"No SBL is registered for {profile.name} with F111 {hw!r}.\n"
+            f"No SBL is registered for {profile.name} with {_sel_desc(hw, sw)}.\n"
             f"    Specify one with:  --sbl /path/to/SBL.vbf")
     path = find_sbl_file(name, sbl_dirs)
     if not path:
         searched = "\n      ".join(sbl_dirs)
         raise SystemExit(
-            f"The required SBL '{name}' (selected from F111 {hw!r}) was not "
+            f"The required SBL '{name}' (selected from {_sel_desc(hw, sw)}) was not "
             f"found on disk.\n    Searched:\n      {searched}\n"
             f"    Place '{name}' in the sbl/ folder, add a folder with "
             f"--sbl-dir, or pass --sbl /path/to/{name}.")
-    return path, name, f"selected from F111 {hw!r}"
+    return path, name, f"selected from {_sel_desc(hw, sw)}"
 
 
 # --------------------------------------------------------------------------
@@ -613,7 +656,9 @@ def flash_session(txid, files, args):
     elif args.execute:
         ident = read_identity(ecu, profile, args.wake_tries, args.wake_timeout)
         hw = args.hw or ident.get("F111") or ""
-        if not hw and not args.sbl:
+        check_generation(profile, hw, ident, to_flash, force=args.force)
+        if not hw and not args.sbl and not profile.pick_sbl(
+                hw, select_sw(profile, hw, ident, to_flash)):
             raise SystemExit(
                 "could not read F111 from the ECU and no --hw/--sbl given; "
                 "cannot choose the SBL/secret.\n"
@@ -640,7 +685,8 @@ def flash_session(txid, files, args):
     # Default SBL location is the ./sbl/ subdir next to the flasher; HERE stays
     # as a fallback so SBLs dropped beside the script still resolve.
     sbl_dirs = [SBL_DIR, HERE] + list(args.sbl_dir or [])
-    sbl_path, sbl_name, sbl_reason = resolve_sbl(profile, hw, args, sbl_dirs)
+    sw = select_sw(profile, hw, ident, to_flash)
+    sbl_path, sbl_name, sbl_reason = resolve_sbl(profile, hw, args, sbl_dirs, sw)
     sbl = Vbf(sbl_path)
     if sbl.call is None:
         raise SystemExit(f"{sbl_path}: SBL VBF has no `call` address in header")
@@ -660,12 +706,12 @@ def flash_session(txid, files, args):
             else args.secret
         secret_reason = "explicit --secret"
     else:
-        secret = profile.pick_secret(hw, level)
-        secret_reason = f"selected from F111 {hw!r} at security level {level}"
+        secret = profile.pick_secret(hw, level, sw)
+        secret_reason = f"selected from {_sel_desc(hw, sw)} at security level {level}"
         if secret is None and args.execute:
             raise SystemExit(
                 f"no SecurityAccess secret registered for {profile.name} "
-                f"F111 {hw!r} level {level}. Pass --secret 0x....")
+                f"{_sel_desc(hw, sw)} level {level}. Pass --secret 0x....")
 
     # --- the PLAN ----------------------------------------------------------
     print("\n" + "=" * 72)
@@ -992,12 +1038,13 @@ def _open_sbl_session(profile, args, need_secret=True):
     ident = read_identity(ecu, profile, getattr(args, "wake_tries", 8),
                           getattr(args, "wake_timeout", 0.5))
     hw = args.hw or ident.get("F111") or ""
-    if not hw and not args.sbl:
+    sw = live_sw_parts(ident)
+    if not hw and not args.sbl and not profile.pick_sbl(hw, sw):
         raise SystemExit("could not read F111 and no --hw/--sbl given; cannot "
                          "choose the SBL/secret. Pass --hw <F111> or --sbl.")
 
     sbl_dirs = [SBL_DIR, HERE] + list(args.sbl_dir or [])
-    sbl_path, sbl_name, sbl_reason = resolve_sbl(profile, hw, args, sbl_dirs)
+    sbl_path, sbl_name, sbl_reason = resolve_sbl(profile, hw, args, sbl_dirs, sw)
     sbl = Vbf(sbl_path)
     if sbl.call is None:
         raise SystemExit(f"{sbl_path}: SBL VBF has no `call` address")
@@ -1010,10 +1057,10 @@ def _open_sbl_session(profile, args, need_secret=True):
         secret = (args.secret.to_bytes(5, "big")
                   if isinstance(args.secret, int) else args.secret)
     else:
-        secret = profile.pick_secret(hw, level)
+        secret = profile.pick_secret(hw, level, sw)
         if secret is None and need_secret:
             raise SystemExit(f"no SecurityAccess secret for {profile.name} "
-                             f"F111 {hw!r} level {level}. Pass --secret 0x....")
+                             f"{_sel_desc(hw, sw)} level {level}. Pass --secret 0x....")
 
     quiet = BusQuiet(iface, FUNCTIONAL_ID, execute=True,
                      enabled=getattr(args, "quiet_bus", False))
@@ -1202,7 +1249,12 @@ def do_flash(args):
     if args.recovery:
         if len(groups) != 1:
             raise SystemExit("--recovery requires exactly one target ECU")
-        if args.execute and not (args.hw or (args.sbl and
+        (rtx, rfiles), = groups.items()
+        rprof = ecu_db.get_profile(rtx)
+        rsw = tuple(Vbf(f).part for f in rfiles if Vbf(f).part)
+        by_sw = bool(rprof and rprof.pick_sbl("", rsw) != rprof.pick_sbl("", ())
+                     and rprof.pick_secret("", args.sec_level, rsw) is not None)
+        if args.execute and not (args.hw or by_sw or (args.sbl and
                                   (args.skip_security or args.secret is not None))):
             raise SystemExit("--recovery skips live F111 reads: pass --hw "
                              "<known F111>, or --sbl PATH with --secret VALUE "
@@ -1386,29 +1438,54 @@ def _session_and_unlock(args, profile, ecu):
     print("   unlocked")
 
 
+def _norm_did(did):
+    d = did.upper().replace("0X", "").replace(" ", "")
+    if len(d) != 4 or any(c not in "0123456789ABCDEF" for c in d):
+        return None
+    return d
+
+
+def _read_did(ecu, d, timeout):
+    """One 22 <did>. Returns (payload, None, raw) or (None, error text, raw)."""
+    r = ecu.req("22" + d, timeout=timeout, what="22 " + d)
+    if r is None:
+        return None, "<no response / timeout>", None
+    if r[0] == 0x7F:
+        return None, fmt(r), r
+    # positive: 62 <did_hi> <did_lo> <payload...>
+    if r[0] != 0x62 or len(r) < 3:
+        return None, f"unexpected response {r.hex().upper()}", r
+    return r[3:], None, r
+
+
 def do_readdid(args):
+    dids = []
+    for did in args.did:
+        d = _norm_did(did)
+        if d is None:
+            if getattr(args, "poll", None):
+                raise SystemExit(f"{did}: not a 2-byte DID (expected 4 hex digits)")
+            print(f"\n   {did}: not a 2-byte DID (expected 4 hex digits)")
+            continue
+        dids.append(d)
+    until = None
+    if getattr(args, "until", None):
+        u = args.until.replace("0x", "").replace("0X", "").replace(" ", "")
+        if len(u) % 2 or any(c not in "0123456789abcdefABCDEF" for c in u):
+            raise SystemExit(f"--until {args.until!r}: not valid hex bytes")
+        until = bytes.fromhex(u)
     profile, ecu = _connect_by_selector(args)
     print(f"== {profile.name}  tx=0x{profile.txid:03X} rx=0x{ecu.rxid:03X} ==")
     ecu.wake(tries=getattr(args, "wake_tries", 8),
              timeout=getattr(args, "wake_timeout", 0.5))
     _session_and_unlock(args, profile, ecu)
-    for did in args.did:
-        d = did.upper().replace("0X", "").replace(" ", "")
-        if len(d) != 4 or any(c not in "0123456789ABCDEF" for c in d):
-            print(f"\n   {did}: not a 2-byte DID (expected 4 hex digits)")
+    if getattr(args, "poll", None):
+        return _poll_dids(args, profile, ecu, dids, until)
+    for d in dids:
+        payload, err, _ = _read_did(ecu, d, args.timeout)
+        if err:
+            print(f"\n   {d}: {err}")
             continue
-        r = ecu.req("22" + d, timeout=args.timeout, what="22 " + d)
-        if r is None:
-            print(f"\n   {d}: <no response / timeout>")
-            continue
-        if r[0] == 0x7F:
-            print(f"\n   {d}: {fmt(r)}")
-            continue
-        # positive: 62 <did_hi> <did_lo> <payload...>
-        if r[0] != 0x62 or len(r) < 3:
-            print(f"\n   {d}: unexpected response {r.hex().upper()}")
-            continue
-        payload = r[3:]
         print(f"\n   DID {d}  ({len(payload)} bytes)")
         if not payload:
             print("      (empty)")
@@ -1417,6 +1494,73 @@ def do_readdid(args):
         print(f"      ascii: {_ascii_sanitize(payload)!r}")
         if len(payload) > 16:
             print(_hexdump(payload, indent="      "))
+
+
+# NRCs that mean "the session / security context was lost" (S3 timeout, a
+# module reset): re-run the --session/--unlock preamble once and retry.
+_CONTEXT_LOST_NRC = (0x33, 0x7E, 0x7F)
+
+
+def _poll_dids(args, profile, ecu, dids, until):
+    """readdid --poll: re-read the DIDs every --poll seconds, one timestamped
+    line per round. Ends on Ctrl-C, after --count rounds, or when the FIRST
+    DID's payload starts with --until. A TesterPresent keepalive runs whenever
+    a non-default session was requested, and a lost session/security context
+    is re-established once per occurrence, so a long watch (e.g. an IPMA
+    alignment drive) does not silently fall back to NRCs."""
+    interval = max(0.0, args.poll)
+    keep_ctx = args.session is not None or getattr(args, "unlock", False)
+    ka = None
+    if keep_ctx:
+        ka_can_id = None if args.tp_id < 0 else args.tp_id
+        ka = Keepalive(ecu, period=args.tp_interval, can_id=ka_can_id).start()
+    print(f"   polling {' '.join(dids)} every {interval:g} s"
+          + (f", stop when {dids[0]} starts with {until.hex().upper()}"
+             if until is not None else "")
+          + (f", {args.count} rounds" if args.count else "")
+          + (", changes only" if args.changes else "")
+          + "  (Ctrl-C to stop)", flush=True)
+    t0 = time.monotonic()
+    last = {}
+    rounds = 0
+    rc = 0
+    try:
+        while True:
+            rounds += 1
+            now = time.monotonic() - t0
+            cells, changed, first = [], False, None
+            for i, d in enumerate(dids):
+                payload, err, raw = _read_did(ecu, d, args.timeout)
+                if (err and raw is not None and len(raw) >= 3 and raw[0] == 0x7F
+                        and raw[2] in _CONTEXT_LOST_NRC and keep_ctx):
+                    print(f"[{now:8.1f}s] {d}  {err} -> re-entering session/"
+                          "security", flush=True)
+                    _session_and_unlock(args, profile, ecu)
+                    payload, err, raw = _read_did(ecu, d, args.timeout)
+                val = err if err else payload.hex().upper()
+                if i == 0:
+                    first = payload
+                if last.get(d) != val:
+                    changed = True
+                last[d] = val
+                cells.append(f"{d}={val}" if len(dids) > 1 else f"{d}  {val}")
+            if changed or not args.changes:
+                print(f"[{now:8.1f}s] " + "   ".join(cells), flush=True)
+            if until is not None and first is not None and first.startswith(until):
+                print(f"   {dids[0]} reached {until.hex().upper()} after "
+                      f"{now:.1f} s — stopping")
+                break
+            if args.count and rounds >= args.count:
+                break
+            if interval:
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n   stopped (Ctrl-C)")
+        rc = 130
+    finally:
+        if ka:
+            ka.stop()
+    return rc
 
 
 def do_writedid(args):
@@ -2129,6 +2273,19 @@ def selftest():
     ipma = ecu_db.get_profile(0x706)
     chk("IPMA secret == 00009875CA",
         ipma.pick_secret("anything", 1) == bytes.fromhex("00009875CA"))
+    # HVAC 0x733: two generations. V850 GJ5T keyed on the SOFTWARE part (F111
+    # unknown); secrets = the GJ5T application's own table 0xADE8.
+    hvac = ecu_db.get_profile(0x733)
+    gj5 = ("GJ5T-18D619-AK",)
+    chk("HVAC GJ5T SBL == F1ET-18D618-AA.vbf (software-keyed)",
+        hvac.pick_sbl("", gj5) == "F1ET-18D618-AA.vbf")
+    chk("HVAC GJ5T level1 secret == AFFE55EFFA",
+        hvac.pick_secret("", 1, gj5) == bytes.fromhex("AFFE55EFFA"))
+    chk("HVAC GJ5T level3 secret == C346C346AA",
+        hvac.pick_secret("", 3, gj5) == bytes.fromhex("C346C346AA"))
+    chk("HVAC paged AM5T-14C239 keeps AM5T-18D618-BB",
+        hvac.pick_sbl("AM5T-14C239-AB", ("CJ5T-18D619-BC",)) == "AM5T-18D618-BB.vbf")
+    chk("HVAC no software, no F111 -> no SBL", hvac.pick_sbl("", ()) is None)
     # IPC DM5T-14F094 (C-MAX Energi hybrid): level-3 secret solved from the
     # UCDS 2E writedid captures in IPC/c-max_el/hybrid/. Three independent
     # seed/key pairs from the same module must all reproduce, which is what
@@ -3336,6 +3493,23 @@ def build_parser():
                         f"requestSeed (default {SEED_DELAY}; 0 disables)")
     s.add_argument("--timeout", type=float, default=5.0,
                    help="per-DID response timeout in seconds (default 5)")
+    s.add_argument("--poll", type=float, default=None, metavar="SECONDS",
+                   help="re-read the DID(s) every SECONDS until Ctrl-C, one "
+                        "timestamped line per round (e.g. IPMA alignment "
+                        "progress: 41BB --poll 1)")
+    s.add_argument("--count", type=int, default=0,
+                   help="--poll: stop after N rounds (default 0 = forever)")
+    s.add_argument("--changes", action="store_true",
+                   help="--poll: print a round only when a value changed")
+    s.add_argument("--until", default=None, metavar="HEX",
+                   help="--poll: stop once the FIRST DID's payload starts "
+                        "with these bytes (IPMA alignment done: 0205)")
+    s.add_argument("--tp-interval", type=float, default=TP_INTERVAL,
+                   help="--poll with --session/--unlock: TesterPresent period "
+                        f"(default {TP_INTERVAL}; 0 off)")
+    s.add_argument("--tp-id", type=lambda x: int(x, 0), default=-1,
+                   help="--poll: broadcast CAN ID for TesterPresent "
+                        "(default: physical via ISO-TP)")
 
     s = add_ecu_diag_parser(
         "routine", "run a RoutineControl (31) routine, e.g. the ABS CCC learn")

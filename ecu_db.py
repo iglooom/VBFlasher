@@ -68,13 +68,33 @@ class SecretRule:
     hw_prefix: str
     level: Optional[int]
     secret: str
+    # Optional SOFTWARE part prefix (live F188/F120/... or the VBF being
+    # flashed). For modules whose F111 hardware string is not known yet but
+    # whose generation is fixed by the software part (HVAC GJ5T = V850).
+    sw_prefix: str = ""
 
 
 @dataclass
 class SblRule:
-    """SBL VBF filename chosen by F111 hardware-string prefix (''=any/default)."""
+    """SBL VBF filename chosen by F111 hardware-string prefix (''=any/default).
+
+    sw_prefix (optional) additionally / instead matches a SOFTWARE part number:
+    the live software DIDs first, else the part numbers of the VBFs being
+    flashed (see EcuProfile.pick_sbl)."""
     hw_prefix: str
     filename: str
+    sw_prefix: str = ""
+
+
+def _sw_match(prefix, sw):
+    """True when prefix is blank or any software part starts with it."""
+    if not prefix:
+        return True
+    return any((p or "").strip().upper().startswith(prefix.upper()) for p in sw)
+
+
+def _rule_ok(r, hw, sw):
+    return (not r.hw_prefix or hw.startswith(r.hw_prefix)) and _sw_match(r.sw_prefix, sw)
 
 
 @dataclass
@@ -124,33 +144,40 @@ class EcuProfile:
         except KeyError:
             raise ValueError(f"unsupported CAN bus {self.bus!r} for {self.name}")
 
-    def pick_secret(self, hw: str, level: int) -> Optional[bytes]:
+    def pick_secret(self, hw: str, level: int, sw=()) -> Optional[bytes]:
+        """Secret for F111 `hw` at `level`. `sw` = software part numbers
+        (live ident, else the VBFs being flashed) for sw_prefix rules.
+        Exact level first, then level-agnostic; the most specific rule wins
+        (longest F111 prefix, then longest software prefix)."""
         hw = hw or ""
-        # exact level first, then level-agnostic, longest prefix wins
         for want_level in (level, None):
             best = None
             for r in self.secrets:
-                if r.level != want_level:
+                if r.level != want_level or not _rule_ok(r, hw, sw):
                     continue
-                if hw.startswith(r.hw_prefix):
-                    if best is None or len(r.hw_prefix) > len(best.hw_prefix):
-                        best = r
+                key = (len(r.hw_prefix), len(r.sw_prefix))
+                if best is None or key > (len(best.hw_prefix), len(best.sw_prefix)):
+                    best = r
             if best is not None:
                 return bytes.fromhex(best.secret)
         return None
 
-    def pick_sbl(self, hw: str) -> Optional[str]:
+    def pick_sbl(self, hw: str, sw=()) -> Optional[str]:
+        """SBL for F111 `hw`; `sw` as in pick_secret. A rule with any prefix
+        (F111 or software) beats the blank catch-all rule and default_sbl."""
         hw = hw or ""
         best = None
         for r in self.sbls:
-            if r.hw_prefix and hw.startswith(r.hw_prefix):
-                if best is None or len(r.hw_prefix) > len(best.hw_prefix):
-                    best = r
+            if not (r.hw_prefix or r.sw_prefix) or not _rule_ok(r, hw, sw):
+                continue
+            key = (len(r.hw_prefix), len(r.sw_prefix))
+            if best is None or key > (len(best.hw_prefix), len(best.sw_prefix)):
+                best = r
         if best is not None:
             return best.filename
         # then a blank-prefix (catch-all) SBL rule, then the profile default
         for r in self.sbls:
-            if r.hw_prefix == "":
+            if r.hw_prefix == "" and r.sw_prefix == "":
                 return r.filename
         return self.default_sbl
 
@@ -404,8 +431,34 @@ ECUS = {
     0x733: EcuProfile(
         name="DEATC / HVAC", txid=0x733, bus="MS-CAN",
         aliases=("DEATC", "HVAC"),
-        secrets=(SecretRule("", None, "415249414E"),),
-        sbls=(SblRule("AM5T-14C239", "AM5T-18D618-BB.vbf"),),
+        # Two hardware generations answer on 0x733:
+        #  * older (CJ5T-18D619 software, paged 0xE08000.. map, F111 AM5T-14C239):
+        #    SBL AM5T-18D618-BB from FoCCCus getSblFilename(). Its secret is
+        #    NOT from FoCCCus (getSecret() has no 0x733 case -> 0000000000);
+        #    415249414E is the original registry guess, unverified.
+        #  * Visteon V850E2/Fx4-L (GJ5T-18D619 software, app 0x8000..0x77FFF,
+        #    see HVAC/docs/HVAC_GJ5T_firmware_reference.md). F111 is written at
+        #    EOL into flash 0x7FC00 and is not known, so the generation is
+        #    keyed on the SOFTWARE part. SBL F1ET-18D618-AA "Flash driver for
+        #    V850 Fx4-L" (ecu 0x733, loads/calls 0xFEDF8000) - matching family,
+        #    not capture-proven on GJ5T. Secrets: the GJ5T APPLICATION's own
+        #    SecurityAccess table at 0xADE8 (AK; 0xACC8 AG, 0xADBC AH), keygen
+        #    FUN_26232 = the universal Ford LFSR (200/200 random seeds equal to
+        #    ford_seckey). Level 1 AFFE55EFFA, level 3 C346C346AA. That the PBL
+        #    uses the application's level-1 secret is INFERRED (same supplier
+        #    table); the first live 27 02 is the test.
+        secrets=(
+            SecretRule("", 1, "AFFE55EFFA", sw_prefix="GJ5T-18D619"),
+            SecretRule("", 3, "C346C346AA", sw_prefix="GJ5T-18D619"),
+            SecretRule("", None, "415249414E"),
+        ),
+        sbls=(
+            SblRule("AM5T-14C239", "AM5T-18D618-BB.vbf"),
+            SblRule("", "F1ET-18D618-AA.vbf", sw_prefix="GJ5T-18D619"),
+        ),
+        # Ford programming sequence ends with 31 01 0304; no HVAC capture yet,
+        # so no response gate (finalize_response) is imposed.
+        finalize=True,
     ),
     0x716: EcuProfile(
         name="GWM", txid=0x716, bus="HS-CAN", aliases=("GWM",),
