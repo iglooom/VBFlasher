@@ -239,8 +239,25 @@ ECUS = {
     ),
     0x727: EcuProfile(
         name="ACM (audio)", txid=0x727, bus="MS-CAN", aliases=("ACM",),
-        secrets=(SecretRule("", None, "13F129B301"),),
-        sbls=(SblRule("BM5T-14C230", "AM5T-14C047-DC.vbf"),),
+        # Kuga 2 / C520 Visteon ACM (R32C/118): F111 CV4T-14F188-TB, F188
+        # CV4T-14D099-xx app, F124 CV4T-14D100-xx sound cal. Sits on I-CAN in
+        # SYNC 3 cars (bench: --iface can2). SBL CV4T-14D101-AA loads to RAM
+        # 0x580 and is called there. FoCCCus' ACM secret 13F129B301 (Focus
+        # BM5T) is REJECTED by the CV4T PBL (seed 98028A -> NRC 35). The CV4T
+        # application hardcodes 50C86A49F1 (fff2280c, keygen FUN_fff04e88 =
+        # universal Ford LFSR, 2000/2000 random seeds equal to ford_seckey).
+        secrets=(SecretRule("", None, "13F129B301"),
+                 SecretRule("CV4T-14F188", None, "50C86A49F1")),
+        # LIVE-PROVEN on CV4T-14F188-TB (can2, logs/20261103-151354_ACM_*):
+        #   10 02 -> 50 02 00 19 01 F4 ; 27 01/02 with 50C86A49F1 -> 67 02
+        #   34 00 44 00000580 0000029D -> 74 20 0402 (1024 B/transfer)
+        #   37 -> 77 FA68 (SBL CRC) ; 31 01 0301 00000580 -> 71 01 0301 10
+        #   31 01 FF00 FFFD0000 00028000 -> 71 01 FF00 10   (~1 s)
+        #   34 00 44 FFFD0000 00027FF0, 161 x 36 (~8 s), 37 -> 77 F5F7
+        #   31 01 0304 -> 71 01 0304 10 02 ; 11 01 -> 51 01, no DTCs after.
+        # Response gates are NOT set profile-wide: the BM5T ACM PBL is unproven.
+        sbls=(SblRule("BM5T-14C230", "AM5T-14C047-DC.vbf"),
+              SblRule("CV4T-14F188", "CV4T-14D101-AA.vbf")),
         finalize=True,
     ),
     0x730: EcuProfile(

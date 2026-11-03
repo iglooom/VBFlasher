@@ -670,4 +670,8 @@ Secrets/SBLs: FoCCCus `ford_c346.cpp` (`getSecret`, `getSblFilename`, keyed on
 F111). Hardware-relevant: BCM `16C0BF803D` (DV6T/F1FT/F1DT level 1; supersedes the
 older `64000B0C59`), PSCM `00009B2533` (published, unverified on the module
 — treat the first live `27 02` as the test), IPMA `00009875CA` (solved from two
-captured sessions).
+captured sessions). ACM `50C86A49F1` for CV4T (`CV4T-14F188` F111): read
+from the CV4T-14D099 application (keygen identical to `ford_seckey`), then
+proven by a live flash of `CV4T-14D100-TE` with SBL `CV4T-14D101-AA`; the
+FoCCCus ACM secret `13F129B301` is rejected by that module (NRC 35) and is kept
+only for the BM5T generation.
