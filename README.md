@@ -16,6 +16,11 @@ IPMA) plus the OEM-derived secret/SBL tables from FoCCCus `ford_c346.cpp`.
 | `vbf.py` | VBF container parser + ISO-TP transport + bus-quiet / keepalive / download |
 | `ford_keybag.py` | 343 candidate secrets transcribed from FoCCCus `bruteSecretKey()` |
 | `ford_brutekey.py` | dictionary attack on an unknown SecurityAccess secret (`--self-test` for the offline proof) |
+| `vbflasher_gui.py` | PySide6 GUI over everything above — see [GUI](#gui) |
+| `gui_backend.py` | Qt-free bus helpers the GUI runs in-process (ident, DID read/write, DTC, reset) |
+| `defs.py` | module definitions: pick the DID layouts for a live module, field codec, CCC image, UCDS XML I/O |
+| `defs/vbflasher_defs.sqlite` | generated definition DB (DIDs/fields/enums, DTC text, CCF central config) |
+| `tools/build_defs.py` | rebuilds `defs/vbflasher_defs.sqlite` from `~/Projects/ford/IDSdb/build` |
 | `sbl/` | Secondary Bootloader VBFs looked up by the registry (the only VBFs tracked in git) |
 | `.tests/` | offline unit tests, all CAN transport mocked (git-ignored, local only; see [Tests](#tests)) |
 | `logs/` | per-run trace logs (git-ignored) |
@@ -78,10 +83,69 @@ To just print the script (e.g. to a system-wide dir), drop `--install`:
 `vbflasher completion bash > /etc/bash_completion.d/vbflasher`. **Regenerate**
 after adding a subcommand, flag, or ECU by re-running the same command.
 
+## GUI
+
+```bash
+vbflasher --gui                     # or: python3 vbflasher_gui.py  (needs PySide6; Arch/Manjaro: pyside6)
+```
+
+A desktop launcher is optional: `~/.local/share/applications/vbflasher.desktop`
+with `Exec=$HOME/.local/bin/vbflasher --gui`.
+
+The toolbar selects the **module** (registry, or a custom tx CAN id) and the
+**interface**: `auto` maps each module by its bus (HS-CAN → / MS-CAN → combos,
+default can0/can1); picking an interface (e.g. `can2` for a bench unit) forces
+it for every operation. One bus job runs at a time; **Stop** cancels a polling
+job or sends Ctrl-C to a running CLI job.
+
+| tab | what it does | how |
+|---|---|---|
+| Modules | scan every registered module: present/silent, F111/F188/F110/F113/F124/VIN, best definition | in-process |
+| Flash | add VBFs (header, part, CRC check), all `flash` options, dry-run plan → confirm → flash with progress; `info`/`verify` | CLI subprocess |
+| Direct config | identify the module, pick its definition, read all writable DIDs, edit fields (enum combos / numbers / ASCII / raw hex), write changed DIDs with session + SecurityAccess, read-back verify; load/save UCDS *Direct Configuration* XML | in-process |
+| Central config (CCC) | read the 512-byte CCC from BCM/IPC (address from D12B, SBL + 35 upload), decode it with the CCF definition, edit, checksum auto-fixed, write back (fresh backup → confirm → `memwrite --erase-len` → read-back compare); load/save UCDS *As-Built* XML or .bin | CLI subprocess |
+| DIDs | raw read / write / poll (changes only, stop-on-value) with optional session/unlock | in-process |
+| DTCs | read with descriptions, scan all modules, clear one / clear ALL (7DF) | in-process |
+| Service | reset (one / ALL), routine, silence, memread/memwrite, SBL test, `ford_brutekey`, self-test | mixed |
+
+Every config read is backed up automatically to `logs/backups/` (UCDS XML for
+DIDs, `.bin` for the CCC) before anything is written.
+
+**Picking a definition.** In order: the module's own Part II spec from
+**F110** (exact FDRS MDX), then sibling specs of the same family (marked
+*verify!*), then vehicle definitions for the chosen model / model year at that
+CAN address (the UCDS-extracted C520 IPC list first, then IDS ffdata/CCF
+synthesis, then IDS platform MDX), then any spec at that address. Search
+covers spec, model and acronym. Field positions show `B<byte>.<bit>`
+(byte 0 first, bit 7 = MSB). Ford MDX `security_level_N` is SecurityAccess
+`27 (2N-1)`, so config writes that publish level 2 unlock with `27 03`.
+
+**The definition DB** (`defs/vbflasher_defs.sqlite`, ~15 MB, committed) is one
+source-agnostic format built from IDSdb: 685 FDRS spec documents, ~10.6 k
+model/MY/module documents, 50 CCF central-config layouts, DTC text per module
+address. Layouts and DID sets are content-deduplicated; part-number lists and
+security bytes are not copied. Rebuild after IDSdb changes:
+
+```bash
+python3 tools/build_defs.py         # ~10 s
+```
+
+**CCC facts used** (verified on three UCDS As-Built files): 512 bytes =
+CCF blocks 1..5 (88+40+128+2+254); byte 256 = `0xFC` (block-5 length),
+byte 257 = `sum(bytes 258..511) & 0xFF`. Erase length on write: BCM
+DV6T/F1FT/F1DT `0x4000`, other BCM `0x400`, IPC `0x1000` (FoCCCus).
+
+**Windows:** the GUI itself is portable, but the transport is Linux SocketCAN
+with the kernel ISO-TP module. On Windows only the offline parts could work
+(VBF info/verify, editing/decoding UCDS XML files — untested there); live bus
+access would need a different transport backend (e.g. python-can + a
+J2534/ELM adapter).
+
 ## Usage
 
 ```bash
 vbflasher --selftest                      # offline self-tests
+vbflasher --gui                           # graphical interface (see GUI)
 vbflasher list                            # registered ECUs
 vbflasher info   FILE.vbf [...]           # header + block table + integrity
 vbflasher verify FILE.vbf [...]           # CRC check only

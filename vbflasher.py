@@ -3439,6 +3439,8 @@ def build_parser():
                     "from F111).")
     ap.add_argument("--selftest", action="store_true",
                     help="run offline self-tests and exit")
+    ap.add_argument("--gui", action="store_true",
+                    help="start the graphical interface (vbflasher_gui.py, needs PySide6)")
     sub = ap.add_subparsers(dest="cmd")
 
     for name in ("info", "verify"):
@@ -3778,6 +3780,12 @@ def build_parser():
 def main():
     ap = build_parser()
     args = ap.parse_args()
+    if args.gui:
+        try:
+            import vbflasher_gui
+        except ImportError as e:
+            raise SystemExit(f"--gui needs PySide6 ({e}); install the pyside6 package")
+        return vbflasher_gui.main()
     if args.selftest or args.cmd is None:
         if args.cmd is None and not args.selftest:
             ap.print_help()
