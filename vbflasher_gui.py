@@ -285,7 +285,7 @@ class Main(QMainWindow):
         self.dtc_tab = DtcTab(self)
         self.service_tab = ServiceTab(self)
         for t, n in ((self.modules_tab, "Modules"), (self.flash_tab, "Flash"),
-                     (self.direct_tab, "Direct config"),
+                     (self.direct_tab, "Module data && config"),
                      (self.central_tab, "Central config (CCC)"),
                      (self.did_tab, "DIDs"), (self.dtc_tab, "DTCs"),
                      (self.service_tab, "Service")):
@@ -942,10 +942,16 @@ class DirectConfigTab(QWidget):
         lay.addWidget(top)
 
         acc = QHBoxLayout()
-        self.only_cfg = QCheckBox("only writable DIDs")
-        self.only_cfg.setChecked(True)
-        self.only_cfg.toggled.connect(self.populate)
-        acc.addWidget(self.only_cfg)
+        acc.addWidget(QLabel("Show"))
+        self.view = QComboBox()
+        self.view.addItems(["Config (writable)", "Diagnostic data (read-only)", "All DIDs"])
+        self.view.currentIndexChanged.connect(self.populate)
+        acc.addWidget(self.view)
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("filter: DID / name / field (e.g. batt, TPM, 40)")
+        self.filter.setMinimumWidth(240)
+        self.filter.textChanged.connect(self.populate)
+        acc.addWidget(self.filter)
         acc.addWidget(QLabel("  read: session"))
         self.rd_sess = QComboBox()
         self.rd_sess.addItems(["auto", "01", "03", "60", "40"])
@@ -966,7 +972,8 @@ class DirectConfigTab(QWidget):
         lay.addLayout(acc)
 
         row = QHBoxLayout()
-        for text, fn in (("Read from module", self.read_module),
+        for text, fn in (("Read shown DIDs", self.read_module),
+                         ("Read selected", self.read_selected),
                          ("Write changed DIDs", self.write_module),
                          ("Revert edits", self.revert),
                          ("Load UCDS Direct XML…", self.load_xml),
@@ -976,9 +983,20 @@ class DirectConfigTab(QWidget):
             bb.clicked.connect(fn)
             row.addWidget(bb)
         row.addStretch()
+        row.addWidget(QLabel("live every"))
+        self.poll_s = QDoubleSpinBox()
+        self.poll_s.setRange(0.0, 60.0)
+        self.poll_s.setValue(1.0)
+        self.poll_s.setSuffix(" s")
+        row.addWidget(self.poll_s)
+        self.poll_btn = QPushButton("Live poll (selected / shown)")
+        self.poll_btn.setCheckable(True)
+        self.poll_btn.toggled.connect(self.toggle_poll)
+        row.addWidget(self.poll_btn)
         lay.addLayout(row)
 
         self.tree = QTreeWidget()
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.setColumnCount(5)
         self.tree.setHeaderLabels(["DID / field", "Position", "Value", "Raw", "Access / info"])
         self.tree.setItemDelegate(FieldDelegate(self))
@@ -1084,14 +1102,34 @@ class DirectConfigTab(QWidget):
 
     # -- tree ----------------------------------------------------------------
     def shown_dids(self):
-        ds = set(self.cur) | set(self.orig)
-        for d, dd in self.dids.items():
-            if dd.writable or not self.only_cfg.isChecked():
-                ds.add(d)
-        if self.only_cfg.isChecked():
-            ds = {d for d in ds if d not in self.dids or self.dids[d].writable
-                  or d in self.cur}
-        return sorted(ds)
+        view = self.view.currentIndex()        # 0 config, 1 diagnostic, 2 all
+        ds = set(self.cur) | set(self.orig) | set(self.dids)
+        out = []
+        q = self.filter.text().strip().lower()
+        for d in sorted(ds):
+            dd = self.dids.get(d)
+            w = dd.writable if dd else d in self.cur and d not in self.orig
+            if view == 0 and dd is not None and not w:
+                continue
+            if view == 1 and (dd is None or w):
+                continue
+            if q:
+                hay = f"{d:04x} " + (dd.name.lower() if dd else "") + " " + " ".join(
+                    (f.name + " " + (f.key or "")).lower() for f in (dd.fields if dd else []))
+                if q not in hay:
+                    continue
+            out.append(d)
+        return out
+
+    def selected_dids(self):
+        out = []
+        for it in self.tree.selectedItems():
+            while it.parent():
+                it = it.parent()
+            d = it.data(0, Qt.ItemDataRole.UserRole)
+            if d is not None and d not in out:
+                out.append(d)
+        return out
 
     def populate(self):
         self.tree.clear()
@@ -1106,12 +1144,17 @@ class DirectConfigTab(QWidget):
             self.tree.addTopLevelItem(it)
             self.items[did] = it
             if dd:
-                for i, f in enumerate(dd.fields):
+                for f in sorted(dd.fields, key=lambda f: -f.msb):   # byte 0 / MSB first
+                    info = " · ".join(x for x in (f.key, f.desc) if x)
                     ch = QTreeWidgetItem(["   " + f.name, f.position(dd.size or 0), "", "",
-                                          f.desc or ""])
+                                          info])
                     ch.setData(2, ROLE_FIELD, (did, f))
-                    ch.setFlags(ch.flags() | Qt.ItemFlag.ItemIsEditable)
-                    ch.setToolTip(2, "double-click to edit")
+                    ch.setToolTip(0, f.name)
+                    if dd.writable:
+                        ch.setFlags(ch.flags() | Qt.ItemFlag.ItemIsEditable)
+                        ch.setToolTip(2, "double-click to edit")
+                    else:
+                        ch.setToolTip(2, "read-only DID")
                     it.addChild(ch)
             self.refresh_did(did)
         self.status.setText(f"{len(self.items)} DID(s) shown; definition "
@@ -1120,7 +1163,7 @@ class DirectConfigTab(QWidget):
     def _access(self, dd):
         if not dd:
             return ""
-        s = f"read {dd.rd or '?'}"
+        s = f"read {dd.rd}" if dd.rd else "read (default session)"
         if dd.writable:
             s += f" · write {dd.wr or '?'}"
             lvl = B.ford_level_to_seed(dd.wr_sec)
@@ -1172,13 +1215,94 @@ class DirectConfigTab(QWidget):
     def _lvl(text):
         return None if text in ("none", "auto") else int(text.split()[1], 16)
 
-    def read_module(self):
+    def read_selected(self):
+        d = self.selected_dids()
+        if not d:
+            QMessageBox.information(self, APP, "Select DID rows first.")
+            return
+        self.read_module(d)
+
+    def _read_groups(self, dids):
+        sess_over = self.rd_sess.currentText()
+        groups = {}
+        for d in dids:
+            dd = self.dids.get(d)
+            s = (None if sess_over == "01" else int(sess_over, 16)) if sess_over != "auto" \
+                else B.first_session(dd.rd if dd else "")
+            groups.setdefault(s, []).append(d)
+        return groups
+
+    def _got(self, d, p, e):
+        """A fresh read. Keeps the user's pending edit of a writable DID."""
+        if p is not None:
+            edited = d in self.cur and d in self.orig and self.cur[d] != self.orig[d]
+            self.orig[d] = p
+            if not edited:
+                self.cur[d] = p
+            self.errors.pop(d, None)
+        else:
+            self.errors[d] = e
+        if d in self.items:
+            self.refresh_did(d)
+
+    def toggle_poll(self, on):
+        if not on:
+            self.m.worker.cancel.set()
+            return
+        try:
+            t = self.m.target()
+        except B.OpError as e:
+            QMessageBox.warning(self, APP, str(e))
+            self.poll_btn.setChecked(False)
+            return
+        dids = self.selected_dids() or self.shown_dids()
+        if not dids:
+            self.poll_btn.setChecked(False)
+            return
+        if len(dids) > 40 and not self.m.confirm(
+                "Live poll", f"Poll {len(dids)} DIDs? Select fewer rows for a faster refresh."):
+            self.poll_btn.setChecked(False)
+            return
+        groups = self._read_groups(dids)
+        sessions = [s for s in groups if s is not None]
+        lvl = self._lvl(self.rd_lvl.currentText())
+        interval = self.poll_s.value()
+
+        def job(ctx):
+            with B.Link(t, "livepoll") as ln:
+                ln.wake()
+                if sessions:
+                    ln.session(max(sessions))
+                    ln.start_keepalive()
+                if lvl:
+                    ln.unlock(lvl)
+                n = 0
+                while not ctx.cancel.is_set():
+                    for d in dids:
+                        if ctx.cancel.is_set():
+                            break
+                        p, err = ln.read(d, timeout=1.0)
+                        ctx.post((d, p, err))
+                    n += 1
+                    ctx.cancel.wait(interval)
+                ln.stop_keepalive()
+                if sessions:
+                    ln.session(0x01)
+            print(f"   live poll stopped after {n} round(s)")
+
+        if not self.m.run_job(f"live poll {len(dids)} DID(s) on {t.name}", job,
+                              lambda r, e: self.poll_btn.setChecked(False),
+                              on_post=lambda o: self._got(*o)):
+            self.poll_btn.setChecked(False)
+
+    def read_module(self, dids=None):
         try:
             t = self.m.target()
         except B.OpError as e:
             QMessageBox.warning(self, APP, str(e))
             return
-        dids = self.shown_dids() if self.dids else sorted(self.cur)
+        if not dids:
+            dids = self.shown_dids() if self.dids else sorted(self.cur)
         if not dids:
             QMessageBox.information(self, APP, "Choose a definition first (or load a file).")
             return
@@ -1217,16 +1341,12 @@ class DirectConfigTab(QWidget):
             if not res:
                 return
             for d, (p, e) in res.items():
-                if p is not None:
-                    self.orig[d] = p
-                    self.cur[d] = p
-                    self.errors.pop(d, None)
-                else:
-                    self.errors[d] = e
+                self._got(d, p, e)
             self.populate()
             ok = sum(1 for p, _ in res.values() if p is not None)
             self.status.setText(f"read {ok}/{len(res)} DID(s) from {t.name}")
-            self._auto_backup(t)
+            if any(self.dids.get(d) is None or self.dids[d].writable for d in res):
+                self._auto_backup(t)
 
         self.m.run_job(f"read {len(dids)} DID(s) from {t.name}", job, done)
 

@@ -102,7 +102,7 @@ job or sends Ctrl-C to a running CLI job.
 |---|---|---|
 | Modules | scan every registered module: present/silent, F111/F188/F110/F113/F124/VIN, best definition | in-process |
 | Flash | add VBFs (header, part, CRC check), all `flash` options, dry-run plan → confirm → flash with progress; `info`/`verify` | CLI subprocess |
-| Direct config | identify the module, pick its definition, read all writable DIDs, edit fields (enum combos / numbers / ASCII / raw hex), write changed DIDs with session + SecurityAccess, read-back verify; load/save UCDS *Direct Configuration* XML | in-process |
+| Module data & config | identify the module, pick its definition; **Show** config (writable), diagnostic data (read-only: switches, lamps, battery, TPMS… decoded per bit with scaling) or all, filter by text, read shown/selected, **Live poll** selected DIDs; read all writable DIDs, edit fields (enum combos / numbers / ASCII / raw hex), write changed DIDs with session + SecurityAccess, read-back verify; load/save UCDS *Direct Configuration* XML | in-process |
 | Central config (CCC) | read the 512-byte CCC from BCM/IPC (address from D12B, SBL + 35 upload), decode it with the CCF definition, edit, checksum auto-fixed, write back (fresh backup → confirm → `memwrite --erase-len` → read-back compare); load/save UCDS *As-Built* XML or .bin | CLI subprocess |
 | DIDs | raw read / write / poll (changes only, stop-on-value) with optional session/unlock | in-process |
 | DTCs | read with descriptions, scan all modules, clear one / clear ALL (7DF) | in-process |
@@ -114,16 +114,25 @@ DIDs, `.bin` for the CCC) before anything is written.
 **Picking a definition.** In order: the module's own Part II spec from
 **F110** (exact FDRS MDX), then sibling specs of the same family (marked
 *verify!*), then vehicle definitions for the chosen model / model year at that
-CAN address (the UCDS-extracted C520 IPC list first, then IDS ffdata/CCF
-synthesis, then IDS platform MDX), then any spec at that address. Search
+CAN address (IDS ffdata/CCF synthesis, then IDS platform MDX), then any spec
+at that address. Search
 covers spec, model and acronym. Field positions show `B<byte>.<bit>`
-(byte 0 first, bit 7 = MSB). Ford MDX `security_level_N` is SecurityAccess
+(byte 0 first, bit 7 = MSB). IDS ffdata scaling is converted on build:
+physical = (raw + offset) × resolution (e.g. BCM `402A` battery voltage
+0.05 V/bit + 6 V); ffdata carries no unit names, so synth values show
+without units. Ford MDX `security_level_N` is SecurityAccess
 `27 (2N-1)`, so config writes that publish level 2 unlock with `27 03`.
 
 **The definition DB** (`defs/vbflasher_defs.sqlite`, ~15 MB, committed) is one
 source-agnostic format built from IDSdb: 685 FDRS spec documents, ~10.6 k
 model/MY/module documents, 50 CCF central-config layouts, DTC text per module
-address. Layouts and DID sets are content-deduplicated; part-number lists and
+address. UCDS RAM extractions are merged into the same definitions, not kept
+apart: every C520/C520_EU IPC (0x720) and BCM (0x726) definition also carries
+the UCDS IPC level-3 list (`IPC/RE/config/ipc_did_defs.json`) and the BCM DIDs
+decoded from UCDS (`BCM/Research/docs/ucds`: `DE00` config, `40D7` battery
+quiescent-current statistics, `414C` battery-voltage statistics, plus catalogue
+names). A UCDS layout with fields replaces the IDS layout of the same DID; the
+IDS session/security for that DID is kept. Layouts and DID sets are content-deduplicated; part-number lists and
 security bytes are not copied. Rebuild after IDSdb changes:
 
 ```bash

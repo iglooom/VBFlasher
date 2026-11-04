@@ -15,6 +15,7 @@ metadata, provenance columns. Run again whenever IDSdb is rebuilt:
 
     python3 tools/build_defs.py [--idsdb ~/Projects/ford/IDSdb/build]
                                 [--ucds-ipc ~/Projects/ford/IPC/RE/config/ipc_did_defs.json]
+                                [--ucds-bcm ~/Projects/ford/BCM/Research/docs/ucds]
 """
 import argparse
 import hashlib
@@ -30,6 +31,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 DEFAULT_IDSDB = Path.home() / "Projects/ford/IDSdb/build"
 DEFAULT_UCDS_IPC = Path.home() / "Projects/ford/IPC/RE/config/ipc_did_defs.json"
+DEFAULT_UCDS_BCM = Path.home() / "Projects/ford/BCM/Research/docs/ucds"
 OUT = HERE / "defs" / "vbflasher_defs.sqlite"
 
 SCHEMA = """
@@ -132,15 +134,43 @@ TYPE_MAP = {"enumerated": "enum", "unsigned": "uint", "signed": "sint",
             "bytes": "bytes", "ascii": "ascii", "bcd": "bcd", "DTC": "dtc"}
 
 
-def mdx_field(sf):
+def num(v):
+    """'1/20' / '0.2' / '-40' -> float, else None."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    try:
+        if "/" in s:
+            a, b = s.split("/", 1)
+            return float(a) / float(b)
+        return float(s)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def mdx_field(sf, origin="fdrs"):
     """Normalise one MDX subfield (lsb/msb count from the LSB of the WHOLE
-    payload). Returns None for header-only nodes without a bit span."""
+    payload). Returns None for header-only nodes without a bit span.
+
+    Scaling is stored as physical = raw * r + o. FDRS MDX already uses that
+    form (AM presets: 530 kHz + raw*10). IDS ffdata (origin 'synth') stores the
+    converter's field_offset in RAW counts, physical = (raw + offset) * res:
+    V_BATT_BCM res 1/20 offset 120 -> 6.0..18.75 V, HBC#1 2/1 offset -128 ->
+    symmetric current. So the synth offset is converted to offset*res here.
+    """
     lsb, msb = to_int(sf.get("lsb")), to_int(sf.get("msb"))
     if lsb is None or msb is None or msb < lsb:
         return None
-    f = {"n": (sf.get("name") or "").strip() or sf.get("id") or "?",
-         "l": lsb, "m": msb,
+    code = (sf.get("name") or "").strip()
+    nice = (sf.get("ids_mnemonic") or "").strip()
+    if origin == "synth" and nice and nice != code:
+        name, key = nice, code            # readable text, ffdata mnemonic as key
+    else:
+        name, key = code or sf.get("id") or "?", None
+    f = {"n": name, "l": lsb, "m": msb,
          "t": TYPE_MAP.get(sf.get("data_type"), "uint" if msb - lsb < 64 else "bytes")}
+    if key:
+        f["k"] = key
     if sf.get("enum"):
         e = []
         for o in sf["enum"]:
@@ -154,17 +184,32 @@ def mdx_field(sf):
     u = sf.get("units")
     if u not in SKIP_UNITS:
         f["u"] = u
-    for k, key, neutral in (("resolution", "r", 1.0), ("offset", "o", 0.0)):
-        try:
-            fv = float(sf.get(k))
-        except (TypeError, ValueError):
-            continue
-        if fv != neutral:
-            f[key] = fv
+    res = num(sf.get("resolution"))
+    off = num(sf.get("offset"))
+    if res is not None and res != 1.0:
+        f["r"] = res
+    if off:
+        f["o"] = off * (res if (origin == "synth" and res is not None) else 1.0)
     d = sf.get("description")
-    if d and isinstance(d, str) and d.strip() and d.strip() != f["n"]:
+    if d and isinstance(d, str) and d.strip() and d.strip() not in (f["n"], code):
         f["d"] = d.strip()[:300]
     return f
+
+
+def pick_subfields(subs):
+    """ffdata synth lists a parameter once per operation (read encoding and
+    write/IO-control encoding). For decoding keep the read alternatives when
+    any exist, then drop exact duplicates."""
+    if any(s.get("ids_operation") == "read" for s in subs):
+        subs = [s for s in subs if s.get("ids_operation") in (None, "read")]
+    seen, out = set(), []
+    for s in subs:
+        k = (s.get("name"), s.get("lsb"), s.get("msb"))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+    return out
 
 
 class Writer:
@@ -176,6 +221,8 @@ class Writer:
         self.db.executescript(SCHEMA)
         self.layouts = {}
         self.sets = {}
+        self.nfields = {}          # layout id -> field count
+        self.supp = []             # (address, model prefix, {did: (lid, wr, sec)}, tag)
 
     def layout(self, name, size, did_type, fields):
         blob = json.dumps(fields, separators=(",", ":"), ensure_ascii=False)
@@ -186,6 +233,7 @@ class Writer:
                 "INSERT INTO layout(sha,name,size,did_type,fields) VALUES(?,?,?,?,?)",
                 (sha, name, size, did_type, zlib.compress(blob.encode(), 9)))
             lid = self.layouts[sha] = cur.lastrowid
+            self.nfields[lid] = len(fields)
         return lid
 
     def didset(self, items):
@@ -200,8 +248,33 @@ class Writer:
                 [(sid,) + it for it in items])
         return sid, len(items), sum(1 for it in items if it[3] is not None)
 
+    def merge_supp(self, address, model, origin, items):
+        """Fold UCDS-extracted DIDs into a vehicle definition of the same
+        module/vehicle family. A UCDS layout with fields replaces an IDS layout
+        for the same DID (it is the real tool's decode for this generation);
+        the IDS access (sessions/security) is kept when it has one."""
+        for addr, prefix, dids, tag in self.supp:
+            if addr != address or not (model or "").startswith(prefix):
+                continue
+            items = list(items)
+            for did, (lid, wr, sec) in dids.items():
+                olds = [it for it in items if it[0] == did]
+                if not olds:
+                    items.append((did, lid, "", wr, sec))
+                    continue
+                old = olds[0]
+                if self.nfields.get(lid, 0) >= max(1, self.nfields.get(old[1], 0)):
+                    items = [it for it in items if it[0] != did]
+                    items.append((did, lid, old[2], old[3] if old[3] is not None else wr,
+                                  old[4] if old[3] is not None else sec))
+            if tag not in origin:
+                origin = f"{origin}+{tag}"
+        return origin, items
+
     def module(self, kind, spec, model, year, acronym, title, address, origin,
                priority, items):
+        if kind == "vehicle" and self.supp:
+            origin, items = self.merge_supp(address, model, origin, items)
         if not items:
             return None
         sid, n, ncfg = self.didset(items)
@@ -213,7 +286,7 @@ class Writer:
         return cur.lastrowid
 
 
-def did_items(w, rows):
+def did_items(w, rows, origin="fdrs"):
     """rows: (number, name, byte_size, did_type, access, subfields)."""
     items = []
     for number, name, size, did_type, access, subfields in rows:
@@ -224,15 +297,24 @@ def did_items(w, rows):
         fields = []
         if subfields:
             try:
-                for sf in json.loads(subfields):
-                    f = mdx_field(sf)
+                for sf in pick_subfields(json.loads(subfields)):
+                    f = mdx_field(sf, origin)
                     if f is not None:
                         if size and f["m"] >= size * 8:
                             continue
                         fields.append(f)
             except ValueError:
                 pass
-        lid = w.layout((name or "").strip() or f"DID {did:04X}", size, did_type, fields)
+        name = (name or "").strip()
+        if origin == "synth" and fields:
+            # synth names are a mnemonic (V_BATT_BCM) or "N ffdata parameter(s)
+            # at 0x...": use the readable field text instead
+            texts = list(dict.fromkeys(f["n"] for f in fields))
+            if len(texts) == 1:
+                name = texts[0]
+            elif re.match(r"^\d+ ffdata parameter", name):
+                name = "; ".join(texts[:3]) + (f" (+{len(texts) - 3})" if len(texts) > 3 else "")
+        lid = w.layout(name or f"DID {did:04X}", size, did_type, fields)
         rd, wr, sec = parse_access(access)
         items.append((did, lid, rd, wr, sec))
     return items
@@ -280,7 +362,7 @@ def build_mdx(w, mdx):
         a = to_int(addr)
         if a is None:
             continue
-        items = did_items(w, c.execute(q_did, (fid,)))
+        items = did_items(w, c.execute(q_did, (fid,)), "synth")
         if w.module("vehicle", None, model, year, mod, f"{mod} ({model} {year})", a,
                     "synth", 2, items):
             n += 1
@@ -384,44 +466,89 @@ def build_ccc(w, ccfdb):
     print(f"   central config definitions: {n}")
 
 
-def build_ucds_ipc(w, path):
-    """C520 IPC DIDs extracted from UCDS process RAM. Only bit-positioned
-    fields; lsb/msb already count from the LSB of the whole payload."""
+def _ucds_fields(raw, size):
+    fields = []
+    for f in raw:
+        if f.get("bit_start") is None or f.get("bit_end") is None:
+            continue
+        lo, hi = sorted((int(f["bit_start"]), int(f["bit_end"])))
+        if size and hi >= size * 8:
+            continue
+        ff = {"n": f.get("name") or "?", "l": lo, "m": hi,
+              "t": "enum" if f.get("enum") else "uint"}
+        if f.get("enum"):
+            ff["e"] = [[int(v), str(t)] for v, t in f["enum"]]
+        if f.get("unit") not in SKIP_UNITS:
+            ff["u"] = f["unit"]
+        mul, div = f.get("mul") or 1, f.get("div") or 1
+        if mul != 1 or div != 1:
+            ff["r"] = mul / div
+        fields.append(ff)
+    return fields
+
+
+def load_ucds_ipc(w, path):
+    """C520 IPC DIDs extracted from UCDS process RAM (the 'KUGA 2 / Escape
+    [C520] 2017-2019 - IPC LEVEL3' list). Bit numbers count from the payload
+    LSB, as in MDX."""
     if not path or not Path(path).exists():
         print("   ucds ipc: skipped (file not found)")
         return
     d = json.load(open(path))
-    items = []
+    dids = {}
     for did_hex, fl in d.items():
         did = to_int("0x" + did_hex)
         if did is None:
             continue
-        size = None
-        name = None
-        fields = []
-        for f in fl:
-            size = size or to_int(f.get("byte_size"))
-            if f.get("bit_start") is None or f.get("bit_end") is None:
-                name = name or f.get("name")
-                continue
-            lo, hi = sorted((int(f["bit_start"]), int(f["bit_end"])))
-            if size and hi >= size * 8:
-                continue
-            ff = {"n": f.get("name") or "?", "l": lo, "m": hi,
-                  "t": "enum" if f.get("enum") else "uint"}
-            if f.get("enum"):
-                ff["e"] = [[int(v), str(t)] for v, t in f["enum"]]
-            if f.get("unit") not in SKIP_UNITS:
-                ff["u"] = f["unit"]
-            fields.append(ff)
+        size = next((to_int(f.get("byte_size")) for f in fl if f.get("byte_size")), None)
+        name = next((f.get("name") for f in fl if f.get("bit_start") is None
+                     and f.get("name")), None)
+        fields = _ucds_fields(fl, size)
         if size is None and fields:
             size = (max(f["m"] for f in fields) + 8) // 8
         lid = w.layout(name or f"DID {did:04X}", size, "ucds", fields)
         wr = "03" if did_hex.upper().startswith("DE") else None
-        items.append((did, lid, "", wr, "2" if wr else None))   # Ford level 2 = 27 03
-    w.module("vehicle", None, "C520", None, "IPC", "IPC (C520, UCDS level-3 list)",
-             0x720, "ucds", 1, items)
-    print(f"   ucds ipc DIDs: {len(items)}")
+        dids[did] = (lid, wr, "2" if wr else None)       # Ford level 2 = 27 03
+    w.supp.append((0x720, "C520", dids, "ucds"))
+    print(f"   ucds ipc DIDs: {len(dids)}")
+
+
+def load_ucds_bcm(w, folder):
+    """C520 BCM (JV6T) DIDs decoded from UCDS process RAM: one
+    *_decoded.json per opened DID (field tables verified against the UCDS
+    screen) plus catalogue names for DIDs whose fields were not extracted."""
+    folder = Path(folder) if folder else None
+    if not folder or not folder.is_dir():
+        print("   ucds bcm: skipped (folder not found)")
+        return
+    names = {}
+    cat = folder / "bcm_did_catalog.json"
+    if cat.exists():
+        for k, v in json.load(open(cat)).get("catalog", {}).items():
+            names[to_int("0x" + k)] = v.get("name")
+    inv = folder / "DID_INVENTORY.md"          # "Confirmed catalogue labels" table
+    if inv.exists():
+        for m in re.finditer(r"^\| `([0-9A-F]{4})` \| #\d+ \| ([^|]+?) \|", inv.read_text(),
+                             re.M):
+            names.setdefault(int(m.group(1), 16), m.group(2).strip())
+    dids = {}
+    for fn in sorted(folder.glob("*_decoded.json")):
+        d = json.load(open(fn))
+        did = to_int("0x" + d["did"]) if d.get("did") else (
+            0xDE00 if fn.name.lower().startswith("de00") else None)
+        if did is None:
+            continue
+        size = d.get("blob_len") or (len(d.get("blob_hex", "")) // 2 or None)
+        fields = _ucds_fields(d.get("params") or [], size)
+        lid = w.layout(names.get(did) or f"DID {did:04X}", size, "ucds", fields)
+        wr = "03" if 0xDE00 <= did <= 0xDEFF else None
+        dids[did] = (lid, wr, None)
+    for did, name in names.items():
+        if did is not None and did not in dids and name:
+            dids[did] = (w.layout(name, None, "ucds", []), None, None)
+    w.supp.append((0x726, "C520", dids, "ucds"))
+    print(f"   ucds bcm DIDs: {len(dids)} "
+          f"({sum(1 for v in dids.values() if w.nfields.get(v[0]))} with fields)")
 
 
 def main():
@@ -429,6 +556,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--idsdb", default=str(DEFAULT_IDSDB))
     ap.add_argument("--ucds-ipc", default=str(DEFAULT_UCDS_IPC))
+    ap.add_argument("--ucds-bcm", default=str(DEFAULT_UCDS_BCM))
     ap.add_argument("-o", "--out", default=str(OUT))
     a = ap.parse_args()
     src = Path(a.idsdb).expanduser()
@@ -437,14 +565,16 @@ def main():
     w = Writer(tmp)
     t0 = time.time()
     print(f"building {out} from {src}")
+    # UCDS extractions are loaded first and folded into every IDS vehicle
+    # definition of the same address + vehicle family while those are built
+    load_ucds_ipc(w, Path(a.ucds_ipc).expanduser())
+    load_ucds_bcm(w, Path(a.ucds_bcm).expanduser())
     build_mdx(w, src / "mdx_data.sqlite")
     build_ccc(w, src / "ccf.sqlite")
-    build_ucds_ipc(w, Path(a.ucds_ipc).expanduser())
     w.db.executemany("INSERT INTO meta VALUES(?,?)", [
         ("format", "1"),
         ("built", time.strftime("%Y-%m-%d %H:%M:%S")),
-        ("source", "IDSdb mdx_data.sqlite + ccf.sqlite" +
-         (" + UCDS IPC" if Path(a.ucds_ipc).exists() else "")),
+        ("source", "IDSdb mdx_data.sqlite + ccf.sqlite + UCDS C520 IPC/BCM extractions"),
         ("bits", "field l/m = lsb/msb counted from the LSB of the whole payload"),
     ])
     w.db.commit()
