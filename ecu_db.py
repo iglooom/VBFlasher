@@ -53,6 +53,9 @@ from typing import Optional
 BUS_DEFAULT_IFACES = {
     "HS-CAN": "can0",
     "MS-CAN": "can1",
+    # SYNC 3 infotainment bus (APIM / ACM / FCIM side of the cluster gateway).
+    # Not part of the default ALL scan unless the interface exists.
+    "I-CAN": "can2",
 }
 
 
@@ -410,6 +413,24 @@ ECUS = {
             SblRule("BM5T-14D356-C", "BM5T-14D360-CA.vbf"),
             SblRule("CM5T-14F180-C", "BM5T-14D360-CB.vbf"),
         ),
+    ),
+    0x7A7: EcuProfile(
+        name="FCIM (front controls / Mini EFP)", txid=0x7A7, bus="I-CAN",
+        aliases=("FCIM", "EFP", "BEZEL"),
+        # TRW "Mini EFP" button panel of SYNC 3 Kugas, Renesas R8C/23 (M16C core,
+        # on-chip CAN). Live: F188 F1CT-14F565-HC, F111 F1CT-14F571-HB, F113
+        # F1CT-18K811-HC (car, can2). Diag 0x7A7 -> 0x7AF on I-CAN; also takes the
+        # 0x7DF functional request (CAN slot table at 0x141AA of the application).
+        # Application VBFs F1ET-14F565-HC / CJ5T-14F565-HG: 0x4000..0xBFFF +
+        # 0x14000..0x1BFFF; SBL F1ET-14F567-HA (729 B, load + call 0x400).
+        # Firmware analysis: /home/gl/Projects/ford/FCIM (Ghidra project ghidra/FCIM.gpr).
+        # Secret INFERRED: the application's SecurityAccess table at 0x14954 (FUN_007296
+        # picks 0x14954 + 5*index) holds 50C86A49F1 at index 0 (= the live-proven CV4T
+        # ACM secret), index 2 33992D5248. Keygen not traced; 0x27 is refused outside
+        # the programming session (NRC 7F in 10 03), so the first flash is the test.
+        secrets=(SecretRule("", None, "50C86A49F1"),),
+        sbls=(SblRule("", "F1ET-14F567-HA.vbf"),),
+        finalize=True,
     ),
     0x7D0: EcuProfile(
         name="APIM", txid=0x7D0, bus="MS-CAN",

@@ -331,6 +331,9 @@ class Main(QMainWindow):
         tb.addWidget(QLabel(" MS-CAN→"))
         self.ms_combo = QComboBox()
         tb.addWidget(self.ms_combo)
+        tb.addWidget(QLabel(" I-CAN→"))
+        self.ic_combo = QComboBox()
+        tb.addWidget(self.ic_combo)
         tb.addSeparator()
         self.busy_lbl = QLabel("  idle  ")
         tb.addWidget(self.busy_lbl)
@@ -356,7 +359,8 @@ class Main(QMainWindow):
         k = self.iface_combo.findData(cur)
         self.iface_combo.setCurrentIndex(max(0, k))
         self.iface_combo.blockSignals(False)
-        for combo, key, dflt in ((self.hs_combo, "hs", "can0"), (self.ms_combo, "ms", "can1")):
+        for combo, key, dflt in ((self.hs_combo, "hs", "can0"), (self.ms_combo, "ms", "can1"),
+                                  (self.ic_combo, "ic", "can2")):
             val = combo.currentText() or self.settings.value(key, dflt)
             combo.clear()
             combo.addItems(sorted(set(ifs) | {dflt}))
@@ -375,7 +379,8 @@ class Main(QMainWindow):
         if profile is None:
             return "can0"
         return {"HS-CAN": self.hs_combo.currentText(),
-                "MS-CAN": self.ms_combo.currentText()}.get(profile.bus) or profile.default_iface()
+                "MS-CAN": self.ms_combo.currentText(),
+                "I-CAN": self.ic_combo.currentText()}.get(profile.bus) or profile.default_iface()
 
     def iface_override(self):
         return self.iface_combo.currentData() or ""
@@ -498,6 +503,7 @@ class Main(QMainWindow):
         self.settings.setValue("iface", self.iface_combo.currentData())
         self.settings.setValue("hs", self.hs_combo.currentText())
         self.settings.setValue("ms", self.ms_combo.currentText())
+        self.settings.setValue("ic", self.ic_combo.currentText())
         self.settings.setValue("tab", self.tabs.currentIndex())
         for t in (self.direct_tab, self.central_tab):
             t.save_settings()
@@ -542,7 +548,7 @@ class ModulesTab(QWidget):
         lay.addWidget(self.tbl)
         lay.addWidget(QLabel(
             "Scan reads identity DIDs from every registered module on its bus "
-            "(HS-CAN/MS-CAN mapping in the toolbar; the Interface override applies to "
+            "(HS-CAN/MS-CAN/I-CAN mapping in the toolbar; the Interface override applies to "
             "all when set). Double-click a row to make it the current module."))
 
     def _row(self, txid):

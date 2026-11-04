@@ -1321,11 +1321,24 @@ def _profile_iface(profile, override):
     return override or profile.default_iface()
 
 
-def _all_ifaces(override):
-    """Interfaces needed for ALL: override once, or every registered bus."""
+# Buses every ALL operation covers. Other registered buses (I-CAN) are added only to
+# the read-only scans (ident / dtc ALL) and only when their interface exists, so a
+# functional cleardtc / reset / silence broadcast never reaches a new bus implicitly.
+_ALL_CORE_BUSES = ("HS-CAN", "MS-CAN")
+
+
+def _all_ifaces(override, optional=False):
+    """Interfaces needed for ALL: override once, or the HS/MS buses. With
+    optional=True (read-only scans) also every other registered bus whose
+    interface exists on this host."""
     if override:
         return [override]
-    return sorted({p.default_iface() for p in ecu_db.ECUS.values()})
+    core = {p.default_iface() for p in ecu_db.ECUS.values() if p.bus in _ALL_CORE_BUSES}
+    if optional:
+        core |= {p.default_iface() for p in ecu_db.ECUS.values()
+                 if p.bus not in _ALL_CORE_BUSES
+                 and os.path.exists(f"/sys/class/net/{p.default_iface()}")}
+    return sorted(core)
 
 
 def _check_iface(iface):
@@ -1698,7 +1711,7 @@ def _ident_all(args):
     A module that does not answer (not present on this bus / asleep) is noted
     and skipped, not fatal. Uses a short wake so absent modules don't stall.
     """
-    ifaces = _all_ifaces(args.iface)
+    ifaces = _all_ifaces(args.iface, optional=True)
     _check_ifaces(ifaces)
     # Keep the presence probe FAST — a full 8×0.5s wake per absent module would
     # make a 12-module scan crawl. Cap it; the user's --wake-* still cap it down.
@@ -1711,6 +1724,11 @@ def _ident_all(args):
         profile = ecu_db.ECUS[txid]
         iface = _profile_iface(profile, args.iface)
         rxid = profile.resp_id()
+        if iface not in ifaces:                 # optional bus without an interface
+            absent.append(profile)
+            print(f"\n-- {profile.name}  tx=0x{txid:03X}  {profile.bus} "
+                  f"interface {iface} not present, skipped")
+            continue
         ecu = Ecu(iface, txid, rxid, execute=True)
         # quick probe: is anything home? (bounded, so absent modules are fast)
         if ecu.wake(tries=tries, timeout=wtmo) is None \
@@ -1766,7 +1784,7 @@ def _dtc_all(args):
     Per module: actual (real-fault) count and total count. Use `dtc <ECU>` to
     list one module in full. Absent/silent modules are skipped fast.
     """
-    ifaces = _all_ifaces(args.iface)
+    ifaces = _all_ifaces(args.iface, optional=True)
     _check_ifaces(ifaces)
     tries = min(getattr(args, "wake_tries", 2), 2)
     wtmo = min(getattr(args, "wake_timeout", 0.3), 0.3)
@@ -1779,9 +1797,13 @@ def _dtc_all(args):
     for txid in sorted(ecu_db.ECUS):
         profile = ecu_db.ECUS[txid]
         iface = _profile_iface(profile, args.iface)
-        ecu = Ecu(iface, txid, profile.resp_id(), execute=True)
         label = (f"{profile.name.split()[0]} "
                  f"(0x{txid:03X}/0x{profile.resp_id():03X}, {iface})")
+        if iface not in ifaces:                 # optional bus without an interface
+            silent.append(profile)
+            print("   %-39s %8s %8s" % (label, "n/a", "n/a"))
+            continue
+        ecu = Ecu(iface, txid, profile.resp_id(), execute=True)
         # Fast presence probe first: absent modules cost only the short wake,
         # not a full DTC-read timeout. A present module then gets a generous
         # read window (its 19 02 can be a large multi-frame response).
@@ -2446,9 +2468,16 @@ def selftest():
         _actual_ms == _expected_ms
         and all(ecu_db.ECUS[x].default_iface() == "can1" for x in _actual_ms),
         f"actual={sorted(hex(x) for x in _actual_ms)}")
+    _expected_ic = {0x7A7}
+    _actual_ic = {txid for txid, p in ecu_db.ECUS.items() if p.bus == "I-CAN"}
+    chk("all registered I-CAN modules default to can2",
+        _actual_ic == _expected_ic
+        and all(ecu_db.ECUS[x].default_iface() == "can2" for x in _actual_ic),
+        f"actual={sorted(hex(x) for x in _actual_ic)}")
     chk("all other registered modules are HS-CAN on can0",
         all(p.bus == "HS-CAN" and p.default_iface() == "can0"
-            for txid, p in ecu_db.ECUS.items() if txid not in _expected_ms))
+            for txid, p in ecu_db.ECUS.items()
+            if txid not in _expected_ms | _expected_ic))
     _iface_for = globals().get("_profile_iface")
     chk("interface resolver exists", callable(_iface_for))
     if callable(_iface_for):
@@ -2462,6 +2491,16 @@ def selftest():
         chk("ALL defaults cover HS can0 and MS can1",
             _all_iface_fn(None) == ["can0", "can1"],
             str(_all_iface_fn(None)))
+        _real_exists = os.path.exists
+        try:
+            os.path.exists = lambda p: False if p.startswith("/sys/class/net/") else _real_exists(p)
+            chk("read-only ALL skips an absent I-CAN interface",
+                _all_iface_fn(None, optional=True) == ["can0", "can1"])
+            os.path.exists = lambda p: True if p.startswith("/sys/class/net/") else _real_exists(p)
+            chk("read-only ALL adds I-CAN can2 when present",
+                _all_iface_fn(None, optional=True) == ["can0", "can1", "can2"])
+        finally:
+            os.path.exists = _real_exists
         chk("ALL --iface override uses only override",
             _all_iface_fn("vcan7") == ["vcan7"])
     _bp = build_parser()
