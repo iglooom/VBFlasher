@@ -59,6 +59,7 @@ sys.path.insert(0, HERE)
 
 import ecu_db                                            # noqa: E402
 import ford_seckey                                       # noqa: E402
+import cgea_seckey                                       # noqa: E402
 from vbf import (Vbf, Ecu, BusQuiet, Keepalive, FlashProgress, download_blocks,  # noqa: E402
                  human, fmt, iface_is_up, dtc_code, dtc_status_str,
                  dtc_is_actual, functional_broadcast, PblFlood,
@@ -79,6 +80,55 @@ SEED_DELAY = 1.0
 # FORScan's measured rate in the ABS recovery captures (171 frames in 2.058 s).
 FLOOD_INTERVAL = 0.012
 CATCH_PROBE = 0.05
+
+
+def seed_len(algo):
+    """Seed bytes in the 67 <lvl> response for keygen `algo`."""
+    if algo == "ford":
+        return 3
+    return cgea_seckey.ALGOS[algo][0]
+
+
+def compute_key(algo, secret, seed):
+    """Key bytes for 27 <lvl+1>. `algo` is an ecu_db SecretRule.algo."""
+    if algo == "ford":
+        return ford_seckey.key_from_seed(list(seed), secret)
+    if algo not in cgea_seckey.ALGOS:
+        raise SystemExit(f"unknown SecurityAccess algorithm {algo!r}")
+    return cgea_seckey.ALGOS[algo][1](bytes(seed), secret)
+
+
+def secret_from_arg(val, algo="ford"):
+    """--secret is parsed as an int; the Ford LFSR wants exactly 5 bytes, the
+    byte-string secrets (CGEA: 12 ASCII bytes) their natural length."""
+    if not isinstance(val, int):
+        return bytes(val)
+    if algo == "ford":
+        return val.to_bytes(5, "big")
+    return val.to_bytes(max(1, (val.bit_length() + 7) // 8), "big")
+
+
+def security_exchange(ecu, level, secret, algo="ford"):
+    """27 <level> requestSeed -> keygen -> 27 <level+1> sendKey. Seed length
+    follows the algorithm (3 bytes Ford LFSR, 16 bytes CGEA HMAC). An
+    all-zero seed means the level is already unlocked."""
+    r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
+                   timeout=5.0)
+    if r is None:                       # dry-run: nothing on the wire
+        return
+    n = seed_len(algo)
+    seed = bytes(r[2:2 + n])
+    if len(seed) != n:
+        raise SystemExit(f"27 {level:02X}: {algo} keygen expects a {n}-byte "
+                         f"seed, the module sent {len(r) - 2}: {fmt(r)}")
+    if not any(seed):
+        print(f"   seed {seed.hex().upper()} -> already unlocked")
+        return
+    key = compute_key(algo, secret, seed)
+    print(f"   seed {seed.hex().upper()} -> key {key.hex().upper()}"
+          + ("" if algo == "ford" else f"  ({algo})"))
+    ecu.expect(f"27{level + 1:02X}" + key.hex(), 0x67,
+               f"27 {level + 1:02X} sendKey", timeout=5.0)
 
 
 def settle_before_seed(delay=SEED_DELAY):
@@ -461,6 +511,11 @@ BOOT_MODE_APP = 0x01        # 62 D1 00 01 — application
 BOOT_MODE_PBL = 0x02        # 62 D1 00 02 — primary bootloader
 
 
+import errno as _errno
+# send() errnos that mean "nobody ACKs: the ECU is unpowered" during a catch.
+_ECU_OFF_ERRNOS = (_errno.ECOMM, _errno.ENOBUFS)
+
+
 def read_boot_mode(ecu, timeout=0.2):
     """Physical 22 D100 probe: which image is running. Returns the mode byte,
     or None when the module stays silent OR answers a negative response.
@@ -477,6 +532,15 @@ def read_boot_mode(ecu, timeout=0.2):
                     what="22 D100 boot mode (hint)")
     except TimeoutError:
         return None
+    except OSError as e:
+        # ECU unpowered during a --recovery catch: nobody ACKs, the adapter
+        # goes error-passive and send() fails with ECOMM/ENOBUFS. That is the
+        # expected "ECU off" state, not a reason to abort the catch. Anything
+        # else (ENETDOWN: interface down) is a real fault and must surface.
+        if e.errno not in _ECU_OFF_ERRNOS:
+            raise
+        time.sleep(0.02)
+        return None
     if (r is not None and len(r) >= 4 and r[0] == 0x62
             and r[1] == 0xD1 and r[2] == 0x00):
         return r[3]
@@ -491,6 +555,13 @@ def _try_session(ecu, what):
     except TimeoutError:
         # ISO-TP can time out in send() while the ECU is unpowered;
         # Ecu.req() only turns recv() timeouts into None.
+        return None
+    except OSError as e:
+        # Same state, other symptom: an un-ACKed bus makes send() fail with
+        # ECOMM/ENOBUFS (seen with the ECU switched off before the catch).
+        if e.errno not in _ECU_OFF_ERRNOS:
+            raise
+        time.sleep(0.02)
         return None
 
 
@@ -698,16 +769,18 @@ def flash_session(txid, files, args):
         raise SystemExit(2)
 
     level = args.sec_level
+    algo = profile.pick_algo(hw, level, sw)
     if args.skip_security:
         secret = None
         secret_reason = "SecurityAccess skipped"
     elif args.secret is not None:
-        secret = args.secret.to_bytes(5, "big") if isinstance(args.secret, int) \
-            else args.secret
+        secret = secret_from_arg(args.secret, algo)
         secret_reason = "explicit --secret"
     else:
         secret = profile.pick_secret(hw, level, sw)
         secret_reason = f"selected from {_sel_desc(hw, sw)} at security level {level}"
+    if algo != "ford":
+        secret_reason += f", keygen {algo}"
         if secret is None and args.execute:
             raise SystemExit(
                 f"no SecurityAccess secret registered for {profile.name} "
@@ -918,17 +991,7 @@ def flash_session(txid, files, args):
         if args.skip_security:
             print("   SecurityAccess SKIPPED (--skip-security)")
         else:
-            r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
-                           timeout=5.0)
-            seed = list(r[2:5])
-            if seed == [0, 0, 0]:
-                print("   seed 000000 -> already unlocked")
-            else:
-                key = ford_seckey.key_from_seed(seed, secret)
-                print(f"   seed {bytes(seed).hex().upper()} -> "
-                      f"key {key.hex().upper()}")
-                ecu.expect(f"27{level + 1:02X}" + key.hex(), 0x67,
-                           f"27 {level + 1:02X} sendKey", timeout=5.0)
+            security_exchange(ecu, level, secret, algo)
             print("   unlocked")
 
         ka.start()
@@ -1053,9 +1116,9 @@ def _open_sbl_session(profile, args, need_secret=True):
     print(f"   SBL: {sbl_name}  call=0x{sbl.call:08X}  ({sbl_reason})")
 
     level = args.sec_level
+    algo = profile.pick_algo(hw, level, sw)
     if args.secret is not None:
-        secret = (args.secret.to_bytes(5, "big")
-                  if isinstance(args.secret, int) else args.secret)
+        secret = secret_from_arg(args.secret, algo)
     else:
         secret = profile.pick_secret(hw, level, sw)
         if secret is None and need_secret:
@@ -1079,16 +1142,7 @@ def _open_sbl_session(profile, args, need_secret=True):
         raise SystemExit(f"10 02 programmingSession: {fmt(r)}")
     print(f"   OK   10 02 programmingSession        {fmt(r)}")
     settle_before_seed(getattr(args, "seed_delay", SEED_DELAY))
-    r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
-                   timeout=5.0)
-    seed = list(r[2:5])
-    if seed == [0, 0, 0]:
-        print("   seed 000000 -> already unlocked")
-    else:
-        key = ford_seckey.key_from_seed(seed, secret)
-        print(f"   seed {bytes(seed).hex().upper()} -> key {key.hex().upper()}")
-        ecu.expect(f"27{level + 1:02X}" + key.hex(), 0x67,
-                   f"27 {level + 1:02X} sendKey", timeout=5.0)
+    security_exchange(ecu, level, secret, algo)
     print("   unlocked")
 
     ka.start()
@@ -1212,6 +1266,357 @@ def do_memwrite(args):
 # --------------------------------------------------------------------------
 # subcommands
 # --------------------------------------------------------------------------
+BACKUP_SEG = 0x10000          # bytes per 35/36/37 transaction in `backup`
+
+
+def _crc16(data):
+    import binascii
+    return binascii.crc_hqx(bytes(data), 0xFFFF)
+
+
+def upload_segment(ecu, addr, length, addr_len_fmt=0x44):
+    """ONE 35 RequestUpload -> 36 x N -> 37 transaction, quietly.
+
+    Returns (data, echo) where echo is the CRC-16 a `77 <hi> <lo>` TransferExit
+    carries (None for a bare 77). Raises SystemExit on any refusal; a 37 is
+    ALWAYS sent once 35 was accepted, so a failed segment never leaves the ECU
+    with a dangling transfer (every later 35 would then answer NRC 22)."""
+    import struct
+    n = addr_len_fmt >> 4
+    m = addr_len_fmt & 0xF
+    rq = ("3500%02X" % addr_len_fmt + struct.pack(">I", addr)[-m:].hex()
+          + struct.pack(">I", length)[-n:].hex())
+    r = ecu.req(rq, timeout=10.0, what=f"35 RequestUpload @0x{addr:08X} +0x{length:X}")
+    if r is None or r[0] != 0x75:
+        raise SystemExit(f"35 RequestUpload @0x{addr:08X}: {fmt(r)}")
+    out = bytearray()
+    try:
+        bc = 1
+        while len(out) < length:
+            rr = ecu.req("36%02X" % bc, timeout=10.0)
+            if rr is None or rr[0] != 0x76 or len(rr) < 2 or rr[1] != bc:
+                raise SystemExit(f"36 TransferData(read) @0x{addr + len(out):08X} "
+                                 f"bc={bc:02X}: {fmt(rr)}")
+            if len(rr) == 2:
+                raise SystemExit(f"36 bc={bc:02X}: empty payload")
+            out += rr[2:]
+            bc = (bc + 1) & 0xFF
+    finally:
+        r37 = ecu.req("37", timeout=15.0, what="37 TransferExit")
+    if r37 is None or r37[0] != 0x77:
+        raise SystemExit(f"37 TransferExit @0x{addr:08X}: {fmt(r37)}")
+    from vbf import transfer_exit_crc
+    return bytes(out[:length]), transfer_exit_crc(r37)
+
+
+def read_region_sbl(ecu, region, fh, seg=BACKUP_SEG, retries=2,
+                    progress_interval=2.0, addr_len_fmt=0x44):
+    """Read a BackupRegion through the running SBL in `seg`-byte transactions.
+
+    Integrity: when the 37 echoes a CRC-16 it must equal the host CRC-16 of the
+    segment, else the segment is re-read (up to `retries`). If the echo keeps
+    disagreeing but two reads are byte-identical, the echo is evidently not a
+    CRC on this ECU: accept and count the segment as UNCHECKED. Returns
+    (crc_checked, unchecked) segment counts."""
+    checked = unchecked = 0
+    done = 0
+    t0 = t_last = time.time()
+    while done < region.length:
+        n = min(seg, region.length - done)
+        a = region.addr + done
+        prev = None
+        for attempt in range(retries + 1):
+            try:
+                data, echo = upload_segment(ecu, a, n, addr_len_fmt)
+            except SystemExit as e:
+                if attempt == retries:
+                    raise
+                print(f"\n      !! {e} -- retry {attempt + 1}/{retries}")
+                time.sleep(0.5)
+                continue
+            if len(data) != n:
+                raise SystemExit(f"@0x{a:08X}: got {len(data)} of {n} bytes")
+            if echo is None:
+                unchecked += 1
+                break
+            if echo == _crc16(data):
+                checked += 1
+                break
+            if prev is not None and prev == data:
+                print(f"\n      NOTE @0x{a:08X}: 37 echo {echo:04X} != CRC-16 "
+                      f"{_crc16(data):04X}, but two reads agree -> accepted unchecked")
+                unchecked += 1
+                break
+            prev = data
+            print(f"\n      !! @0x{a:08X}: 37 echo {echo:04X} != host CRC-16 "
+                  f"{_crc16(data):04X} -- re-reading")
+        else:
+            raise SystemExit(f"@0x{a:08X}: segment failed integrity {retries + 1}x")
+        fh.write(data)
+        done += n
+        now = time.time()
+        if now - t_last >= progress_interval or done >= region.length:
+            t_last = now
+            el = now - t0
+            rate = done / el if el else 0
+            eta = (region.length - done) / rate if rate else 0
+            print("\r      %-13s %5.1f%%  %s/%s  %.1f KiB/s  ETA %d:%02d   "
+                  % (region.name, 100.0 * done / region.length, human(done),
+                     human(region.length), rate / 1024, eta // 60, eta % 60),
+                  end="", flush=True)
+    print()
+    return checked, unchecked
+
+
+def read_region_vote(ecu, region, fh, mask_fh, seg=BACKUP_SEG, votes=3,
+                     progress_interval=2.0, addr_len_fmt=0x44):
+    """Read a blank_noise region `votes` times per segment; write the per-byte
+    majority to `fh` and a mask (1 = the reads disagreed) to `mask_fh`.
+
+    For flash whose ERASED cells read back random (RH850 data flash), the CRC
+    echo cannot gate the read: the device re-reads to compute it. Programmed
+    data is stable across reads, so agreement across `votes` reads is the
+    integrity check, and disagreement marks blank cells. A transport error still
+    raises. Returns (segments_stable_and_echo_ok, unstable_bytes)."""
+    stable_ok = unstable = 0
+    done = 0
+    t_last = time.time()
+    while done < region.length:
+        n = min(seg, region.length - done)
+        a = region.addr + done
+        reads, echo_ok = [], 0
+        for _ in range(votes):
+            data, echo = upload_segment(ecu, a, n, addr_len_fmt)
+            if len(data) != n:
+                raise SystemExit(f"@0x{a:08X}: got {len(data)} of {n} bytes")
+            reads.append(data)
+            echo_ok += echo is not None and echo == _crc16(data)
+        out = bytearray(n)
+        mask = bytearray(n)
+        for i in range(n):
+            col = [rd[i] for rd in reads]
+            v = max(set(col), key=col.count)
+            out[i] = v
+            if col.count(v) != len(col):
+                mask[i] = 1
+        bad = sum(mask)
+        unstable += bad
+        if bad == 0 and echo_ok == votes:
+            stable_ok += 1
+        fh.write(out)
+        mask_fh.write(mask)
+        done += n
+        if time.time() - t_last >= progress_interval or done >= region.length:
+            t_last = time.time()
+            print("\r      %-13s %5.1f%%  %s/%s  unstable %d B   " % (
+                region.name, 100.0 * done / region.length, human(done),
+                human(region.length), unstable), end="", flush=True)
+    print()
+    return stable_ok, unstable
+
+
+def read_region_rmba(ecu, region, fh, chunk=0x100, progress_interval=2.0):
+    """Read a BackupRegion with the APPLICATION's 23 24 <addr32> <len16>."""
+    done = 0
+    t_last = time.time()
+    while done < region.length:
+        n = min(chunk, region.length - done)
+        a = region.addr + done
+        r = ecu.req("2324%08X%04X" % (a, n), timeout=3.0,
+                    what=f"23 @0x{a:08X} +0x{n:X}")
+        if r is None or r[0] != 0x63 or len(r) - 1 != n:
+            raise SystemExit(f"23 ReadMemoryByAddress @0x{a:08X}: {fmt(r)}")
+        fh.write(bytes(r[1:]))
+        done += n
+        if time.time() - t_last >= progress_interval or done >= region.length:
+            t_last = time.time()
+            print("\r      %-13s %5.1f%%  %s/%s   " % (
+                region.name, 100.0 * done / region.length, human(done),
+                human(region.length)), end="", flush=True)
+    print()
+
+
+def _file_digest(path):
+    import hashlib
+    import zlib
+    h = hashlib.sha256()
+    c = 0
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+            c = zlib.crc32(blk, c)
+    return h.hexdigest(), c
+
+
+def do_backup(args):
+    """Full-module read-only backup: every region of the profile's backup map
+    for the live F111, into one directory, with a manifest.json."""
+    import json
+    from types import SimpleNamespace
+    profile = ecu_db.resolve(args.ecu)
+    if profile is None:
+        raise SystemExit(f"unknown ECU {args.ecu!r}. See `list`.")
+    txid = profile.txid
+    rxid = args.rxid if args.rxid is not None else profile.resp_id()
+    iface = _profile_iface(profile, args.iface)
+    _check_iface(iface)
+    print("=" * 72)
+    print(f"BACKUP  {profile.name}  tx=0x{txid:03X} rx=0x{rxid:03X} on {iface}")
+    print("=" * 72)
+
+    logf = open_run_log(args, profile.name, "backup-ident")
+    ecu = Ecu(iface, txid, rxid, execute=True, logfile=logf)
+    ident = read_identity(ecu, profile, args.wake_tries, args.wake_timeout)
+    hw = args.hw or ident.get("F111") or ""
+    regions = profile.pick_backup(hw)
+    if args.only:
+        want = {x.strip() for x in args.only.split(",") if x.strip()}
+        unknown = want - {r.name for r in regions}
+        if unknown:
+            raise SystemExit(f"--only: no such region(s) {sorted(unknown)}; "
+                             f"have {[r.name for r in regions]}")
+        regions = tuple(r for r in regions if r.name in want)
+    if not regions:
+        raise SystemExit(f"no backup map for {profile.name} F111 {hw!r} "
+                         "(ecu_db backup_regions). Use memread for a single region.")
+    total = sum(r.length for r in regions)
+    out_dir = args.outdir or os.path.join(
+        HERE, "backups", f"{time.strftime('%Y%m%d-%H%M%S')}_"
+        f"{(profile.aliases or (profile.name,))[0]}_{ident.get('F18C') or 'unknown'}")
+    print("\n   PLAN (read-only; nothing is erased or written):")
+    for r in regions:
+        how = (f"23 RMBA, app session {profile.rmba_session:02X} level "
+               f"{profile.rmba_level}" if r.via == "rmba" else "SBL 35 RequestUpload")
+        print(f"     {r.name:13s} 0x{r.addr:08X} +0x{r.length:08X} "
+              f"{human(r.length):>9s}  {how}  {r.note}")
+    print(f"   total {human(total)} -> {out_dir}")
+    # Upload speed is paced by the ECU, not the host: the CGEA IPMA SBL sends
+    # its ConsecutiveFrames at a fixed 1.0 ms even with FC STmin=0 (~6.8 KiB/s).
+    print("   upload is ECU-paced (CGEA IPMA ~6.8 KiB/s): budget ~%d min. "
+          "Ends with 11 01 ECUReset." % max(1, total / (6.8 * 1024) / 60))
+    if not args.yes:
+        if input("Proceed with the backup? [y/N] ").strip().lower() != "y":
+            print("aborted by user.")
+            return
+    os.makedirs(out_dir, exist_ok=True)
+    manifest = {"ecu": profile.name, "txid": txid, "rxid": rxid,
+                "started": time.strftime("%F %T"), "ident": ident,
+                "regions": []}
+    mpath = os.path.join(out_dir, "manifest.json")
+    if os.path.exists(mpath):
+        # Resuming into an earlier run's directory (e.g. --only the regions
+        # that failed): keep its finished regions, refuse a different module.
+        old = json.load(open(mpath))
+        for did in ("F111", "F18C", "F188", "F120", "F124", "F125"):
+            if (old.get("ident") or {}).get(did) != ident.get(did):
+                raise SystemExit(
+                    f"{mpath} belongs to a different module/software "
+                    f"({did} {old['ident'].get(did)!r} != live {ident.get(did)!r}); "
+                    "use a new --outdir")
+        manifest["regions"] = [x for x in old.get("regions", [])
+                               if x["name"] not in {r.name for r in regions}]
+        manifest["started"] = old.get("started", manifest["started"])
+        print(f"   resuming {mpath}: keeping "
+              f"{[x['name'] for x in manifest['regions']]}")
+
+    def finish(r, path, extra):
+        os.replace(path + ".part", path)
+        sha, crc = _file_digest(path)
+        manifest["regions"].append(dict(
+            name=r.name, addr=f"0x{r.addr:08X}", length=r.length, via=r.via,
+            note=r.note, file=os.path.basename(path), sha256=sha,
+            crc32=f"{crc:08X}", **extra))
+        print(f"   OK   {r.name}: {os.path.basename(path)}  sha256 {sha[:16]}..")
+
+    def path_of(r):
+        return os.path.join(out_dir, f"{r.name}_0x{r.addr:08X}.bin")
+
+    try:
+        # 1) regions the APPLICATION serves (before the SBL stops it)
+        rm = [r for r in regions if r.via == "rmba"]
+        if rm:
+            print(f"\n== application 23 ReadMemoryByAddress ==")
+            ua = SimpleNamespace(session=profile.rmba_session, unlock=True,
+                                 sec_level=profile.rmba_level, secret=None,
+                                 hw=hw, timeout=5.0, seed_delay=args.seed_delay)
+            _session_and_unlock(ua, profile, ecu)
+            ka = Keepalive(ecu, period=args.tp_interval).start()
+            try:
+                for r in rm:
+                    with open(path_of(r) + ".part", "wb") as fh:
+                        read_region_rmba(ecu, r, fh,
+                                         progress_interval=args.progress_interval)
+                    finish(r, path_of(r), {})
+            finally:
+                ka.stop()
+            ecu.req("1001", timeout=3.0, what="10 01 defaultSession")
+        if ecu.s is not None:
+            ecu.s.close()
+        ecu = None
+        if logf:
+            logf.close()
+            logf = None
+
+        # 2) everything else through the OEM SBL
+        sb = [r for r in regions if r.via == "sbl"]
+        if sb:
+            time.sleep(0.5)
+            args.hw = args.hw or hw
+            ecu, ka, quiet, logf = _open_sbl_session(profile, args)
+            try:
+                for r in sb:
+                    print(f"\n== {r.name} 0x{r.addr:08X} +0x{r.length:X} ==")
+                    if r.blank_noise:
+                        mpth = path_of(r)[:-4] + ".unstable"
+                        print(f"   erased cells read random here: {r.votes} "
+                              "reads per segment, majority + unstable mask")
+                        with open(path_of(r) + ".part", "wb") as fh, \
+                                open(mpth, "wb") as mfh:
+                            stab, unst = read_region_vote(
+                                ecu, r, fh, mfh, seg=args.segment,
+                                votes=r.votes,
+                                progress_interval=args.progress_interval,
+                                addr_len_fmt=args.addr_len_fmt)
+                        finish(r, path_of(r), {
+                            "votes": r.votes, "unstable_bytes": unst,
+                            "segments_stable_echo_ok": stab,
+                            "unstable_mask": os.path.basename(mpth)})
+                        continue
+                    with open(path_of(r) + ".part", "wb") as fh:
+                        chk, unchk = read_region_sbl(
+                            ecu, r, fh, seg=args.segment,
+                            progress_interval=args.progress_interval,
+                            addr_len_fmt=args.addr_len_fmt)
+                    finish(r, path_of(r), {"segments_crc_checked": chk,
+                                           "segments_unchecked": unchk})
+            finally:
+                ka.stop()
+                quiet.restore()
+    finally:
+        manifest["finished"] = time.strftime("%F %T")
+        order = {r.addr: i for i, r in enumerate(profile.backup_regions)}
+        manifest["regions"].sort(key=lambda x: order.get(int(x["addr"], 16), 99))
+        with open(os.path.join(out_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+        if ecu is not None:
+            try:
+                ecu.req("1101", timeout=8.0, what="11 01 ECUReset")
+                print("\n   11 01 ECUReset sent")
+                time.sleep(2.5)
+                fr = ecu.read_did("F188")
+                print(f"   post-reset F188: {fr or '-'}")
+            except Exception:  # noqa: BLE001
+                pass
+        if logf:
+            logf.close()
+    done = {r["name"] for r in manifest["regions"]}
+    missing = [r.name for r in regions if r.name not in done]
+    print(f"\n   manifest: {os.path.join(out_dir, 'manifest.json')}")
+    if missing:
+        raise SystemExit(f"backup INCOMPLETE, missing {missing}")
+    print("\n*** BACKUP DONE ***")
+
+
 def _split_flash_targets(args):
     """Split the positionals into VBF paths and bare ECU selectors.
 
@@ -1420,16 +1825,24 @@ def _session_and_unlock(args, profile, ecu):
     if not getattr(args, "unlock", False):
         return
     level = args.sec_level if args.sec_level is not None else 1
+    algo = getattr(args, "algo", None)       # GUI passes it with the secret
+    hw = args.hw or ""
+    # F111 picks the secret AND the keygen (module generation), so read it
+    # when either is still open; a profile with only Ford-LFSR rules needs
+    # it only when no --secret was given (unchanged behaviour).
+    multi_algo = any(getattr(r, "algo", "ford") != "ford"
+                     for r in getattr(profile, "secrets", ()))
+    if not hw and (args.secret is None or (algo is None and multi_algo)):
+        fr = ecu.req("22F111", timeout=args.timeout, what="22 F111")
+        if fr is not None and fr and fr[0] == 0x62 and len(fr) >= 3:
+            hw = _ascii_sanitize(fr[3:]).strip()
+            print(f"   F111: {hw!r}")
+    if algo is None:
+        algo = (profile.pick_algo(hw, level)
+                if hasattr(profile, "pick_algo") else "ford")
     if args.secret is not None:
-        secret = (args.secret.to_bytes(5, "big")
-                  if isinstance(args.secret, int) else args.secret)
+        secret = secret_from_arg(args.secret, algo)
     else:
-        hw = args.hw or ""
-        if not hw:
-            fr = ecu.req("22F111", timeout=args.timeout, what="22 F111")
-            if fr is not None and fr and fr[0] == 0x62 and len(fr) >= 3:
-                hw = _ascii_sanitize(fr[3:]).strip()
-                print(f"   F111: {hw!r}")
         secret = profile.pick_secret(hw, level)
         if secret is None:
             raise SystemExit(
@@ -1439,15 +1852,7 @@ def _session_and_unlock(args, profile, ecu):
     # module is not entering a bootloader, so the wait would be pure cost.
     if entered_session:
         settle_before_seed(getattr(args, "seed_delay", SEED_DELAY))
-    r = ecu.expect(f"27{level:02X}", 0x67, f"27 {level:02X} requestSeed",
-                   timeout=5.0)
-    seed = list(r[2:5])
-    if seed != [0, 0, 0]:
-        key = ford_seckey.key_from_seed(seed, secret)
-        print(f"   seed {bytes(seed).hex().upper()} -> key "
-              f"{key.hex().upper()}")
-        ecu.expect(f"27{level + 1:02X}" + key.hex(), 0x67,
-                   f"27 {level + 1:02X} sendKey", timeout=5.0)
+    security_exchange(ecu, level, secret, algo)
     print("   unlocked")
 
 
@@ -3442,7 +3847,7 @@ def selftest():
     try:
         for cmd in ("info", "verify", "ident", "readdid", "writedid", "dtc",
                     "cleardtc", "reset", "silence", "memread", "memwrite",
-                    "completion", "flash", "list"):
+                    "backup", "completion", "flash", "list"):
             sys.argv = ["x", cmd, "--help"]
             buf = io.StringIO()
             try:
@@ -3466,6 +3871,220 @@ def selftest():
             chk(f"flash accepts {flag}", flag in h)
     finally:
         sys.argv = saved
+
+    print("\n== CGEA IPMA (JX7T-14F403): HMAC keygens, SBL, backup map ==")
+    ok = cgea_seckey.selftest() and ok
+    ip = ecu_db.get_profile(0x706)
+    assert ip is not None
+    cg, old = "JX7T-14F403-CA", "F1FT-14F403-AE"
+    chk("CGEA L1 -> cgea_pbl / DELPHIIPMA01",
+        ip.pick_algo(cg, 1) == "cgea_pbl"
+        and ip.pick_secret(cg, 1) == b"DELPHIIPMA01")
+    chk("CGEA L3 -> cgea_app / 30AMPIIHPLED",
+        ip.pick_algo(cg, 3) == "cgea_app"
+        and ip.pick_secret(cg, 3) == b"30AMPIIHPLED")
+    chk("F1FT IPMA unchanged: L1 ford 00009875CA, L3 ford 0000E727FB",
+        ip.pick_algo(old, 1) == "ford" and ip.pick_algo(old, 3) == "ford"
+        and ip.pick_secret(old, 1) == bytes.fromhex("00009875CA")
+        and ip.pick_secret(old, 3) == bytes.fromhex("0000E727FB"))
+    chk("unknown F111 on 0x706 falls back to the Ford LFSR",
+        ip.pick_algo("", 1) == "ford")
+    chk("CGEA SBL H1BT-14F399-AB, F1FT keeps CV4T default",
+        ip.pick_sbl(cg) == "H1BT-14F399-AB.vbf"
+        and ip.pick_sbl(old) == "CV4T-14F399-AF.VBF")
+    chk("CGEA SBL file is in sbl/ and verifies",
+        os.path.exists(os.path.join(SBL_DIR, "H1BT-14F399-AB.vbf"))
+        and not Vbf(os.path.join(SBL_DIR, "H1BT-14F399-AB.vbf")).check())
+    chk("secret_from_arg keeps 5 bytes for ford, natural length for CGEA",
+        secret_from_arg(0x00009875CA, "ford") == bytes.fromhex("00009875CA")
+        and secret_from_arg(int.from_bytes(b"DELPHIIPMA01", "big"),
+                            "cgea_pbl") == b"DELPHIIPMA01")
+
+    class _SeedEcu:
+        """27 xx fake: hands out one seed, records the key it is sent."""
+        execute = True
+
+        def __init__(self, seed):
+            self.seed, self.sent = seed, []
+
+        def expect(self, hexstr, want, what, **kw):
+            self.sent.append(hexstr)
+            if hexstr[2:4] in ("01", "03"):
+                return bytes([0x67, int(hexstr[2:4], 16)]) + self.seed
+            return bytes([0x67, int(hexstr[2:4], 16)])
+
+    _al, _sec, _sd, _ky = cgea_seckey.VECTORS[3]           # live PBL pair
+    fe = _SeedEcu(bytes.fromhex(_sd))
+    with contextlib.redirect_stdout(io.StringIO()):
+        security_exchange(fe, 1, _sec, _al)
+    chk("security_exchange sends the live-accepted 18-byte PBL key",
+        [s.upper() for s in fe.sent] == ["2701", "2702" + _ky.upper()],
+        str(fe.sent))
+    fe = _SeedEcu(bytes(16))
+    with contextlib.redirect_stdout(io.StringIO()):
+        security_exchange(fe, 3, b"30AMPIIHPLED", "cgea_app")
+    chk("all-zero 16-byte seed = already unlocked, no sendKey",
+        fe.sent == ["2703"])
+    fe = _SeedEcu(bytes.fromhex("1F7C69"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            security_exchange(fe, 1, b"DELPHIIPMA01", "cgea_pbl")
+        short_ok = False
+    except SystemExit:
+        short_ok = True
+    chk("3-byte seed under a CGEA rule is refused, not keyed", short_ok
+        and fe.sent == ["2701"])
+
+    bm = ip.pick_backup(cg)
+    spans = sorted((r.addr, r.addr + r.length) for r in bm)
+    chk("CGEA backup map: 7 regions, no overlap, PBL via 23",
+        len(bm) == 7 and all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))
+        and [r.name for r in bm if r.via == "rmba"] == ["pbl"])
+    chk("CGEA backup covers RH850 0x0-0x300000 and EyeQ3 32 MiB exactly",
+        sum(r.length for r in bm if r.addr < 0x00300000) == 0x300000
+        and sum(r.length for r in bm
+                if 0xB0000000 <= r.addr < 0xC0000000) == 0x2000000)
+    chk("no backup map for the F1FT generation", ip.pick_backup(old) == ())
+
+    class _MemEcu:
+        """SBL fake: 35/36/37 over a memory image, 37 echoes CRC-16.
+        corrupt = set of segment start addresses whose FIRST read is bad;
+        badecho = always echo a wrong CRC (ECU whose 77 is not a CRC)."""
+        execute = True
+
+        def __init__(self, base, mem, chunk=0x7F, corrupt=(), badecho=False,
+                     refuse_once=()):
+            self.base, self.mem, self.chunk = base, mem, chunk
+            self.corrupt, self.badecho = set(corrupt), badecho
+            self.refuse_once = set(refuse_once)
+            self.cur = None
+            self.log = []
+
+        def req(self, hexstr, timeout=5.0, what="", **kw):
+            b = bytes.fromhex(hexstr)
+            self.log.append(b[0])
+            if b[0] == 0x35:
+                a = int.from_bytes(b[3:7], "big")
+                n = int.from_bytes(b[7:11], "big")
+                if a in self.refuse_once:
+                    self.refuse_once.discard(a)
+                    return bytes([0x7F, 0x35, 0x22])
+                off = a - self.base
+                bad = a in self.corrupt          # damaged IN TRANSIT: the
+                self.corrupt.discard(a)          # device CRC is of true data
+                self.cur = [self.mem[off:off + n], 0, bad]
+                return bytes([0x75, 0x20, 0x00, self.chunk + 2])
+            if b[0] == 0x36:
+                d, pos, bad = self.cur[:3]
+                piece = bytearray(d[pos:pos + self.chunk])
+                if bad and pos == 0:
+                    piece[5] ^= 0xFF
+                self.cur[1] += len(piece)
+                return bytes([0x76, b[1]]) + bytes(piece)
+            if b[0] == 0x37:
+                c = _crc16(self.cur[0]) if self.cur else 0
+                if self.badecho:
+                    c ^= 0x5A5A
+                self.cur = None
+                return bytes([0x77, c >> 8, c & 0xFF])
+            return bytes([0x7F, b[0], 0x11])
+
+    import random as _rnd
+    _rng = _rnd.Random(7)
+    mem = bytes(_rng.randrange(256) for _ in range(0x2345))
+    reg = ecu_db.BackupRegion("", "t", 0x1000, len(mem))
+
+    def _run(fake, seg=0x800):
+        buf = io.BytesIO()
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = read_region_sbl(fake, reg, buf, seg=seg, progress_interval=99)
+        return buf.getvalue(), res
+
+    got, (c, u) = _run(_MemEcu(0x1000, mem))
+    chk("segmented SBL read is byte-exact, every segment CRC-checked",
+        got == mem and c == 5 and u == 0, f"{c}/{u}")
+    f = _MemEcu(0x1000, mem, corrupt={0x1800})
+    got, (c, u) = _run(f)
+    chk("a corrupted segment (echo != host CRC) is re-read and fixed",
+        got == mem and c == 5 and f.log.count(0x35) == 6)
+    got, (c, u) = _run(_MemEcu(0x1000, mem, badecho=True))
+    chk("echo that is not a CRC: two identical reads -> accepted UNCHECKED",
+        got == mem and c == 0 and u == 5)
+    f = _MemEcu(0x1000, mem, refuse_once={0x2000})
+    got, (c, u) = _run(f)
+    chk("a refused 35 is retried, no 36 sent for the refused attempt",
+        got == mem and c == 5)
+    f = _MemEcu(0x1000, mem, refuse_once={0x1000})
+    f.req = (lambda orig: (lambda h, **k: bytes([0x7F, 0x35, 0x31])
+                           if h.startswith("35") else orig(h, **k)))(f.req)
+    try:
+        _run(f)
+        refused = False
+    except SystemExit:
+        refused = True
+    chk("a permanently refused region raises (no silent short file)", refused)
+    f = _MemEcu(0x1000, mem)
+    _orig = f.req
+
+    def _bad36(h, _o=_orig, **k):
+        r = _o(h, **k)
+        return bytes([0x7F, 0x36, 0x72]) if h.startswith("36") and \
+            f.log.count(0x35) == 1 else r
+    f.req = _bad36
+    got, _ = _run(f)
+    chk("a failed 36 is released with 37 before the retry",
+        got == mem and f.log[:3] == [0x35, 0x36, 0x37])
+
+    class _NoisyEcu(_MemEcu):
+        """RH850 data-flash fake: bytes in [lo, hi) read random EVERY time,
+        and the 37 echo is computed over a separate (noisy) re-read."""
+        def __init__(self, *a, lo=0, hi=0, **k):
+            super().__init__(*a, **k)
+            self.lo, self.hi, self.r = lo, hi, _rnd.Random(3)
+
+        def _noisy(self, a, n):
+            d = bytearray(self.mem[a - self.base:a - self.base + n])
+            for i in range(n):
+                if self.lo <= a + i < self.hi:
+                    d[i] = self.r.randrange(256)
+            return bytes(d)
+
+        def req(self, hexstr, timeout=5.0, what="", **kw):
+            b = bytes.fromhex(hexstr)
+            if b[0] == 0x35:
+                a = int.from_bytes(b[3:7], "big")
+                n = int.from_bytes(b[7:11], "big")
+                self.cur = [self._noisy(a, n), 0, False, a, n]
+                return bytes([0x75, 0x20, 0x00, self.chunk + 2])
+            if b[0] == 0x37:
+                cur = self.cur or [b"", 0, False, 0, 0]
+                c = _crc16(self._noisy(cur[3], cur[4]))
+                self.cur = None
+                return bytes([0x77, c >> 8, c & 0xFF])
+            return super().req(hexstr, timeout, what, **kw)
+
+    nz = _NoisyEcu(0x1000, mem, lo=0x2100, hi=0x2300)
+    buf, mbuf = io.BytesIO(), io.BytesIO()
+    with contextlib.redirect_stdout(io.StringIO()):
+        stab, unst = read_region_vote(nz, reg, buf, mbuf, seg=0x800,
+                                      progress_interval=99)
+    mk = mbuf.getvalue()
+    noisy = range(0x2100 - 0x1000, 0x2300 - 0x1000)
+    chk("blank-noise region: stable bytes exact, noise flagged unstable",
+        all(buf.getvalue()[i] == mem[i] for i in range(len(mem)) if i not in noisy)
+        and all(mk[i] for i in noisy) and sum(mk) == len(noisy) == unst,
+        f"unstable {unst}")
+    chk("blank-noise region: the segments without noise pass echo + vote",
+        stab == 4, str(stab))
+    nz = _NoisyEcu(0x1000, mem, lo=0x2100, hi=0x2300)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            read_region_sbl(nz, reg, io.BytesIO(), seg=0x800, progress_interval=99)
+        strict = False
+    except SystemExit:
+        strict = True
+    chk("the strict CRC reader still REFUSES that region (the live failure)",
+        strict)
 
     print("\n" + "=" * 60)
     print("SELFTEST:", "ALL PASS" if ok else "FAILURES")
@@ -3654,12 +4273,13 @@ def build_parser():
                    help="silence for N seconds then restore (default: until "
                         "Ctrl-C)")
 
-    def add_sbl_flags(sp):
-        """SBL/session flags shared by memread / memwrite."""
+    def add_sbl_flags(sp, need_addr=True):
+        """SBL/session flags shared by memread / memwrite / backup."""
         sp.add_argument("ecu", metavar="ECU",
                         help="ECU by name (PSCM, BCM, ...) or CAN id (730)")
-        sp.add_argument("--addr", type=lambda x: int(x, 0), required=True,
-                        help="start address, e.g. 0x02000000")
+        if need_addr:
+            sp.add_argument("--addr", type=lambda x: int(x, 0), required=True,
+                            help="start address, e.g. 0x02000000")
         sp.add_argument("--iface", default=None,
                         help="override SocketCAN interface (default: HS-CAN=can0, "
                              "MS-CAN=can1)")
@@ -3697,6 +4317,19 @@ def build_parser():
     s.add_argument("-o", "--outfile", required=True, help="output binary file")
     s.add_argument("--no-reset", action="store_true",
                    help="do not ECUReset after the read")
+
+    s = add_sbl_flags(sub.add_parser(
+        "backup",
+        help="read-only full-module backup of every region in the profile's "
+             "backup map (via SBL 35 RequestUpload / application 23)"),
+        need_addr=False)
+    s.add_argument("-o", "--outdir", default=None,
+                   help="output directory (default backups/<date>_<ECU>_<F18C>)")
+    s.add_argument("--only", default=None,
+                   help="comma-separated region names, e.g. pbl,rh850_app")
+    s.add_argument("--segment", type=lambda x: int(x, 0), default=BACKUP_SEG,
+                   help=f"bytes per 35/36/37 transaction (default 0x{BACKUP_SEG:X}); "
+                        "each segment is checked against the 37 CRC-16 echo")
 
     s = add_sbl_flags(sub.add_parser(
         "memwrite",
@@ -3840,6 +4473,7 @@ def main():
             "dtc": do_dtc, "cleardtc": do_cleardtc, "reset": do_reset,
             "silence": do_silence,
             "memread": do_memread, "memwrite": do_memwrite,
+            "backup": do_backup,
             "completion": do_completion,
             "flash": do_flash, "list": do_list}[args.cmd](args)
 

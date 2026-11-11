@@ -66,7 +66,11 @@ class SecretRule:
     hw_prefix : match when the live F111 string startswith this (''=any).
     level     : SecurityAccess level the secret is for (odd request level:
                 1 = requestSeed 0x27 01, 3 = 0x27 03 ...). None = any level.
-    secret    : 5 bytes, MSB first (as printed by FoCCCus fromHex()).
+    secret    : hex string. 5 bytes, MSB first (as printed by FoCCCus
+                fromHex()) for the default "ford" LFSR keygen; the raw secret
+                bytes (e.g. 12 ASCII bytes) for the other algorithms.
+    algo      : keygen, see seckey.ALGOS: "ford" (3-byte seed, ford_seckey),
+                "cgea_app" / "cgea_pbl" (16-byte seed HMAC-SHA1, cgea_seckey).
     """
     hw_prefix: str
     level: Optional[int]
@@ -75,6 +79,29 @@ class SecretRule:
     # flashed). For modules whose F111 hardware string is not known yet but
     # whose generation is fixed by the software part (HVAC GJ5T = V850).
     sw_prefix: str = ""
+    algo: str = "ford"
+
+
+@dataclass
+class BackupRegion:
+    """One memory region of a full-module `backup`, chosen by F111 prefix.
+
+    via = "sbl"  : 35 RequestUpload after the OEM SBL is running
+          "rmba" : 23 ReadMemoryByAddress in the APPLICATION (session
+                   `rmba_session`, unlocked at `rmba_level`), for regions the
+                   SBL refuses (e.g. the primary bootloader itself)."""
+    hw_prefix: str
+    name: str
+    addr: int
+    length: int
+    via: str = "sbl"
+    note: str = ""
+    # Erased cells read back RANDOM (Renesas RH850 data flash: a blank cell has
+    # no defined value and the SBL's 37 CRC re-reads it). Such a region is read
+    # `votes` times; bytes that disagree are reported as unstable (= blank)
+    # instead of failing the CRC gate. Programmed records read back stable.
+    blank_noise: bool = False
+    votes: int = 3
 
 
 @dataclass
@@ -136,6 +163,11 @@ class EcuProfile:
     # where a capture proves it; a bare `77` is normal elsewhere. A MISMATCHED
     # echo aborts on every ECU — this flag only makes its ABSENCE an error.
     transfer_exit_crc: bool = False
+    # Full-module backup map (tuple[BackupRegion]) for the `backup` command,
+    # plus the application session/level that serves 23 ReadMemoryByAddress.
+    backup_regions: tuple = ()
+    rmba_session: int = 0x03
+    rmba_level: int = 3
 
     def resp_id(self):
         return self.rxid if self.rxid is not None else self.txid + 8
@@ -147,8 +179,8 @@ class EcuProfile:
         except KeyError:
             raise ValueError(f"unsupported CAN bus {self.bus!r} for {self.name}")
 
-    def pick_secret(self, hw: str, level: int, sw=()) -> Optional[bytes]:
-        """Secret for F111 `hw` at `level`. `sw` = software part numbers
+    def pick_rule(self, hw: str, level: int, sw=()) -> Optional[SecretRule]:
+        """SecretRule for F111 `hw` at `level`. `sw` = software part numbers
         (live ident, else the VBFs being flashed) for sw_prefix rules.
         Exact level first, then level-agnostic; the most specific rule wins
         (longest F111 prefix, then longest software prefix)."""
@@ -162,8 +194,27 @@ class EcuProfile:
                 if best is None or key > (len(best.hw_prefix), len(best.sw_prefix)):
                     best = r
             if best is not None:
-                return bytes.fromhex(best.secret)
+                return best
         return None
+
+    def pick_secret(self, hw: str, level: int, sw=()) -> Optional[bytes]:
+        r = self.pick_rule(hw, level, sw)
+        return bytes.fromhex(r.secret) if r is not None else None
+
+    def pick_algo(self, hw: str, level: int, sw=()) -> str:
+        """Keygen name for the rule pick_secret would use ("ford" if none)."""
+        r = self.pick_rule(hw, level, sw)
+        return r.algo if r is not None else "ford"
+
+    def pick_backup(self, hw: str) -> tuple:
+        """Backup regions whose F111 prefix matches `hw` (longest prefix set)."""
+        hw = hw or ""
+        best = max((len(r.hw_prefix) for r in self.backup_regions
+                    if hw.startswith(r.hw_prefix)), default=None)
+        if best is None:
+            return ()
+        return tuple(r for r in self.backup_regions
+                     if len(r.hw_prefix) == best and hw.startswith(r.hw_prefix))
 
     def pick_sbl(self, hw: str, sw=()) -> Optional[str]:
         """SBL for F111 `hw`; `sw` as in pick_secret. A rule with any prefix
@@ -331,13 +382,62 @@ ECUS = {
         # Configuration DID set (27 03/04), which the IPMA requires even to
         # READ D700/D701/DE00-DE03/FD05-FD08. Keep the level-agnostic rule last
         # so any other level still resolves to the flash secret as before.
+        #
+        # CGEA generation (Delphi/Aptiv RH850 + Mobileye EyeQ3; core hardware
+        # F111 JX7T-14F403-AA/BA/CA; apps N1BT/JX7T/L1TT/LB5T/LM2T-14F397).
+        # Selected by the JX7T-14F403 F111 prefix, so the older F1FT/CV4T
+        # generation keeps its LFSR rules untouched. Both levels use 16-byte
+        # seeds and HMAC-SHA1 (cgea_seckey.py), secrets = the 12-byte ASCII
+        # records "DELPHIIPMA01" / "30AMPIIHPLED":
+        #   level 1 = PBL (10 02 only), key18, VERIFIED live 2026-11-08
+        #   level 3 = application (10 03), key16, VERIFIED 3/3 UCDS pairs
+        # SBL H1BT-14F399-AB -> 0xFEBD0000 len 0x2368, call 0xFEBD0000:
+        #   34 -> 74 20 0FFF, 37 -> 77 E708 (= the block CRC-16),
+        #   31 01 0301 FEBD0000 -> 71 01 0301 10. All on a bench JX7T-14F403-CA.
+        # Read map (SBL 35 RequestUpload; probed with 0x10 windows, every
+        # region gated byte-exact against the OEM file of the running part):
+        #   0x00010000-0x00300000 RH850 code flash (app, cal, 32 KiB tail)
+        #   0xFF200000-0xFF210000 RH850 data flash (EEPROM emulation)
+        #   0xB0000000-0xB2000000 EyeQ3 flash (32 MiB, via the RH850)
+        #   0x00000000 PBL and 0xFEBD0000 RAM -> NRC 31; the PBL is read by the
+        #   APPLICATION's 23 24 (session 03, level 3) instead.
+        # The SBL's 37 after an upload echoes CRC-16/CCITT-FALSE of the bytes
+        # sent, a device-side check the backup enforces per segment. EXCEPT in
+        # data flash: erased RH850 data-flash cells read random, so the echo
+        # (computed over a second read) and repeat reads disagree there; that
+        # region is read by majority vote (blank_noise).
+        # WRITING (erase/flash) of the CGEA generation is NOT yet verified.
         secrets=(
             SecretRule("", 3, "0000E727FB"),
             SecretRule("", None, "00009875CA"),
+            SecretRule("JX7T-14F403", 1, "44454C50484949504D413031",
+                       algo="cgea_pbl"),
+            SecretRule("JX7T-14F403", 3, "3330414D50494948504C4544",
+                       algo="cgea_app"),
+        ),
+        sbls=(
+            SblRule("JX7T-14F403", "H1BT-14F399-AB.vbf"),
         ),
         default_sbl="CV4T-14F399-AF.VBF",
         sbl_call_halfword=False,
         finalize=True,
+        backup_regions=(
+            BackupRegion("JX7T-14F403", "pbl", 0x00000000, 0x10000, via="rmba",
+                         note="RH850 primary bootloader (boot block)"),
+            BackupRegion("JX7T-14F403", "rh850_app", 0x00010000, 0x280000,
+                         note="RH850 application (F188)"),
+            BackupRegion("JX7T-14F403", "rh850_cal", 0x00290000, 0x68000,
+                         note="RH850 calibration (F124)"),
+            BackupRegion("JX7T-14F403", "rh850_tail", 0x002F8000, 0x8000,
+                         note="RH850 code flash above the calibration"),
+            BackupRegion("JX7T-14F403", "rh850_dflash", 0xFF200000, 0x10000,
+                         note="RH850 data flash (EEPROM emulation)",
+                         blank_noise=True),
+            BackupRegion("JX7T-14F403", "eyeq3_app", 0xB0000000, 0x1FD0000,
+                         note="EyeQ3 application area (F120)"),
+            BackupRegion("JX7T-14F403", "eyeq3_cal", 0xB1FD0000, 0x30000,
+                         note="EyeQ3 calibration (F125) to end of flash"),
+        ),
     ),
     0x734: EcuProfile(
         name="HCM (headlamp control module)", txid=0x734, bus="HS-CAN",

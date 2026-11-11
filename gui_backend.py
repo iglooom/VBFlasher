@@ -159,6 +159,7 @@ class Link:
         """27 level/level+1 with the ecu_db secret for the live F111 (or the
         explicit `secret`). Re-uses the CLI preamble so behaviour is identical."""
         prof = self.t.profile
+        algo = None             # explicit secret: _session_and_unlock resolves it
         if secret is None:
             if prof is None:
                 raise OpError("custom CAN id: give the 5-byte secret explicitly")
@@ -169,8 +170,10 @@ class Link:
             secret = prof.pick_secret(hw or "", level)
             if secret is None:
                 raise OpError(f"no secret in ecu_db for {prof.name} F111 {hw!r} level {level}")
+            # keygen follows the same rule (CGEA IPMA: 16-byte HMAC seeds)
+            algo = prof.pick_algo(hw or "", level)
         args = SimpleNamespace(session=None, unlock=True, sec_level=level, secret=secret,
-                               hw=None, timeout=5.0, seed_delay=vf.SEED_DELAY)
+                               hw=None, timeout=5.0, seed_delay=vf.SEED_DELAY, algo=algo)
         if settle:
             vf.settle_before_seed(vf.SEED_DELAY)
         try:

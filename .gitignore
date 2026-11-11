@@ -17,3 +17,4 @@ logs/
 
 # Local offline test suite (kept out of git)
 .tests/
+backups/

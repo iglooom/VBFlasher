@@ -12,7 +12,8 @@ IPMA) plus the OEM-derived secret/SBL tables from FoCCCus `ford_c346.cpp`.
 |---|---|
 | `vbflasher.py` | the CLI (parse, plan, confirm, flash) |
 | `ecu_db.py` | **the only place ECU-specific data lives** — addresses, secrets, SBLs, quirks |
-| `ford_seckey.py` | the one universal seed→key algorithm (5-byte secret, big-endian) |
+| `ford_seckey.py` | the universal Ford seed→key LFSR (3-byte seed, 5-byte secret, big-endian) |
+| `cgea_seckey.py` | CGEA IPMA HMAC-SHA1 keygens (16-byte seed; PBL level 1, application level 3) |
 | `vbf.py` | VBF container parser + ISO-TP transport + bus-quiet / keepalive / download |
 | `ford_keybag.py` | 343 candidate secrets transcribed from FoCCCus `bruteSecretKey()` |
 | `ford_brutekey.py` | dictionary attack on an unknown SecurityAccess secret (`--self-test` for the offline proof) |
@@ -21,12 +22,15 @@ IPMA) plus the OEM-derived secret/SBL tables from FoCCCus `ford_c346.cpp`.
 | `defs.py` | module definitions: pick the DID layouts for a live module, field codec, CCC image, UCDS XML I/O |
 | `defs/vbflasher_defs.sqlite` | generated definition DB (DIDs/fields/enums, DTC text, CCF central config) |
 | `tools/build_defs.py` | rebuilds `defs/vbflasher_defs.sqlite` from `~/Projects/ford/IDSdb/build` |
+| `tools/backup2vbf.py` | rebuilds flashable VBFs from a `backup` directory using OEM VBFs as layout templates (`--layout oem` / `erase`) |
 | `sbl/` | Secondary Bootloader VBFs looked up by the registry (the only VBFs tracked in git) |
 | `.tests/` | offline unit tests, all CAN transport mocked (git-ignored, local only; see [Tests](#tests)) |
 | `logs/` | per-run trace logs (git-ignored) |
+| `backups/` | default `backup` output (one directory per run, `manifest.json`) |
 
-The seed→key algorithm is identical across every Ford ECU here; only the 5-byte
-**secret** and the **SBL** differ. This was proven: keys computed from the
+The seed→key algorithm is identical across every Ford ECU here except the CGEA
+IPMA (`SecretRule.algo`, see [CGEA IPMA](#cgea-ipma-jx7t-14f403-focus-mk4--fiesta-mca-camera));
+otherwise only the 5-byte **secret** and the **SBL** differ. This was proven: keys computed from the
 registry secrets are byte-identical to those from the proven BCM/PSCM/IPMA
 tools (`vbflasher.py --selftest` asserts it).
 
@@ -553,6 +557,68 @@ vbflasher memread  PSCM --addr 0x02000000 --length 0x400 -o pscm_eeprom.bin
 vbflasher memwrite PSCM --addr 0x02000000 -i pscm_eeprom.bin
 ```
 
+### Full-module backup (`backup`)
+
+`backup <ECU>` reads every region of the profile's `backup_regions` map for the
+live F111 into one directory plus a `manifest.json` (ident DIDs, per-region
+address/length/SHA-256/CRC-32). Read-only: it sends no erase routine and no
+`2E`, and the only `34` is the one that loads the SBL into RAM. Regions marked
+`via="rmba"` are read first by the APPLICATION with `23 24 <addr32> <len16>`
+(session `rmba_session`, level `rmba_level`). Regions it refuses, such as the
+primary bootloader, the SBL cannot reach either. The rest go through the SBL in
+`--segment` transactions (default 64 KiB). Each segment is checked against
+the CRC-16 that the `37` echoes and is re-read on a mismatch. If the echo is
+evidently not a CRC (two identical reads, echo still different), the segment is
+kept and counted as unchecked in the manifest. A partial file stays `*.part`.
+A region marked `blank_noise` (RH850 data flash: erased cells read back random,
+so neither the echo nor a re-read can agree) is read `votes` times instead. The
+per-byte majority is stored, plus a `<name>.unstable` mask (1 = the reads
+disagreed). Re-running with `--only <names>` into the same `-o` directory
+resumes: the earlier regions are kept in the manifest, and a different module
+(F111/F18C/software mismatch) is refused.
+
+```bash
+vbflasher backup IPMA --iface can3 -o backups/ipma_213502402      # ~85 min, CGEA IPMA
+vbflasher backup IPMA --only pbl,rh850_app,rh850_cal,rh850_dflash  # RH850 side only, ~9 min
+```
+
+**Back to VBF.** `tools/backup2vbf.py BACKUP_DIR OEM.vbf ... -o OUT` rebuilds
+flashable VBFs from the backup, with the OEM file as the template (header kept
+verbatim except `file_checksum`). It refuses a template whose part number the
+module did not report, bytes the backup lacks, and blank-noise bytes.
+`--layout oem` keeps the OEM blocks; for the part the module runs, it must
+reproduce the OEM file byte-for-byte. `--layout erase` adds one block per
+non-blank span of the erase map that no OEM block covers, i.e. the module data
+that an OEM flash would erase and not restore.
+
+Upload speed is set by the module: the CGEA IPMA sends its ConsecutiveFrames
+every 1.0 ms even with FC STmin=0, so it runs at ~6.8 KiB/s (SBL download, by
+contrast, runs at ~28 KiB/s).
+
+### CGEA IPMA (JX7T-14F403, Focus mk4 / Fiesta MCA camera)
+
+Same diagnostic address as the older F1FT/CV4T IPMA (0x706/0x70E) but a
+different security scheme. Rules keyed on F111 `JX7T-14F403` select it, and the
+F1FT generation keeps its LFSR secrets:
+
+| level | where | keygen (`cgea_seckey.py`) | status |
+|---|---|---|---|
+| 1 | PBL, `10 02` | `HMAC-SHA1("DELPHIIPMA01", seed16 + "JaKe")[0:18]` | live-verified |
+| 3 | application, `10 03` | `HMAC-SHA1("30AMPIIHPLED", "zaCK" + seed16)[4:20]` | 3 UCDS pairs + live |
+
+SBL `H1BT-14F399-AB` (RAM `0xFEBD0000`) starts with `71 01 0301 10`. It serves
+`35 RequestUpload` for RH850 code flash `0x00010000-0x00300000`, data flash
+`0xFF200000-0xFF210000` and the whole 32 MiB EyeQ3 flash `0xB0000000-0xB2000000`.
+The PBL (`0x0`, 64 KiB) and RAM give NRC 31. The PBL is read through the
+application's `23` instead. Reading is proven: every region compared byte-exact
+with the OEM file of the running part. Writing (erase/flash) of this
+generation has NOT been exercised yet.
+
+```bash
+vbflasher readdid IPMA DE00 --session 0x03 --sec-level 3 --iface can3   # app unlock, 16-byte key
+vbflasher memread IPMA --addr 0xFF200000 --length 0x10000 -o dflash.bin --iface can3
+```
+
 ### Reading the BCM car-configuration (CCC)
 
 Reconstructed from a UCDS capture (`../BCM/Research/ucds_read_ccc.log`). The
@@ -694,6 +760,8 @@ Append one `EcuProfile` to `ECUS` in `ecu_db.py` — nothing else changes:
         SecretRule("", None, "0000000000"),       # ''=any prefix, None=any level
     ),
     sbls=(SblRule("HWPREFIX", "MY-SBL.vbf"),),     # by F111 prefix
+    # non-LFSR keygen: SecretRule("HWPREFIX", 1, "<secret bytes hex>", algo="cgea_pbl")
+    # full-module backup map: backup_regions=(BackupRegion("HWPREFIX", "app", 0x10000, 0x80000),)
     # F111 unknown? key a rule on the SOFTWARE part instead (live F188/F120...,
     # else the VBF being flashed):  SblRule("", "SBL.vbf", sw_prefix="GJ5T-18D619")
     # and SecretRule("", 1, "...", sw_prefix="GJ5T-18D619")
