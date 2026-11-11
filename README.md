@@ -134,9 +134,19 @@ address. UCDS RAM extractions are merged into the same definitions, not kept
 apart: every C520/C520_EU IPC (0x720) and BCM (0x726) definition also carries
 the UCDS IPC level-3 list (`IPC/RE/config/ipc_did_defs.json`) and the BCM DIDs
 decoded from UCDS (`BCM/Research/docs/ucds`: `DE00` config, `40D7` battery
-quiescent-current statistics, `414C` battery-voltage statistics, plus catalogue
-names). A UCDS layout with fields replaces the IDS layout of the same DID; the
-IDS session/security for that DID is kept. Layouts and DID sets are content-deduplicated; part-number lists and
+quiescent-current statistics, `414C` battery-voltage statistics, plus the
+`bcm_direct_config.json` catalogue: 498 named DIDs, 63 of them writable — the
+UCDS *Direct Configuration* settings: `DE00`–`DE05`, remote start `EEAB`…`EEFD`,
+`4227`, battery management, `4130`/`4155` lock/body options, TPMS sensor IDs,
+vehicle mode `D134`; written with `10 03` + `27 03` like UCDS writes `DE00`;
+PATS/immobiliser, identification and counters stay read-only), and every C520 IPMA (0x706) definition carries `DE00`–`DE03`
+(Vehicle Parameters incl. Speed Unit KPH/MPH, Vehicle Parameters 2 = feature
+default modes, Feature Options, DTC Mask) from `IPMA/Research/ucds`. Config
+DIDs that are refused on a plain read are retried once in their write session
+with the published SecurityAccess level (the IPMA needs `10 03` + `27 03` even
+to read). A UCDS layout with fields replaces the IDS layout of the same DID; the
+IDS session/security for that DID is kept (for the BCM catalogue its access class
+wins). Layouts and DID sets are content-deduplicated; part-number lists and
 security bytes are not copied. Rebuild after IDSdb changes:
 
 ```bash

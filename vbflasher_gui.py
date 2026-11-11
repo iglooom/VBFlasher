@@ -1332,6 +1332,28 @@ class DirectConfigTab(QWidget):
                         p, err = ln.read(d)
                         out[d] = (p, err)
                         print(f"   {d:04X}: {hx(p) if p is not None else err}")
+                # Config DIDs refused without SecurityAccess (e.g. IPMA needs
+                # 10 03 + 27 03 even to READ): retry them once, unlocked with
+                # the level the definition publishes for writing.
+                retry = [d for d, (p, _) in out.items() if p is None and not lvl
+                         and self.dids.get(d) is not None and self.dids[d].wr_sec]
+                if retry and not ctx.cancel.is_set():
+                    dd0 = self.dids[retry[0]]
+                    s = B.first_session(dd0.wr) or 0x03
+                    seed = B.ford_level_to_seed(dd0.wr_sec) or 0x03
+                    print(f"   {len(retry)} DID(s) refused -> session {s:02X} + 27 {seed:02X} "
+                          "and retry")
+                    try:
+                        ln.session(s)
+                        ln.start_keepalive()
+                        ln.unlock(seed)
+                        for d in retry:
+                            p, err = ln.read(d)
+                            out[d] = (p, err)
+                            print(f"   {d:04X}: {hx(p) if p is not None else err}")
+                    except B.OpError as e:
+                        print(f"   unlock failed: {e}")
+                    groups.setdefault(s, [])
                 ln.stop_keepalive()
                 if any(s is not None for s in groups):
                     ln.session(0x01)

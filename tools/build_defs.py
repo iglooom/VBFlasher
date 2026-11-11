@@ -16,6 +16,7 @@ metadata, provenance columns. Run again whenever IDSdb is rebuilt:
     python3 tools/build_defs.py [--idsdb ~/Projects/ford/IDSdb/build]
                                 [--ucds-ipc ~/Projects/ford/IPC/RE/config/ipc_did_defs.json]
                                 [--ucds-bcm ~/Projects/ford/BCM/Research/docs/ucds]
+                                [--ucds-ipma ~/Projects/ford/IPMA/Research/ucds]
 """
 import argparse
 import hashlib
@@ -32,6 +33,7 @@ HERE = Path(__file__).resolve().parent.parent
 DEFAULT_IDSDB = Path.home() / "Projects/ford/IDSdb/build"
 DEFAULT_UCDS_IPC = Path.home() / "Projects/ford/IPC/RE/config/ipc_did_defs.json"
 DEFAULT_UCDS_BCM = Path.home() / "Projects/ford/BCM/Research/docs/ucds"
+DEFAULT_UCDS_IPMA = Path.home() / "Projects/ford/IPMA/Research/ucds"
 OUT = HERE / "defs" / "vbflasher_defs.sqlite"
 
 SCHEMA = """
@@ -252,8 +254,10 @@ class Writer:
         """Fold UCDS-extracted DIDs into a vehicle definition of the same
         module/vehicle family. A UCDS layout with fields replaces an IDS layout
         for the same DID (it is the real tool's decode for this generation);
-        the IDS access (sessions/security) is kept when it has one."""
-        for addr, prefix, dids, tag in self.supp:
+        the IDS access (sessions/security) is kept when it has one. With
+        `force` the UCDS access always wins, and any UCDS layout with fields
+        replaces the IDS one (the catalogue was checked against this module)."""
+        for addr, prefix, dids, tag, force in self.supp:
             if addr != address or not (model or "").startswith(prefix):
                 continue
             items = list(items)
@@ -263,6 +267,12 @@ class Writer:
                     items.append((did, lid, "", wr, sec))
                     continue
                 old = olds[0]
+                if force:
+                    nf = self.nfields.get(lid, 0)
+                    keep = old[1] if nf == 0 and self.nfields.get(old[1], 0) else lid
+                    items = [it for it in items if it[0] != did]
+                    items.append((did, keep, old[2], wr, sec))
+                    continue
                 if self.nfields.get(lid, 0) >= max(1, self.nfields.get(old[1], 0)):
                     items = [it for it in items if it[0] != did]
                     items.append((did, lid, old[2], old[3] if old[3] is not None else wr,
@@ -297,7 +307,18 @@ def did_items(w, rows, origin="fdrs"):
         fields = []
         if subfields:
             try:
-                for sf in pick_subfields(json.loads(subfields)):
+                subs = json.loads(subfields)
+            except ValueError:
+                subs = []
+            # IDS ffdata 'mcp' encodings are As-Built (Module Configuration
+            # Programming) block fields: their "address" is the as-built block
+            # number (0x0001, 0x0002 ...), NOT a UDS DID. Never present them
+            # as DIDs.
+            if subs and all(s.get("ids_operation") == "mcp" for s in subs):
+                continue
+            subs = [s for s in subs if s.get("ids_operation") != "mcp"]
+            try:
+                for sf in pick_subfields(subs):
                     f = mdx_field(sf, origin)
                     if f is not None:
                         if size and f["m"] >= size * 8:
@@ -475,7 +496,7 @@ def _ucds_fields(raw, size):
         if size and hi >= size * 8:
             continue
         ff = {"n": f.get("name") or "?", "l": lo, "m": hi,
-              "t": "enum" if f.get("enum") else "uint"}
+              "t": f.get("type") or ("enum" if f.get("enum") else "uint")}
         if f.get("enum"):
             ff["e"] = [[int(v), str(t)] for v, t in f["enum"]]
         if f.get("unit") not in SKIP_UNITS:
@@ -509,17 +530,19 @@ def load_ucds_ipc(w, path):
         lid = w.layout(name or f"DID {did:04X}", size, "ucds", fields)
         wr = "03" if did_hex.upper().startswith("DE") else None
         dids[did] = (lid, wr, "2" if wr else None)       # Ford level 2 = 27 03
-    w.supp.append((0x720, "C520", dids, "ucds"))
+    w.supp.append((0x720, "C520", dids, "ucds", False))
     print(f"   ucds ipc DIDs: {len(dids)}")
 
 
-def load_ucds_bcm(w, folder):
-    """C520 BCM (JV6T) DIDs decoded from UCDS process RAM: one
-    *_decoded.json per opened DID (field tables verified against the UCDS
-    screen) plus catalogue names for DIDs whose fields were not extracted."""
+def load_ucds_dir(w, folder, address, label, wr_sec=None):
+    """DIDs decoded from UCDS process RAM (UCDS/work/ram extract_did.py or
+    defs_only.py): one did_<DID>_decoded.json / did_<DID>_defs.json per DID
+    page opened in UCDS, plus catalogue names (BCM) for DIDs whose fields were
+    not extracted. All extractions are C520 Kuga. `wr_sec` = Ford security
+    level for config writes (2 -> 27 03)."""
     folder = Path(folder) if folder else None
     if not folder or not folder.is_dir():
-        print("   ucds bcm: skipped (folder not found)")
+        print(f"   ucds {label}: skipped (folder not found)")
         return
     names = {}
     cat = folder / "bcm_did_catalog.json"
@@ -532,23 +555,96 @@ def load_ucds_bcm(w, folder):
                              re.M):
             names.setdefault(int(m.group(1), 16), m.group(2).strip())
     dids = {}
-    for fn in sorted(folder.glob("*_decoded.json")):
+    for fn in sorted(list(folder.glob("*_decoded.json")) + list(folder.glob("did_*_defs.json"))):
         d = json.load(open(fn))
+        if d.get("name"):
+            names.setdefault(to_int("0x" + d["did"]), d["name"])
         did = to_int("0x" + d["did"]) if d.get("did") else (
             0xDE00 if fn.name.lower().startswith("de00") else None)
         if did is None:
             continue
-        size = d.get("blob_len") or (len(d.get("blob_hex", "")) // 2 or None)
+        size = d.get("blob_len") or d.get("byte_size") or (
+            len(d.get("blob_hex") or "") // 2 or None)
         fields = _ucds_fields(d.get("params") or [], size)
         lid = w.layout(names.get(did) or f"DID {did:04X}", size, "ucds", fields)
         wr = "03" if 0xDE00 <= did <= 0xDEFF else None
-        dids[did] = (lid, wr, None)
+        dids[did] = (lid, wr, wr_sec if wr else None)
+    # BCM catalogue (BCM/Research docs/ucds/tools/direct_config_json.py): every
+    # DID UCDS reads or lists under Direct Configuration, with an access class.
+    # Its access is authoritative for this module: "config" DIDs are written
+    # like UCDS writes DE00 (10 03 + 27 03), everything else is read-only.
+    force = False
+    dc = folder / "bcm_direct_config.json"
+    if dc.exists():
+        j = json.load(open(dc))
+        sess, lvl = j["write"]["session"], j["write"]["security_level"]
+        for k, e in j["dids"].items():
+            did = to_int("0x" + k)
+            wr, sec = (sess, lvl) if e["access"] == "config" else (None, None)
+            if did in dids:                  # decoded table: keep its fields
+                dids[did] = (dids[did][0], wr, sec)
+                continue
+            names[did] = e["name"]
+            fields = _ucds_fields(e["fields"], e["size"])
+            dids[did] = (w.layout(e["name"], e["size"], "ucds", fields), wr, sec)
+        force = True
     for did, name in names.items():
         if did is not None and did not in dids and name:
             dids[did] = (w.layout(name, None, "ucds", []), None, None)
-    w.supp.append((0x726, "C520", dids, "ucds"))
-    print(f"   ucds bcm DIDs: {len(dids)} "
+    w.supp.append((address, "C520", dids, "ucds", force))
+    print(f"   ucds {label} DIDs: {len(dids)} "
           f"({sum(1 for v in dids.values() if w.nfields.get(v[0]))} with fields)")
+
+
+MDXCACHE_TYPES = {"enum": "enum", "unsigned": "uint", "signed": "sint", "ascii": "ascii",
+                  "bcd": "bcd", "bytes": "bytes"}
+
+
+def load_mdx_cache_spec(w, path):
+    """A module definition decoded from an FDRS client-cache MDX (binary ETIS
+    serialisation) by IPMA/EyeQ3/tools/mdx_cache_decode.py + ipma_report.py.
+    Registered as a 'spec' definition (matched on F110), priority 1 because its
+    fields were cross-checked 197/197 against UCDS RAM extractions."""
+    if not path or not Path(path).exists():
+        print(f"   mdx-cache spec: skipped ({path} not found)")
+        return
+    j = json.load(open(path))
+    units, dtypes = ({int(k): v for k, v in j["units"].items()},
+                     {int(k): v for k, v in j["dtypes"].items()})
+    items = []
+    for did_hex, d in sorted(j["dids"].items()):
+        did = int(did_hex, 16)
+        size = d.get("byte_size")
+        fields = []
+        for f in d["fields"]:
+            t = MDXCACHE_TYPES.get(dtypes.get(f.get("dtype")), "uint")
+            ff = {"n": f["name"], "l": f["lsb"], "m": f["msb"], "t": t}
+            if f.get("enum"):
+                ff["e"] = [[int(v), str(lab)] for v, lab in f["enum"]]
+            if t in ("uint", "sint"):
+                num, den = f.get("num") or 1, f.get("den") or 1
+                if (num, den) != (1, 1):
+                    ff["r"] = num / den
+                if f.get("offset"):
+                    ff["o"] = f["offset"]          # physical = raw * r + o
+                u = units.get(f.get("unit_ord"))
+                if u:
+                    ff["u"] = u
+            fields.append(ff)
+        lid = w.layout(d.get("name") or f"DID {did:04X}", size, "mdxcache", fields)
+        cfg = 0xDE00 <= did <= 0xDEFF
+        # config DIDs: 2E in extended session; MDX security level 03 -> Ford level 2 (27 03)
+        items.append((did, lid, "", "03" if cfg else None, "2" if cfg else None))
+    w.module("spec", j["spec"], None, None, "IPMA", "IPMA (Delphi RH850 + EyeQ3, CGEA)",
+             j["address"], "fdrs-cache+ucds", 1, items)
+    rows = []
+    for code_hex, e in j.get("dtcs", {}).items():
+        rows.append((j["address"], int(code_hex, 16), e["name"]))
+    w.db.executemany("INSERT OR IGNORE INTO dtc_text VALUES(?,?,?)", rows)
+    print(f"   mdx-cache spec {j['spec']}: {len(items)} DIDs, {len(rows)} DTC texts")
+
+
+DEFAULT_MDXCACHE = [Path.home() / "Projects/ford/IPMA/EyeQ3/ucds/ipma_cgea_defs.json"]
 
 
 def main():
@@ -557,6 +653,7 @@ def main():
     ap.add_argument("--idsdb", default=str(DEFAULT_IDSDB))
     ap.add_argument("--ucds-ipc", default=str(DEFAULT_UCDS_IPC))
     ap.add_argument("--ucds-bcm", default=str(DEFAULT_UCDS_BCM))
+    ap.add_argument("--ucds-ipma", default=str(DEFAULT_UCDS_IPMA))
     ap.add_argument("-o", "--out", default=str(OUT))
     a = ap.parse_args()
     src = Path(a.idsdb).expanduser()
@@ -568,13 +665,18 @@ def main():
     # UCDS extractions are loaded first and folded into every IDS vehicle
     # definition of the same address + vehicle family while those are built
     load_ucds_ipc(w, Path(a.ucds_ipc).expanduser())
-    load_ucds_bcm(w, Path(a.ucds_bcm).expanduser())
+    load_ucds_dir(w, Path(a.ucds_bcm).expanduser(), 0x726, "bcm")
+    # IPMA needs SecurityAccess 27 03 (Ford level 2) for its config DIDs,
+    # even to read them (ecu_db: IPMA level-3 secret, UCDS capture)
+    load_ucds_dir(w, Path(a.ucds_ipma).expanduser(), 0x706, "ipma", wr_sec="2")
     build_mdx(w, src / "mdx_data.sqlite")
     build_ccc(w, src / "ccf.sqlite")
+    for p in DEFAULT_MDXCACHE:
+        load_mdx_cache_spec(w, p)
     w.db.executemany("INSERT INTO meta VALUES(?,?)", [
         ("format", "1"),
         ("built", time.strftime("%Y-%m-%d %H:%M:%S")),
-        ("source", "IDSdb mdx_data.sqlite + ccf.sqlite + UCDS C520 IPC/BCM extractions"),
+        ("source", "IDSdb mdx_data.sqlite + ccf.sqlite + UCDS C520 IPC/BCM/IPMA extractions + FDRS-cache CGEA IPMA (DSNK3T-19H406-AA)"),
         ("bits", "field l/m = lsb/msb counted from the LSB of the whole payload"),
     ])
     w.db.commit()
