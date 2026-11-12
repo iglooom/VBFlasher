@@ -453,7 +453,15 @@ ECUS = {
         rxid=0x79F, aliases=("SASM", "SCCM"),
         # UCDS ident on this car: F188 F1FT-14C309-AC, F111 F1FT-14F077-BA,
         # F113 F1FT-3F818-BC; responds on HS-CAN 0x79F to a functional 7DF read.
-        # Diagnostic registration only: no secret or SBL established yet.
+        # IDS IVS (MY11..MY19 C344/C346/C520, every F1FT-3F818-* assembly):
+        # SBL DV6T-14C311-AB ("Flash driver for NEC V850", call 0x03FFC0A4),
+        # security_level_1 = 53 43 4D 52 45 (same byte order as the IPC row
+        # 62 1C 06 72 60, which IDS also lists). BV6T-3F818-* assemblies use
+        # SBL BV6T-14C311-AA and IDS lists no secret for them.
+        # NOT yet proven on a live module (unlock / SBL start untested).
+        secrets=(SecretRule("F1FT-14F077", 1, "53434D5245"),),
+        sbls=(SblRule("F1FT-14F077", "DV6T-14C311-AB.vbf"),
+              SblRule("BV6T-14F077", "BV6T-14C311-AA.VBF")),
     ),
     0x737: EcuProfile(
         name="RCM (restraints)", txid=0x737, bus="HS-CAN", aliases=("RCM",),
