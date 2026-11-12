@@ -448,6 +448,13 @@ ECUS = {
         # hardware-qualified secret or SBL has been established here.
         # Leave those unset rather than guessing a flash/recovery recipe.
     ),
+    0x797: EcuProfile(
+        name="SASM (steering column / steering-wheel module)", txid=0x797, bus="HS-CAN",
+        rxid=0x79F, aliases=("SASM", "SCCM"),
+        # UCDS ident on this car: F188 F1FT-14C309-AC, F111 F1FT-14F077-BA,
+        # F113 F1FT-3F818-BC; responds on HS-CAN 0x79F to a functional 7DF read.
+        # Diagnostic registration only: no secret or SBL established yet.
+    ),
     0x737: EcuProfile(
         name="RCM (restraints)", txid=0x737, bus="HS-CAN", aliases=("RCM",),
         secrets=(
