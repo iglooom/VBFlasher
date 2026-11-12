@@ -820,18 +820,40 @@ class FlashTab(QWidget):
 ROLE_FIELD = Qt.ItemDataRole.UserRole + 1     # (key, Field)
 
 
+def _parse_raw(text):
+    """'6', '0x06', '06h' or a combo label ending in '(0x6)' -> int."""
+    t = text.strip()
+    if t.endswith(")") and "(0x" in t:
+        t = t[t.rindex("(0x") + 1:-1]
+    if t.lower().endswith("h"):
+        t = "0x" + t[:-1]
+    return int(t, 0) if t.lower().startswith("0x") else int(t)
+
+
 class FieldDelegate(QStyledItemDelegate):
-    """Column-2 editor: combo for enums, spin/hex line for numbers, text for ASCII."""
+    """Column-2 editor: fixed combo for enums (the definition's values only),
+    line edit for numbers, text for ASCII. Column 3 ("Raw") edits the raw
+    integer, including values the definition does not list."""
 
     def __init__(self, tab):
         super().__init__(tab)
         self.tab = tab
 
+    @staticmethod
+    def _raw_col(index, f):
+        return index.column() == 3 and f.type not in ("ascii", "bytes", "dtc") and f.width <= 64
+
     def createEditor(self, parent, option, index):
-        data = index.data(ROLE_FIELD)
-        if not data or index.column() != 2:
+        data = index.siblingAtColumn(2).data(ROLE_FIELD)
+        if not data or index.column() not in (2, 3):
             return None
         key, f = data
+        if index.column() == 3:
+            if not self._raw_col(index, f):
+                return None
+            le = QLineEdit(parent)
+            le.setPlaceholderText(f"raw 0..0x{(1 << f.width) - 1:X}  (dec, or 0x hex)")
+            return le
         if f.enum:
             cb = QComboBox(parent)
             for v, lab in f.enum:
@@ -849,9 +871,12 @@ class FieldDelegate(QStyledItemDelegate):
         return le
 
     def setEditorData(self, ed, index):
-        key, f = index.data(ROLE_FIELD)
+        key, f = index.siblingAtColumn(2).data(ROLE_FIELD)
         payload = self.tab.payload_of(key)
         if payload is None:
+            return
+        if index.column() == 3:
+            ed.setText(f"0x{f.get_raw(payload):X}")
             return
         if isinstance(ed, QComboBox):
             raw = f.get_raw(payload)
@@ -868,12 +893,14 @@ class FieldDelegate(QStyledItemDelegate):
             ed.setText(f.get_bytes(payload).hex(" ").upper())
 
     def setModelData(self, ed, model, index):
-        key, f = index.data(ROLE_FIELD)
+        key, f = index.siblingAtColumn(2).data(ROLE_FIELD)
         payload = self.tab.payload_of(key)
         if payload is None:
             return
         try:
-            if isinstance(ed, QComboBox):
+            if index.column() == 3:
+                new = f.set_raw(payload, _parse_raw(ed.text()))
+            elif isinstance(ed, QComboBox):
                 new = f.set_raw(payload, ed.currentData())
             elif f.type == "ascii":
                 new = f.set_bytes(payload, ed.text().encode("latin-1", "replace"))
@@ -1576,6 +1603,7 @@ class CentralConfigTab(QWidget):
                          ("Load As-Built XML / .bin…", self.load),
                          ("Save As-Built XML…", self.save_xml),
                          ("Save .bin…", self.save_bin),
+                         ("Edit raw bytes…", self.edit_raw),
                          ("Revert edits", self.revert)):
             b = QPushButton(text)
             b.clicked.connect(fn)
@@ -1626,9 +1654,22 @@ class CentralConfigTab(QWidget):
         self.img = bytes(img)
         self.orig = bytes(img)
         self.vin = vin
-        cid = self.m.defs.guess_ccc(self.img, None)
-        if self.ccf.currentData() is None and cid:
-            self.ccf.setCurrentIndex(self.ccf.findData(cid))
+        dt = self.m.direct_tab
+        cid, why = self.m.defs.guess_ccc(self.img, dt.model.currentText().strip() or None,
+                                         dt.year.currentText().strip() or None)
+        cur = self.ccf.currentData()
+        if cur is not None and self.m.defs.ccc_vehicle_type_ok(cur, self.img):
+            if cid is not None and cid != cur:
+                self.m.log(f"CCF definition kept: {self.ccf.currentText().split()[0]} "
+                           f"(best guess would be {why})")
+        elif cid is not None:
+            k = self.ccf.findData(cid)
+            self.ccf.blockSignals(True)
+            self.ccf.setCurrentIndex(k)
+            self.ccf.blockSignals(False)
+            self.m.log(f"CCF definition chosen: {why}")
+        else:
+            self.m.log(f"CCF definition: {why} - pick one by hand")
         self.populate()
 
     def populate(self):
@@ -1643,11 +1684,69 @@ class CentralConfigTab(QWidget):
             for f in b.fields:
                 if "Carriage return" in f.name:
                     continue
-                ch = QTreeWidgetItem(["   " + f.name, f.position(b.length), "", "", f.key or ""])
+                ch = QTreeWidgetItem(["   " + f.name, self._pos(b, f), "", "", f.key or ""])
                 ch.setData(2, ROLE_FIELD, (b.no, f))
                 ch.setFlags(ch.flags() | Qt.ItemFlag.ItemIsEditable)
+                ch.setToolTip(2, "double-click: pick a defined value")
+                ch.setToolTip(3, "double-click: type any raw value (6 / 0x06)")
                 it.addChild(ch)
             it.setExpanded(b.no >= 4)
+        self.refresh()
+
+    @staticmethod
+    def _pos(b, f):
+        """Block position plus, inside the F106 range, the DID byte index."""
+        pos = f.position(b.length)
+        span = f.byte_span(b.length) if f.fits(b.length) else None
+        first = b.offset + (span[0] if span else (b.length * 8 - 1 - f.msb) // 8)
+        if first >= D.F106_BASE:
+            pos += f"  F106[{first - D.F106_BASE}]"
+        return pos
+
+    def edit_raw(self):
+        """Edit image bytes directly: offset as image offset (0x111 / 273) or
+        F106 index (F106:17); value as hex bytes. Checksum is re-fixed."""
+        if self.img is None:
+            QMessageBox.information(self, APP, "Load or read a CCC first.")
+            return
+        txt, ok = QInputDialog.getText(
+            self, "Raw CCC bytes",
+            "Offset: image offset (0x111) or F106 index (F106:17), then '=' and hex bytes\n"
+            "e.g.  F106:17 = 06      or      0x111 = 06\n"
+            "Without '=' the current bytes are shown.",
+            text="F106:")
+        if not ok or not txt.strip():
+            return
+        try:
+            where, _, val = txt.partition("=")
+            where = where.strip()
+            if where.upper().startswith("F106:"):
+                idx = parse_int(where[5:].strip())
+                off = None if idx is None else D.F106_BASE + idx
+            else:
+                off = parse_int(where)
+            if off is None or not 0 <= off < len(self.img):
+                raise ValueError(f"offset {where!r} outside the {len(self.img)}-byte image")
+            if not val.strip():
+                cur = self.img[off:off + 8]
+                QMessageBox.information(
+                    self, APP, f"image 0x{off:03X}"
+                    + (f" (F106[{off - D.F106_BASE}])" if off >= D.F106_BASE else "")
+                    + f": {cur.hex(' ').upper()} …")
+                return
+            data = parse_hex(val)
+            if off + len(data) > len(self.img):
+                raise ValueError("value runs past the end of the image")
+            if off <= D.CCC_CHECKSUM_OFF < off + len(data):
+                raise ValueError("byte 257 (F106[1]) is the checksum; it is recomputed "
+                                 "automatically")
+        except ValueError as e:
+            QMessageBox.warning(self, APP, str(e))
+            return
+        img = bytearray(self.img)
+        img[off:off + len(data)] = data
+        self.img = D.ccc_fix_checksum(bytes(img)) if len(img) == D.CCC_LEN else bytes(img)
+        self.m.log(f"CCC raw edit: 0x{off:03X} = {data.hex(' ').upper()}")
         self.refresh()
 
     def refresh(self):

@@ -338,24 +338,59 @@ class Defs:
                 "SELECT block_no,offset,length,layout_id FROM ccc_block WHERE ccc_id=? "
                 "ORDER BY offset", (ccc_id,)):
             name, size, _, fl = self._layout(lid)
-            out.append(CccBlock(bno, off, length, fl))
+            out.append(CccBlock(bno, off, length, [ccc_extend_enum(f) for f in fl]))
         return out
 
     def guess_ccc(self, image: bytes, model=None, year=None):
-        """Pick the CCF definition: explicit model/year first, else by the
-        car-configuration document number in block 1 (bytes 1..5 = '31827371'
-        BCD-ish + issue)."""
-        defs = self.ccc_defs()
-        if model:
-            cand = [d for d in defs if d[2] == model and (not year or d[3] == year)]
-            if cand:
-                return cand[-1][0]
-        if len(image) >= 9:
-            doc = image[1:5].hex().upper()
-            for d in defs:
-                if d[4] and d[4].replace(" ", "").upper().startswith(doc):
-                    return d[0]
-        return defs[0][0] if defs else None
+        """Pick the CCF definition for an image -> (ccc_id, reason).
+
+        The car-configuration document number ('31827371 Rev 05') is the same
+        in every CCF file, so it cannot tell platforms apart. The vehicle type
+        byte (F106[2], PARAM_EUCD_CCF_VEHICLE_TYPE) can: only the platform's
+        own files name its value (0x0A = 'C520' only in C520 files). Among
+        those, prefer the vehicle model/year hint (the Module data tab's
+        Vehicle), then the definition naming most of the image's enum values,
+        then the newest model year."""
+        best = []
+        for cid, name, mdl, yr, _cc, _len, _mods in self.ccc_defs():
+            vt, named, total = None, 0, 0
+            for b in self.ccc_blocks(cid):
+                p = image[b.offset:b.offset + b.length]
+                if len(p) != b.length:
+                    continue
+                for f in b.fields:
+                    if not f.enum or not f.fits(len(p)):
+                        continue
+                    lab = f.label(f.get_raw(p))
+                    total += 1
+                    named += lab is not None
+                    if f.key == "PARAM_EUCD_CCF_VEHICLE_TYPE":
+                        vt = lab
+            if vt is None:
+                continue
+            hint = (2 if model and mdl == model and year and yr == year else
+                    1 if model and mdl == model else 0)
+            best.append((hint, named / total if total else 0.0, _year_key(yr), cid,
+                         f"{name}: vehicle type '{vt}'"
+                         + (f", matches {model} {year or ''}".rstrip() if hint else "")
+                         + f", {named}/{total} values named"))
+        if not best:
+            return None, "no definition names this image's vehicle type"
+        best.sort(reverse=True)
+        return best[0][3], best[0][4]
+
+    def ccc_vehicle_type_ok(self, ccc_id, image: bytes) -> bool:
+        for b in self.ccc_blocks(ccc_id):
+            p = image[b.offset:b.offset + b.length]
+            for f in b.fields:
+                if f.key == "PARAM_EUCD_CCF_VEHICLE_TYPE" and f.enum and f.fits(len(p)):
+                    return f.label(f.get_raw(p)) is not None
+        return False
+
+
+def _year_key(y):
+    m = re.search(r"(\d+(?:\.\d+)?)", y or "")
+    return float(m.group(1)) if m else 0.0
 
 
 @dataclass
@@ -368,6 +403,31 @@ class CccBlock:
 
 CCC_LEN = 512
 CCC_CHECKSUM_OFF = 257      # block-4 byte 1: sum of block 5 (258..511) & 0xFF
+F106_BASE = 256             # DID F106 byte i = image byte 256 + i (BCM 0x8100 + i)
+
+# Values the module firmware accepts that the platform's IDS CCF does not list
+# (IDS lists only the variants Ford shipped on that platform). Keyed by CCF
+# parameter name; shown in the editor with a [fw]/[other platform] tag.
+CCC_EXTRA_ENUM = {
+    "PARAM_EUCD_CCF_DAYRUNNING_LIGHT": [
+        (0x06, "Dedicated DRL, user switchable from the cluster menu "
+               "[fw: BCM JV6T-14C094, not in any IDS CCF]"),
+        (0x0A, "User configurable DTRL lit in auto - dipped beam, only with halogen "
+               "headlamps 0x02 [other platform: C344N/C346N/V408N]"),
+    ],
+}
+
+
+def ccc_extend_enum(f: Field) -> Field:
+    extra = CCC_EXTRA_ENUM.get(f.key or "")
+    if not extra or not f.enum:
+        return f
+    have = {v for v, _ in f.enum}
+    add = [[v, lab] for v, lab in extra if v not in have]
+    if not add:
+        return f
+    return Field(f.name, f.lsb, f.msb, f.type, sorted(list(f.enum) + add),
+                 f.units, f.res, f.off, f.desc, f.key)
 
 
 def ccc_checksum(img: bytes) -> int:
