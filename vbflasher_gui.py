@@ -16,6 +16,7 @@ Only one bus job runs at a time; the UI refuses a second one while busy.
 """
 import os
 import queue
+import re
 import signal
 import sys
 import threading
@@ -24,8 +25,8 @@ import traceback
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from PySide6.QtCore import (QObject, QProcess, QSettings, Qt, QThread, QTimer,
-                            Signal)
+from PySide6.QtCore import (QObject, QProcess, QSettings, QSocketNotifier, Qt,
+                            QThread, QTimer, Signal)
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
@@ -71,6 +72,16 @@ def parse_int(s, default=None):
         return default
     return int(s, 0) if s.lower().startswith("0x") else int(s, 16) if any(
         c in "abcdefABCDEF" for c in s) else int(s)
+
+
+def _unique(path):
+    """path, or path with _2, _3 … before the extension if it already exists."""
+    stem, ext = os.path.splitext(path)
+    n, out = 1, path
+    while os.path.exists(out):
+        n += 1
+        out = f"{stem}_{n}{ext}"
+    return out
 
 
 # ==========================================================================
@@ -122,10 +133,11 @@ class Worker(QThread):
         self.pending += 1
         self.q.put((name, fn, done, on_post))
 
-    def shutdown(self):
+    def shutdown(self, timeout_ms=15000):
+        """Stop the worker; True when the thread has finished."""
         self.cancel.set()
         self.q.put(None)
-        self.wait(15000)
+        return self.wait(timeout_ms)
 
     def run(self):
         while True:
@@ -195,6 +207,11 @@ class Proc(QObject):
         self.p.setProcessEnvironment(env)
         self.p.readyReadStandardOutput.connect(self._read)
         self.p.finished.connect(self._fin)
+        # Own session: a Ctrl+C in the launching terminal must not reach a
+        # running flash/memwrite; the GUI decides (Main.on_unix_signal) and
+        # interrupt() still signals the child explicitly.
+        if hasattr(QProcess, "setUnixProcessParameters"):
+            self.p.setUnixProcessParameters(QProcess.UnixProcessFlag.CreateNewSession)
         self.log.emit(f"── {title or 'vbflasher'} ── {time.strftime('%H:%M:%S')}")
         self.log.emit("$ " + " ".join(argv[2:] if argv[1] == "-u" else argv))
         self.busy_changed.emit(True)
@@ -495,8 +512,53 @@ class Main(QMainWindow):
         box.setDefaultButton(QMessageBox.StandardButton.No)
         return box.exec() == QMessageBox.StandardButton.Yes
 
+    # -- Ctrl+C / SIGTERM from the launching terminal ------------------------
+    # Qt's event loop runs in C++, so Python's default SIGINT handler only
+    # fires the next time some Python slot runs - then KeyboardInterrupt is
+    # raised inside that slot and the window is left half-dead (greyed out).
+    # Instead the signal is written to a socket (signal.set_wakeup_fd) that a
+    # QSocketNotifier watches, and handled here on the GUI thread.
+    def install_signal_handlers(self):
+        import socket
+        self._sig_r, self._sig_w = socket.socketpair()
+        for s in (self._sig_r, self._sig_w):
+            s.setblocking(False)
+        signal.set_wakeup_fd(self._sig_w.fileno(), warn_on_full_buffer=False)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, lambda *_: None)      # real work: on_unix_signal
+        self._sig_note = QSocketNotifier(self._sig_r.fileno(), QSocketNotifier.Type.Read, self)
+        self._sig_note.activated.connect(self._sig_ready)
+        self._sig_count = 0
+        self._force_quit = False
+
+    def _sig_ready(self):
+        try:
+            data = self._sig_r.recv(64)
+        except BlockingIOError:
+            return
+        for signum in data:
+            self.on_unix_signal(signum)
+
+    def on_unix_signal(self, signum):
+        name = signal.Signals(signum).name
+        self._sig_count += 1
+        if self._sig_count >= 3:
+            print(f"\n{APP}: {name} x3 - exiting immediately", file=sys.__stderr__)
+            os._exit(130)
+        if self.proc.busy and self._sig_count == 1 and signum == signal.SIGINT:
+            self.log(f"!! {name}: a CLI job is running (flash / memwrite?). It was NOT "
+                     "interrupted. Press Ctrl+C again to abort it and quit.")
+            print(f"\n{APP}: CLI job running - Ctrl+C again aborts it and quits",
+                  file=sys.__stderr__)
+            return
+        print(f"\n{APP}: {name} - closing", file=sys.__stderr__)
+        self._force_quit = True
+        self.close()
+
     def closeEvent(self, ev):
-        if self.proc.busy and not self.confirm(APP, "A CLI job is running. Quit anyway?"):
+        force = getattr(self, "_force_quit", False)
+        if self.proc.busy and not force and not self.confirm(
+                APP, "A CLI job is running. Quit anyway?"):
             ev.ignore()
             return
         self.settings.setValue("module", self.mod_combo.currentData())
@@ -507,8 +569,12 @@ class Main(QMainWindow):
         self.settings.setValue("tab", self.tabs.currentIndex())
         for t in (self.direct_tab, self.central_tab):
             t.save_settings()
+        self.settings.sync()
         self.proc.kill()
-        self.worker.shutdown()
+        if not self.worker.shutdown(3000 if force else 15000):
+            # a bus job is stuck in I/O: do not let QThread's destructor abort
+            print(f"{APP}: worker still busy - exiting without waiting", file=sys.__stderr__)
+            os._exit(130 if force else 1)
         ev.accept()
 
 
@@ -1537,14 +1603,17 @@ class DirectConfigTab(QWidget):
             mod = t.short
         except B.OpError:
             mod = "MODULE"
+        mod_tag = "mod" if any(self.orig.get(d) != p for d, p in self.cur.items()) else ""
         f, _ = QFileDialog.getSaveFileName(
             self, "Save UCDS Direct Configuration XML",
-            os.path.join(self.m.settings.value("xmldir", HERE),
-                         f"Direct_{mod}_{time.strftime('%d%m%y')}_.xml"), "XML (*.xml)")
+            _unique(os.path.join(self.m.settings.value("xmldir", HERE),
+                                 f"Direct_{mod}_{time.strftime('%d%m%y')}_{mod_tag}.xml")),
+            "XML (*.xml)")
         if f:
             D.save_direct_xml(f, mod, {d: p for d, p in self.cur.items() if p is not None},
                               B.text(self.ident.get("F190")) or "NONE",
                               self.model.currentText(), self.year.currentText())
+            self.m.settings.setValue("xmldir", os.path.dirname(f))
             self.m.log(f"saved {f}")
 
     def edit_raw(self):
@@ -1608,6 +1677,12 @@ class CentralConfigTab(QWidget):
             b = QPushButton(text)
             b.clicked.connect(fn)
             row.addWidget(b)
+            if fn == self.write_module:
+                self.write_btn = b
+        self.write_btn.setEnabled(False)
+        self.write_btn.setToolTip("Read the CCC from the module or load a file first")
+        self._addr = self._hw = None
+        self._source = None           # backup file the current image came from
         row.addStretch()
         lay.addLayout(row)
         self.info = QLabel("No CCC loaded. Read it from the BCM/IPC (SBL + RequestUpload "
@@ -1650,10 +1725,14 @@ class CentralConfigTab(QWidget):
                 return b
         return None
 
-    def set_image(self, img, vin=""):
+    def set_image(self, img, vin="", source=None, from_txid=None):
         self.img = bytes(img)
         self.orig = bytes(img)
         self.vin = vin
+        self._source = source
+        self._from_txid = from_txid           # module it was read from (None: file)
+        self.write_btn.setEnabled(True)
+        self.write_btn.setToolTip(f"Write to the module; pre-write backup: {source}")
         dt = self.m.direct_tab
         cid, why = self.m.defs.guess_ccc(self.img, dt.model.currentText().strip() or None,
                                          dt.year.currentText().strip() or None)
@@ -1800,44 +1879,58 @@ class CentralConfigTab(QWidget):
             QMessageBox.warning(self, APP, f"{f}: {e}")
             return
         self.m.log(f"loaded CCC {len(img)} bytes from {f}")
-        self.set_image(img, vin)
+        self.set_image(img, vin, source=f)
+
+    def _default_name(self, ext):
+        """UCDS-style name, e.g. Asbuilt121126_WF0AXXWPMAEL32600_mod.xml;
+        '_mod' when the image differs from what was read/loaded, '_2', '_3'…
+        so an existing file is never offered for overwrite."""
+        vin = re.sub(r"[^0-9A-Z]", "", self.img[11:28].decode("latin-1", "replace").upper())
+        mod = "_mod" if self.orig is not None and self.img != self.orig else ""
+        base = f"Asbuilt{time.strftime('%d%m%y')}" + (f"_{vin}" if vin else "") + mod
+        d = self.m.settings.value("xmldir", HERE)
+        return _unique(os.path.join(d, base + ext))
+
+    def _saved(self, f):
+        self.m.settings.setValue("xmldir", os.path.dirname(f))
+        self.m.log(f"saved {f}")
 
     def save_xml(self):
         if self.img is None:
             return
-        f, _ = QFileDialog.getSaveFileName(
-            self, "Save UCDS As-Built XML",
-            os.path.join(self.m.settings.value("xmldir", HERE),
-                         f"Asbuilt{time.strftime('%d%m%y')}.xml"), "XML (*.xml)")
+        f, _ = QFileDialog.getSaveFileName(self, "Save UCDS As-Built XML",
+                                           self._default_name(".xml"), "XML (*.xml)")
         if f:
             vin = self.img[11:28].decode("latin-1", "replace")
             D.save_asbuilt_xml(f, self.img, vin)
-            self.m.log(f"saved {f}")
+            self._saved(f)
 
     def save_bin(self):
         if self.img is None:
             return
         f, _ = QFileDialog.getSaveFileName(self, "Save CCC binary",
-                                           self.m.settings.value("xmldir", HERE),
-                                           "Binary (*.bin)")
+                                           self._default_name(".bin"), "Binary (*.bin)")
         if f:
             Path(f).write_bytes(self.img)
-            self.m.log(f"saved {f}")
+            self._saved(f)
 
     # -- module I/O ------------------------------------------------------------
     def _target(self):
         return self.m.target(self.src.currentData())
 
     def _resolve_addr(self, t, then):
+        """then(addr, hw): address from the field or DID D12B, plus F111 (the
+        erase length depends on it). Default-session DID reads only."""
         txt = self.addr.text().strip()
-        if not txt.lower().startswith("auto"):
-            then(parse_int(txt), None)
-            return
+        fixed = None if txt.lower().startswith("auto") else parse_int(txt)
 
         def job(ctx):
             with B.Link(t, "d12b") as ln:
                 ln.wake()
                 hw = B.text(ln.read(0xF111)[0])
+                if fixed is not None:
+                    print(f"   CCC address 0x{fixed:08X} (manual); F111 {hw}")
+                    return fixed, hw
                 p, err = ln.read(0xD12B)
             if p is None or len(p) < 2:
                 print(f"   D12B not readable ({err}); using 0x00008000")
@@ -1849,37 +1942,38 @@ class CentralConfigTab(QWidget):
         self.m.run_job(f"read CCC address (D12B) from {t.name}", job,
                        lambda r, e: then(*r) if r else None)
 
-    def read_module(self, then=None, outfile=None):
+    def read_module(self, *_):
+        """Read the CCC (SBL + 35 upload, one module reset). The file it is
+        saved to is THE pre-write backup: Write does not read again."""
         t = self._target()
         os.makedirs(B.BACKUP_DIR, exist_ok=True)
-        out = outfile or os.path.join(
-            B.BACKUP_DIR, f"CCC_{t.short}_{time.strftime('%Y%m%d-%H%M%S')}.bin")
+        out = os.path.join(B.BACKUP_DIR,
+                           f"CCC_{t.short}_{time.strftime('%Y%m%d-%H%M%S')}.bin")
 
         def go(addr, hw):
             if addr is None:
                 return
-            self._addr, self._hw = addr, hw
             argv = ["memread", t.short, "--addr", hex(addr), "--length", "0x200",
                     "-o", out, "--yes", *self.m.cli_iface_args(t)]
 
             def fin(code):
                 if code != 0 or not os.path.exists(out):
                     QMessageBox.warning(self, APP, "memread failed — see the log.")
-                    if then:
-                        then(None)
                     return
-                img = Path(out).read_bytes()
-                self.m.log(f"   CCC saved to {out}")
-                if then:
-                    then(img)
-                else:
-                    self.set_image(img)
+                self.m.log(f"   CCC saved to {out} (backup for a later write)")
+                self.set_image(Path(out).read_bytes(), source=out, from_txid=t.txid)
+                self._addr, self._hw = addr, hw
             self.m.run_cli(argv, fin, title=f"read CCC from {t.name}")
 
         self._resolve_addr(t, go)
 
-    def write_module(self):
-        if self.img is None:
+    def write_module(self, *_):
+        """One confirmation, one memwrite (one SBL session, one reset). No
+        backup read before and no read-back after: the backup is the file the
+        image was read into / loaded from."""
+        if self.img is None or self._source is None:
+            QMessageBox.information(self, APP, "Read the CCC from the module or load a "
+                                    "file first.")
             return
         probs = D.ccc_check(self.img)
         if probs:
@@ -1887,60 +1981,66 @@ class CentralConfigTab(QWidget):
                                 + "\n".join(probs))
             return
         t = self._target()
+        if self._from_txid is not None and self._from_txid != t.txid:
+            QMessageBox.warning(self, APP, f"This CCC was read from module 0x{self._from_txid:03X}"
+                                f", but {t.name} is selected. Select the module it came from.")
+            return
         new = self.img
-        nchg = sum(1 for a, c in zip(self.orig or b"", new) if a != c)
+        diff = [i for i in range(len(new)) if (self.orig or b"")[i:i + 1] != new[i:i + 1]]
+        if not diff:
+            QMessageBox.information(self, APP, "Nothing changed — nothing to write.")
+            return
 
-        def got_backup(img):
-            if img is None:
+        def go(addr, hw):
+            if addr is None:
                 return
-            if len(img) != len(new):
-                QMessageBox.warning(self, APP, "backup read returned the wrong length; abort")
+            self._addr, self._hw = addr, hw
+            if not hw:
+                QMessageBox.warning(self, APP, f"F111 of {t.name} is unknown, so the erase "
+                                    "length cannot be chosen. Nothing written.")
                 return
-            diff = [i for i in range(len(new)) if img[i] != new[i]]
-            if not diff:
-                QMessageBox.information(self, APP, "The module already holds this CCC.")
-                return
-            elen = B.ccc_erase_len(t.profile, getattr(self, "_hw", ""))
-            detail = "\n".join(f"+{i:3d} (0x{i:03X}): {img[i]:02X} -> {new[i]:02X}"
+            elen = B.ccc_erase_len(t.profile, hw)
+            detail = "\n".join(f"0x{i:03X}" + (f" F106[{i - D.F106_BASE}]" if i >= D.F106_BASE
+                                               else "") + f": {self.orig[i]:02X} -> {new[i]:02X}"
                                for i in diff)
+            src = ("read from the module" if self._from_txid is not None
+                   else "loaded file (not a fresh module read)")
             if not self.m.confirm(
                     "Write Central Configuration",
-                    f"Write the 512-byte CCC to {t.name} at 0x{self._addr:08X}?\n\n"
-                    f"{len(diff)} byte(s) differ from the module (backup taken).\n"
-                    f"Erase length 0x{elen:X} (sector). The module is reset afterwards.",
+                    f"Ready to write the CCC to {t.name}?\n\n"
+                    f"{len(diff)} byte(s) changed (details below).\n"
+                    f"Address 0x{addr:08X}, erase 0x{elen:X}. One SBL session, then one "
+                    f"module reset. No read-back.\n\n"
+                    f"Backup = {src}:\n{self._source}",
                     detail):
+                self.m.log("CCC write cancelled")
                 return
             fn = os.path.join(B.BACKUP_DIR,
                               f"CCC_{t.short}_{time.strftime('%Y%m%d-%H%M%S')}_new.bin")
+            os.makedirs(B.BACKUP_DIR, exist_ok=True)
             Path(fn).write_bytes(new)
-            argv = ["memwrite", t.short, "--addr", hex(self._addr), "-i", fn,
-                    "--erase-len", hex(elen), "--yes", *self.m.cli_iface_args(t)]
+            argv = ["memwrite", t.short, "--addr", hex(addr), "-i", fn,
+                    "--erase-len", hex(elen), "--hw", hw, "--yes", *self.m.cli_iface_args(t)]
             if self.no_verify.isChecked():
                 argv.append("--no-verify")
 
             def written(code):
                 if code != 0:
-                    QMessageBox.warning(self, APP, "memwrite FAILED — see the log. A backup "
-                                        "of the previous CCC is in logs/backups.")
+                    QMessageBox.warning(self, APP, "memwrite FAILED — see the log.\n"
+                                        f"Backup: {self._source}")
                     return
-                vfile = fn.replace("_new.bin", "_verify.bin")
-                self.read_module(then=verified, outfile=vfile)
-
-            def verified(img):
-                if img == new:
-                    self.orig = new
-                    self.refresh()
-                    QMessageBox.information(self, APP, "CCC written and read back identical.")
-                else:
-                    QMessageBox.warning(self, APP, "Read-back DIFFERS from what was written!")
+                self.orig = new               # module now holds the written image
+                self._source = fn
+                self.refresh()
+                self.m.log(f"CCC written to {t.name}; image saved as {fn}")
+                QMessageBox.information(self, APP, "CCC written.")
 
             self.m.run_cli(argv, written, title=f"write CCC to {t.name}")
 
-        if not self.m.confirm("Write Central Configuration",
-                              f"{nchg} byte(s) edited. First a fresh backup is read from "
-                              f"{t.name}, then you confirm the write. Continue?"):
-            return
-        self.read_module(then=got_backup)
+        if self._addr is not None and self._from_txid == t.txid:
+            go(self._addr, self._hw)          # known from the read: no bus access yet
+        else:
+            self._resolve_addr(t, go)         # loaded file: D12B/F111 read, no reset
 
 
 # ==========================================================================
@@ -2539,8 +2639,11 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP)
     w = Main()
+    w.install_signal_handlers()
     w.show()
-    sys.exit(app.exec())
+    rc = app.exec()
+    signal.set_wakeup_fd(-1)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
