@@ -590,12 +590,13 @@ ECUS = {
         ),
     ),
     0x7A7: EcuProfile(
-        name="FCIM (front controls / Mini EFP)", txid=0x7A7, bus="I-CAN",
+        name="FCIM (front controls / Mini EFP)", txid=0x7A7, bus="MS-CAN",
         aliases=("FCIM", "EFP", "BEZEL"),
         # TRW "Mini EFP" button panel of SYNC 3 Kugas, Renesas R8C/23 (M16C core,
         # on-chip CAN). Live: F188 F1CT-14F565-HC, F111 F1CT-14F571-HB, F113
-        # F1CT-18K811-HC (car, can2). Diag 0x7A7 -> 0x7AF on I-CAN; also takes the
-        # 0x7DF functional request (CAN slot table at 0x141AA of the application).
+        # F1CT-18K811-HC (first read on can2 / I-CAN). Diag 0x7A7 -> 0x7AF, now
+        # registered on MS-CAN (can1) at the user's direction, 2026-11-14; also
+        # takes the 0x7DF functional request (CAN slot table at 0x141AA of the app).
         # Application VBFs F1ET-14F565-HC / CJ5T-14F565-HG: 0x4000..0xBFFF +
         # 0x14000..0x1BFFF; SBL F1ET-14F567-HA (729 B, load + call 0x400).
         # Firmware analysis: /home/gl/Projects/ford/FCIM (Ghidra project ghidra/FCIM.gpr).
@@ -608,7 +609,7 @@ ECUS = {
         finalize=True,
     ),
     0x7D0: EcuProfile(
-        name="APIM", txid=0x7D0, bus="MS-CAN",
+        name="APIM", txid=0x7D0, bus="HS-CAN",
         aliases=("APIM",),
         secrets=(
             SecretRule("", 3, "9A78563412"),

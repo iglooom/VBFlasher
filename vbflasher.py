@@ -2927,13 +2927,13 @@ def selftest():
         getattr(ecu_db.get_profile(0x7E0), "bus", None) == "HS-CAN"
         and getattr(ecu_db.get_profile(0x7E0), "default_iface", lambda: None)()
         == "can0")
-    _expected_ms = {0x720, 0x727, 0x733, 0x7A5, 0x7D0}
+    _expected_ms = {0x720, 0x727, 0x733, 0x7A5, 0x7A7}
     _actual_ms = {txid for txid, p in ecu_db.ECUS.items() if p.bus == "MS-CAN"}
     chk("all registered MS-CAN modules default to can1",
         _actual_ms == _expected_ms
         and all(ecu_db.ECUS[x].default_iface() == "can1" for x in _actual_ms),
         f"actual={sorted(hex(x) for x in _actual_ms)}")
-    _expected_ic = {0x7A7}
+    _expected_ic = set()           # no module registered on I-CAN at present
     _actual_ic = {txid for txid, p in ecu_db.ECUS.items() if p.bus == "I-CAN"}
     chk("all registered I-CAN modules default to can2",
         _actual_ic == _expected_ic
@@ -2963,10 +2963,22 @@ def selftest():
             chk("read-only ALL skips an absent I-CAN interface",
                 _all_iface_fn(None, optional=True) == ["can0", "can1"])
             os.path.exists = lambda p: True if p.startswith("/sys/class/net/") else _real_exists(p)
-            chk("read-only ALL adds I-CAN can2 when present",
-                _all_iface_fn(None, optional=True) == ["can0", "can1", "can2"])
-            globals()["_iface_usable"] = lambda i: i != "can2"
-            chk("read-only ALL skips a present-but-DOWN I-CAN interface",
+            # No real module is registered on I-CAN today: register a stand-in
+            # so the optional-bus path keeps its coverage.
+            _ic_probe = ecu_db.EcuProfile(name="selftest I-CAN", txid=0x7FE, bus="I-CAN")
+            ecu_db.ECUS[0x7FE] = _ic_probe
+            try:
+                chk("read-only ALL adds I-CAN can2 when present",
+                    _all_iface_fn(None, optional=True) == ["can0", "can1", "can2"])
+                chk("destructive ALL never adds I-CAN",
+                    _all_iface_fn(None) == ["can0", "can1"])
+                globals()["_iface_usable"] = lambda i: i != "can2"
+                chk("read-only ALL skips a present-but-DOWN I-CAN interface",
+                    _all_iface_fn(None, optional=True) == ["can0", "can1"])
+            finally:
+                ecu_db.ECUS.pop(0x7FE, None)
+            globals()["_iface_usable"] = lambda i: True
+            chk("read-only ALL without I-CAN modules stays on can0/can1",
                 _all_iface_fn(None, optional=True) == ["can0", "can1"])
             globals()["_iface_usable"] = lambda i: i != "can1"
             chk("ALL skips a DOWN core interface and uses what is up",
