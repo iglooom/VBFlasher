@@ -168,6 +168,19 @@ class EcuProfile:
     backup_regions: tuple = ()
     rmba_session: int = 0x03
     rmba_level: int = 3
+    # Module-owned data regions that an OEM application file ERASES as part of
+    # a normal reflash (tuple of (addr, length, name)). A VBF whose header
+    # erase list leaves one of them standing keeps the module's stored data,
+    # which is only coherent with the SAME software version that wrote it, so
+    # the flash requires an exact identity match (override: --force).
+    retained_regions: tuple = ()
+
+    def retained_by(self, erase):
+        """The retained_regions an erase list (tuple of (addr, len)) does NOT
+        fully cover, i.e. the module data such a file leaves in place."""
+        def covered(a, l):
+            return any(ea <= a and a + l <= ea + el for ea, el in erase)
+        return tuple(r for r in self.retained_regions if not covered(r[0], r[1]))
 
     def resp_id(self):
         return self.rxid if self.rxid is not None else self.txid + 8
@@ -372,6 +385,16 @@ ECUS = {
         finalize=True,
         finalize_response=bytes.fromhex("710103041002"),
         transfer_exit_crc=True,
+        # The OEM GV6T-14D049 header erases these two besides the application
+        # (UCDS 31 01 FF00 x3 in the captures above). 0xFFC000-0xFFC7FF
+        # (manufacturing) is never erased by any file. A file that skips one
+        # of these (CCM/RE/work/qa45 *-keepEEE / *-apponly) must go onto the
+        # same software version: see CCM/RE/CCM_CCSTAT4_PATCH.md section 4.
+        retained_regions=(
+            (0x00FF8000, 0x4000, "Emulation Flash (emulated EEPROM: "
+                                 "alignment / configuration)"),
+            (0x00FFC800, 0x3800, "calibration A/B banks"),
+        ),
     ),
     0x706: EcuProfile(
         name="IPMA (front camera)", txid=0x706, bus="HS-CAN", rxid=0x70E,

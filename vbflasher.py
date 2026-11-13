@@ -888,6 +888,9 @@ def flash_session(txid, files, args):
             else:
                 print(f"      identity gate: resolved from the part family "
                       f"at flash time (dry run — ECU not read)")
+            for a, l, name in profile.retained_by(v.flash_erase()):
+                print(f"      KEEPS 0x{a:08X} len 0x{l:06X} {name} (not in this "
+                      f"file's erase list) -> needs the SAME version on the ECU")
         if profile.finalize:
             print("\n   FINALISE  31 01 0304 (checkProgrammingDependencies) "
                   "after the last block")
@@ -977,6 +980,23 @@ def flash_session(txid, files, args):
             else:
                 print(f"   {v.part}: identity unverified "
                       f"(no readable software DID); proceeding")
+            kept = profile.retained_by(v.flash_erase())
+            if kept and verdict != "exact":
+                names = "; ".join(f"0x{a:08X} {n}" for a, _, n in kept)
+                msg = (f"{os.path.basename(v.path)} does not erase {names}. That "
+                       f"data stays in the module and is only coherent with the "
+                       f"version that wrote it, but the ECU does not report "
+                       f"{v.part} ("
+                       + (f"{gdid}={live}" if live else "no readable software DID")
+                       + "). Flash the OEM-erase-map file for a version change.")
+                if args.force:
+                    print(f"   WARNING (--force): {msg}")
+                else:
+                    raise SystemExit(f"retained-data gate: {msg} "
+                                     f"Use --force to flash it anyway.")
+            elif kept:
+                print(f"   {v.part}: keeps " + ", ".join(n for _, _, n in kept)
+                      + " (same version on the ECU)")
 
         print("\n== session + security ==")
         enter_programming_session(ecu, args)

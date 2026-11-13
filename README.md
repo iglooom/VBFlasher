@@ -381,6 +381,37 @@ RAM, erase, download, finalise, reset — with its usual checks.
 Tunables: `--flood-interval` (default 0.012 s, 0 disables the flood and probes
 only) and `--catch-probe` (pause between probe rounds, default 0.05 s).
 
+### Files that keep module data (retained-data gate)
+
+Some profiles list `retained_regions`: module-owned data that the OEM file's
+erase map wipes (CCM: Emulation Flash `0xFF8000` = alignment/configuration,
+calibration banks `0xFFC800`). A VBF whose header `erase` list leaves one of them
+standing (e.g. `CCM/RE/work/qa45/*-apponly.VBF`, `*-keepEEE.VBF`) keeps that data,
+and the data is only coherent with the version that wrote it. The plan prints
+`KEEPS 0x… <region>`, and the flash **refuses unless the ECU already reports the
+same part number** (`F188 == sw_part_number`). `--force` downgrades it to a warning.
+For a version change, flash the file with the full OEM erase map.
+
+### CCM (Delphi ESR, 0x764)
+
+Everything is reproduced from the UCDS captures (`ford/CCM/GV6T/`) and covered
+offline by `.tests/test_ccm_flash_replay.py`, a fake bootloader that answers like
+the capture and enforces erase-before-write. Security level 1 secret
+`AACCCC3355` (capture-verified), SBL `AE9T-14D051-AA` to `0x03FF9000`, 128-byte
+transfers, every `36` pending ~185 ms (≈0.7 KiB/s: about 9 min for the 352 KiB
+application), `37` CRC echo, finalise `71 01 0304 10 02`.
+
+```bash
+vbflasher ident CCM                                        # F188 must match the file
+vbflasher flash --dry-run GV6T-14D049-AD-qa45-apponly.VBF  # plan + KEEPS lines
+vbflasher flash GV6T-14D049-AD-qa45-apponly.VBF
+```
+
+Not yet done live with VBFlasher. UCDS put the whole bus in programming first
+(`7DF 10 82` ×71) and then sent the physical `10 02`. Whether the CCM application
+also accepts a bare physical `10 02` is not captured. If it answers with a
+negative response, rerun with `--quiet-bus`, which sends the same functional `10 82`.
+
 ## Service procedures
 
 Post-repair / configuration procedures, reproduced with the generic `routine`
@@ -777,6 +808,8 @@ Append one `EcuProfile` to `ECUS` in `ecu_db.py` — nothing else changes:
     # and SecretRule("", 1, "...", sw_prefix="GJ5T-18D619")
     default_sbl="MY-SBL.vbf",                      # fallback
     finalize=True,          # run 31 01 0304 before reset (PCM/TCM/ABS/PSCM/IPMA)
+    # module data an OEM file's erase map wipes; a file that skips it needs the same version
+    # retained_regions=((0xFF8000, 0x4000, "emulated EEPROM"),),
     sbl_call_halfword=False,# start SBL with high 16 bits only (no known ECU; default full 4-byte addr)
 )
 ```
@@ -810,6 +843,7 @@ python3 -m unittest discover -s .tests           # capture regressions + CLI flo
 | `test_routine.py` | `routine` (31 RoutineControl) |
 | `test_readdid_poll.py` | `readdid --poll` (periodic watch, `--until`, `--changes`, session recovery) |
 | `test_abs_capture.py` / `test_ccm_capture.py` | secrets, SBL/finalise signatures, `37` CRC echoes from FORScan / UCDS captures |
+| `test_ccm_flash_replay.py` | full CCM flash against a fake ESR bootloader (pending `36`/`37`, erase-before-write); qa45 full/keepEEE/apponly; retained-data gate |
 | `test_hcm_profile.py` | HCM registry entry + `readdid` |
 | `test_hvac_profile.py` | HVAC generations, software-keyed SBL/secret, generation guard, keygen vs the GJ5T application (`../HVAC/work/AK.bin`, skips when absent) |
 
