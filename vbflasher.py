@@ -1752,10 +1752,20 @@ def _profile_iface(profile, override):
 _ALL_CORE_BUSES = ("HS-CAN", "MS-CAN")
 
 
+def _iface_usable(iface):
+    """True when the interface exists and is not administratively DOWN."""
+    return (os.path.exists(f"/sys/class/net/{iface}")
+            and iface_is_up(iface) is not False)
+
+
 def _all_ifaces(override, optional=False):
     """Interfaces needed for ALL: override once, or the HS/MS buses. With
     optional=True (read-only scans) also every other registered bus whose
-    interface exists on this host."""
+    interface exists on this host.
+
+    Without an override, absent or DOWN interfaces are dropped (with a note)
+    so ALL just covers the buses that are up; it fails only when none is.
+    An explicit --iface is returned as-is and checked strictly by the caller."""
     if override:
         return [override]
     core = {p.default_iface() for p in ecu_db.ECUS.values() if p.bus in _ALL_CORE_BUSES}
@@ -1763,7 +1773,15 @@ def _all_ifaces(override, optional=False):
         core |= {p.default_iface() for p in ecu_db.ECUS.values()
                  if p.bus not in _ALL_CORE_BUSES
                  and os.path.exists(f"/sys/class/net/{p.default_iface()}")}
-    return sorted(core)
+    up = sorted(i for i in core if _iface_usable(i))
+    skipped = sorted(core - set(up))
+    if skipped:
+        print(f"   NOTE: skipping {', '.join(skipped)} (absent or DOWN); "
+              f"using {', '.join(up) or 'none'}")
+    if not up:
+        raise SystemExit(f"no usable CAN interface for ALL "
+                         f"({', '.join(skipped)} absent or DOWN).")
+    return up
 
 
 def _check_iface(iface):
@@ -2149,10 +2167,10 @@ def _ident_all(args):
         profile = ecu_db.ECUS[txid]
         iface = _profile_iface(profile, args.iface)
         rxid = profile.resp_id()
-        if iface not in ifaces:                 # optional bus without an interface
+        if iface not in ifaces:                 # interface absent or DOWN
             absent.append(profile)
             print(f"\n-- {profile.name}  tx=0x{txid:03X}  {profile.bus} "
-                  f"interface {iface} not present, skipped")
+                  f"interface {iface} absent or DOWN, skipped")
             continue
         ecu = Ecu(iface, txid, rxid, execute=True)
         # quick probe: is anything home? (bounded, so absent modules are fast)
@@ -2224,7 +2242,7 @@ def _dtc_all(args):
         iface = _profile_iface(profile, args.iface)
         label = (f"{profile.name.split()[0]} "
                  f"(0x{txid:03X}/0x{profile.resp_id():03X}, {iface})")
-        if iface not in ifaces:                 # optional bus without an interface
+        if iface not in ifaces:                 # interface absent or DOWN
             silent.append(profile)
             print("   %-39s %8s %8s" % (label, "n/a", "n/a"))
             continue
@@ -2913,19 +2931,33 @@ def selftest():
     _all_iface_fn = globals().get("_all_ifaces")
     chk("ALL interface resolver exists", callable(_all_iface_fn))
     if callable(_all_iface_fn):
-        chk("ALL defaults cover HS can0 and MS can1",
-            _all_iface_fn(None) == ["can0", "can1"],
-            str(_all_iface_fn(None)))
-        _real_exists = os.path.exists
+        _real_exists, _real_usable = os.path.exists, globals()["_iface_usable"]
         try:
+            globals()["_iface_usable"] = lambda i: True
+            chk("ALL defaults cover HS can0 and MS can1",
+                _all_iface_fn(None) == ["can0", "can1"],
+                str(_all_iface_fn(None)))
             os.path.exists = lambda p: False if p.startswith("/sys/class/net/") else _real_exists(p)
             chk("read-only ALL skips an absent I-CAN interface",
                 _all_iface_fn(None, optional=True) == ["can0", "can1"])
             os.path.exists = lambda p: True if p.startswith("/sys/class/net/") else _real_exists(p)
             chk("read-only ALL adds I-CAN can2 when present",
                 _all_iface_fn(None, optional=True) == ["can0", "can1", "can2"])
+            globals()["_iface_usable"] = lambda i: i != "can2"
+            chk("read-only ALL skips a present-but-DOWN I-CAN interface",
+                _all_iface_fn(None, optional=True) == ["can0", "can1"])
+            globals()["_iface_usable"] = lambda i: i != "can1"
+            chk("ALL skips a DOWN core interface and uses what is up",
+                _all_iface_fn(None) == ["can0"])
+            globals()["_iface_usable"] = lambda i: False
+            try:
+                _all_iface_fn(None)
+                chk("ALL with every interface DOWN exits", False)
+            except SystemExit:
+                chk("ALL with every interface DOWN exits", True)
         finally:
             os.path.exists = _real_exists
+            globals()["_iface_usable"] = _real_usable
         chk("ALL --iface override uses only override",
             _all_iface_fn("vcan7") == ["vcan7"])
     _bp = build_parser()

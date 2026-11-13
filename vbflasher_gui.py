@@ -2367,9 +2367,15 @@ class DtcTab(QWidget):
         self.m.run_job(f"clear DTCs on {t.name}", job, lambda r, e: self.read())
 
     def clear_all(self):
-        ifs = sorted({self.m.target(tx).iface for tx in ecu_db.ECUS})
+        ifs, skipped = B.usable_ifaces(sorted({self.m.target(tx).iface for tx in ecu_db.ECUS}))
+        if not ifs:
+            QMessageBox.warning(self, APP, f"No usable interface ({', '.join(skipped)} "
+                                           "absent or DOWN).")
+            return
+        note = f"\n(skipping {', '.join(skipped)}: absent or DOWN)" if skipped else ""
         if not self.m.confirm("Clear ALL DTCs", "Broadcast 14 FFFFFF on 0x7DF to every "
-                              f"module on {', '.join(ifs)}? (unconfirmed, fire-and-forget)"):
+                              f"module on {', '.join(ifs)}? (unconfirmed, fire-and-forget)"
+                              + note):
             return
 
         def job(ctx):
@@ -2531,9 +2537,14 @@ class ServiceTab(QWidget):
 
     def reset_all(self):
         mode = int(self.rmode.currentText().split()[0], 16)
-        ifs = sorted({self.m.target(tx).iface for tx in ecu_db.ECUS})
+        ifs, skipped = B.usable_ifaces(sorted({self.m.target(tx).iface for tx in ecu_db.ECUS}))
+        if not ifs:
+            QMessageBox.warning(self, APP, f"No usable interface ({', '.join(skipped)} "
+                                           "absent or DOWN).")
+            return
+        note = f"\n(skipping {', '.join(skipped)}: absent or DOWN)" if skipped else ""
         if not self.m.confirm("Reset ALL", f"Broadcast 11 {mode | 0x80:02X} to EVERY module on "
-                              f"{', '.join(ifs)}? Vehicle stationary, engine off."):
+                              f"{', '.join(ifs)}? Vehicle stationary, engine off." + note):
             return
 
         def job(ctx):

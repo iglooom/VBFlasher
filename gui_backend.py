@@ -53,6 +53,14 @@ def iface_state(iface):
     return "up" if up else ("DOWN" if up is False else "?")
 
 
+def usable_ifaces(ifaces):
+    """Split interfaces into (usable, skipped): absent or DOWN ones are skipped
+    so ALL operations just cover the buses that are up."""
+    up = [i for i in ifaces
+          if os.path.exists(f"/sys/class/net/{i}") and vf.iface_is_up(i) is not False]
+    return up, [i for i in ifaces if i not in up]
+
+
 @dataclass
 class Target:
     """What the user selected: a registered profile (or a raw CAN id) + iface."""
