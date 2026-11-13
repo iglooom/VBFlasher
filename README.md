@@ -478,6 +478,32 @@ before and after with `vbflasher readdid HCM 3B03 3B05` (front / rear, raw
 `uint16_be − 200` = mm). The IDS sensor-height procedure uses a different
 routine (`0x2054`) for other platforms — it is **not** this module's learn.
 
+#### HCM flashing / SBL (V850 Visteon generation)
+
+Bench-proven on `7S71-13K031-CC`, F188 `AM51-14C084-CB`, F120 `AM51-14C399-AB`
+(`vbflasher flash HCM --test-sbl`, 6 runs on 2026-11-14: 5 started the SBL, the first one hung, see below).
+
+* **F111 is refused (NRC 31)**, so the SBL and secret are picked from the software
+  part: `AM51-14C084*`/`7S71-14C084*` → SBL `AM51-14C087-AA` (same payload as
+  `7S71-14C087-AB`, call `0xFFFFE254`), level-1 secret `DACCCB6EB3` (IDS ffdata HCM
+  VMC_9938 C520_EU; accepted by both the application and the PBL).
+* **Unlock the application in `10 03` BEFORE `10 02`.** Otherwise `27 01` in the
+  programming session answers `7F 27 7F`. The profile does this automatically
+  (`prog_preunlock_session=0x03`): `10 03` → `27 01/02` → `10 02` → `27 01/02` (the PBL
+  seed is a constant `03 76 A5`) → `34/36/37` ×4 (each `37` echoes the block CRC-16) →
+  `31 01 0301 FFFFE254` → `71 01 03 01 00 00`.
+* The SBL's service table (block at `0xFFFFEED0`) holds `10 11 3E 22 27 36 37 31 34 2E`.
+  It has **no `35` RequestUpload**, and the application answers `23` with NRC 11.
+  There is no read-back or backup path, so `memread`/`backup` cannot work on this module.
+* **One unexplained hang:** the first SBL start of the session got no response to
+  `31 01 0301` for 10 s. The tool aborted before any erase, and the module was back in its
+  application when probed later. Five later starts succeeded, including one directly after
+  a seed-only `10 02` visit. A cold-boot RAM dependency is unconfirmed: power-cycle the
+  module, then run `--test-sbl` first. If that start hangs, it reproduces the failure.
+  A start that times out never erases, so the failure is safe.
+* GEN3 Varroc HCM (`AM51-14C084-DA`, `GJ5T-14D063`, F111 `AM51-14F110`): SBL
+  `BK21-14D065-AA` and secret `08306155AA` come from IDS. **Not tested on a module.**
+
 ### IPMA — front camera alignment learn (drive)
 
 F1FT IPMA (tx `0x706` / rx `0x70E`, HS-CAN). Source: IDS capture
@@ -815,8 +841,7 @@ Append one `EcuProfile` to `ECUS` in `ecu_db.py` — nothing else changes:
 ```
 
 Registered today (`vbflasher list`): IPMA 0x706, GWM 0x716, IPC 0x720,
-BCM 0x726, ACM 0x727, PSCM 0x730, DEATC/HVAC 0x733, HCM 0x734 (diagnostics
-only — no secret/SBL established), RCM 0x737, ABS 0x760, CCM 0x764,
+BCM 0x726, ACM 0x727, PSCM 0x730, DEATC/HVAC 0x733, HCM 0x734, RCM 0x737, ABS 0x760, CCM 0x764,
 FCDIM 0x7A5, APIM 0x7D0, PCM 0x7E0, TCM 0x7E1.
 
 After adding a module, extend the MS-CAN set in `--selftest` if it lives on
@@ -844,7 +869,7 @@ python3 -m unittest discover -s .tests           # capture regressions + CLI flo
 | `test_readdid_poll.py` | `readdid --poll` (periodic watch, `--until`, `--changes`, session recovery) |
 | `test_abs_capture.py` / `test_ccm_capture.py` | secrets, SBL/finalise signatures, `37` CRC echoes from FORScan / UCDS captures |
 | `test_ccm_flash_replay.py` | full CCM flash against a fake ESR bootloader (pending `36`/`37`, erase-before-write); qa45 full/keepEEE/apponly; retained-data gate |
-| `test_hcm_profile.py` | HCM registry entry + `readdid` |
+| `test_hcm_profile.py` | HCM registry, software-keyed SBL/secret selection, bench seed/key pairs, `10 03` pre-unlock order, `readdid` |
 | `test_hvac_profile.py` | HVAC generations, software-keyed SBL/secret, generation guard, keygen vs the GJ5T application (`../HVAC/work/AK.bin`, skips when absent) |
 
 Tests that need OEM VBFs outside the repo (`../ABS/*.vbf`) skip when absent.

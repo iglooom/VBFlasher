@@ -131,6 +131,25 @@ def security_exchange(ecu, level, secret, algo="ford"):
                f"27 {level + 1:02X} sendKey", timeout=5.0)
 
 
+def pre_programming_unlock(ecu, profile, level, secret, algo="ford"):
+    """Unlock the APPLICATION in profile.prog_preunlock_session before 10 02.
+
+    Some modules (V850 Visteon HCM) refuse 27 xx in programmingSession with
+    NRC 7F until the application has been unlocked in the extended session;
+    their bootloader then requests its own seed/key after 10 02. A no-op for
+    every profile that does not set prog_preunlock_session."""
+    sess = getattr(profile, "prog_preunlock_session", None)
+    if sess is None or secret is None:
+        return
+    r = ecu.expect(f"10{sess:02X}", 0x50, f"10 {sess:02X} pre-unlock session",
+                   timeout=5.0)
+    if r is not None:
+        print(f"   OK   10 {sess:02X} diagnosticSession        {fmt(r)}")
+    time.sleep(0.2)
+    security_exchange(ecu, level, secret, algo)
+    print(f"   application unlocked in session {sess:02X} (required before 10 02)")
+
+
 def settle_before_seed(delay=SEED_DELAY):
     """Wait out the post-session bootloader settle before requestSeed."""
     if delay > 0:
@@ -999,6 +1018,8 @@ def flash_session(txid, files, args):
                       + " (same version on the ECU)")
 
         print("\n== session + security ==")
+        if not args.recovery and not args.skip_security:
+            pre_programming_unlock(ecu, profile, level, secret, algo)
         enter_programming_session(ecu, args)
         # Keep the bootloader settle even when SecurityAccess is skipped.
         # Settle before requestSeed on EVERY module (see SEED_DELAY). The one
@@ -1152,6 +1173,7 @@ def _open_sbl_session(profile, args, need_secret=True):
 
     quiet.arm()
     print("\n== session + security ==")
+    pre_programming_unlock(ecu, profile, level, secret, algo)
     r = None
     for i in range(1, args.wake_tries + 1):
         r = ecu.req("1002", timeout=1.0, what=f"10 02 programmingSession {i}")

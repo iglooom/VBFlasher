@@ -149,6 +149,11 @@ class EcuProfile:
     # SBL is started with routine 0301. Ford tools send the 4-byte call address;
     # the IPMA ground-truth capture sends only the HIGH 16 bits. Per-ECU.
     sbl_call_halfword: bool = False
+    # Session in which the APPLICATION must be unlocked BEFORE 10 02, or None.
+    # The V850 Visteon HCM answers 27 01 in programmingSession with NRC 7F
+    # until the app has been unlocked in 10 03; after 10 02 its bootloader
+    # then asks for a second, normal seed/key (same secret). Bench-proven.
+    prog_preunlock_session: Optional[int] = None
     # Run routine 0304 (checkProgrammingDependencies / finalise) after the last
     # TransferExit and before reset. The DM5T IPC PBL stamps its boot marker here.
     finalize: bool = False
@@ -467,9 +472,41 @@ ECUS = {
         rxid=0x73C, aliases=("HCM",),
         # Address pair captured in ../CANBus/read_pid (3B03/3B05 reads on
         # can0); physical HS-CAN placement corroborated by CAN-HS.dbc.
-        # Diagnostic registration only: no HCM-specific programming capture,
-        # hardware-qualified secret or SBL has been established here.
-        # Leave those unset rather than guessing a flash/recovery recipe.
+        #
+        # Two hardware generations answer on 0x734 (IDS IVS, C344/C346/C520):
+        #  * Visteon EuCD HCM, NEC V850ES/Fx2: assy 7S71-/AM51-13K031-A*/CC,
+        #    F111 7S71-14C243-BB (the live module REFUSES F111 with NRC 31,
+        #    so selection is by software part), strategy 7S71-/AM51-14C084
+        #    (A*, B*, C*, X*), SBL AM51-14C087-AA (payload byte-identical to
+        #    7S71-14C087-AB, call 0xFFFFE254 = V850 iRAM). Reprog secret
+        #    DACCCB6EB3 = IDS ffdata MODULE_REC HCM VMC_9938 (C520_EU MY13.25),
+        #    VMC_9365/9366 (CD345), VMC_7365 (C344/C346 MY11).
+        #  * Varroc GEN3 HCM: assy AM51-13K031-CA, F111 AM51-14F110-CA,
+        #    strategy AM51-14C084-DA / GJ5T-14D063, SBL BK21-14D065-AA
+        #    (call 0x03FFD000). Secret 08306155AA = ffdata VMC_11239 (C520_EU
+        #    MY17) / VMC_8908 (C520 MY17-19). UNVERIFIED on a module.
+        secrets=(
+            SecretRule("", 1, "DACCCB6EB3", sw_prefix="AM51-14C084"),
+            SecretRule("", 1, "DACCCB6EB3", sw_prefix="7S71-14C084"),
+            SecretRule("7S71-14C243", 1, "DACCCB6EB3"),
+            SecretRule("", 1, "08306155AA", sw_prefix="AM51-14C084-D"),
+            SecretRule("", 1, "08306155AA", sw_prefix="GJ5T-14D063"),
+            SecretRule("AM51-14F110", 1, "08306155AA"),
+        ),
+        sbls=(
+            SblRule("", "AM51-14C087-AA.vbf", sw_prefix="AM51-14C084"),
+            SblRule("", "AM51-14C087-AA.vbf", sw_prefix="7S71-14C084"),
+            SblRule("7S71-14C243", "AM51-14C087-AA.vbf"),
+            SblRule("", "BK21-14D065-AA.vbf", sw_prefix="AM51-14C084-D"),
+            SblRule("", "BK21-14D065-AA.vbf", sw_prefix="GJ5T-14D063"),
+            SblRule("AM51-14F110", "BK21-14D065-AA.vbf"),
+        ),
+        # Bench-proven on 7S71-13K031-CC / AM51-14C084-CB: 27 01 in 10 02
+        # answers NRC 7F unless the app was unlocked in 10 03 first; the PBL
+        # then issues its own seed (unlocked with the same DACCCB6EB3).
+        prog_preunlock_session=0x03,
+        # Bench-proven: every SBL block's 37 answered 77 <CRC-16 of the block>.
+        transfer_exit_crc=True,
     ),
     0x797: EcuProfile(
         name="SASM (steering column / steering-wheel module)", txid=0x797, bus="HS-CAN",
