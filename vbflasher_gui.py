@@ -25,7 +25,7 @@ import traceback
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from PySide6.QtCore import (QObject, QProcess, QSettings, QSocketNotifier, Qt,
+from PySide6.QtCore import (QItemSelectionModel, QObject, QProcess, QSettings, QSocketNotifier, Qt,
                             QThread, QTimer, Signal)
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QTextCursor
 from PySide6.QtWidgets import (
@@ -1225,6 +1225,21 @@ class DirectConfigTab(QWidget):
         return out
 
     def populate(self):
+        # Rebuilding the tree must not lose the view: keep expanded DIDs, the
+        # selection and the scroll position (a read used to fold everything).
+        expanded = {d for d, it in self.items.items() if it.isExpanded()}
+        selected = set()
+        for it in self.tree.selectedItems():
+            top = it.parent() or it
+            selected.add((top.data(0, Qt.ItemDataRole.UserRole),
+                          top.indexOfChild(it) if it.parent() else -1))
+        current = self.tree.currentItem()
+        cur_key = None
+        if current is not None:
+            top = current.parent() or current
+            cur_key = (top.data(0, Qt.ItemDataRole.UserRole),
+                       top.indexOfChild(current) if current.parent() else -1)
+        scroll = self.tree.verticalScrollBar().value()
         self.tree.clear()
         self.items = {}
         for did in self.shown_dids():
@@ -1250,6 +1265,19 @@ class DirectConfigTab(QWidget):
                         ch.setToolTip(2, "read-only DID")
                     it.addChild(ch)
             self.refresh_did(did)
+        for did, it in self.items.items():
+            if did in expanded:
+                it.setExpanded(True)
+        for (did, idx) in selected:
+            it = self.items.get(did)
+            if it is not None:
+                (it if idx < 0 else it.child(idx) or it).setSelected(True)
+        if cur_key is not None and cur_key[0] in self.items:
+            it = self.items[cur_key[0]]
+            target = it if cur_key[1] < 0 else (it.child(cur_key[1]) or it)
+            self.tree.setCurrentItem(target, 0,
+                                     QItemSelectionModel.SelectionFlag.NoUpdate)
+        self.tree.verticalScrollBar().setValue(scroll)
         self.status.setText(f"{len(self.items)} DID(s) shown; definition "
                             f"{self.mdef.label() if self.mdef else 'none'}")
 
