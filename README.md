@@ -501,6 +501,12 @@ Bench-proven on `7S71-13K031-CC`, F188 `AM51-14C084-CB`, F120 `AM51-14C399-AB`
   a seed-only `10 02` visit. A cold-boot RAM dependency is unconfirmed: power-cycle the
   module, then run `--test-sbl` first. If that start hangs, it reproduces the failure.
   A start that times out never erases, so the failure is safe.
+* **DID definitions** for the GUI's module-data view come from the application's own
+  DID table (flash `0x870`, 33 DIDs + D100), not from IDS. IDS lists DIDs this module
+  answers with NRC 31 (DD0x, 7211, E734, ...). Source: `../HCM/hcm_did_defs.json`, built
+  into the defs DB by `tools/build_defs.py` as spec `DS7S71-13K031-CA` (matched on F110).
+  Decoded fields include the stored CCC parameters (F106), CCC faults (E103), heights,
+  ADC values, learned zeros and the leveling target and actuator command.
 * GEN3 Varroc HCM (`AM51-14C084-DA`, `GJ5T-14D063`, F111 `AM51-14F110`): SBL
   `BK21-14D065-AA` and secret `08306155AA` come from IDS. **Not tested on a module.**
 
@@ -869,7 +875,7 @@ python3 -m unittest discover -s .tests           # capture regressions + CLI flo
 | `test_readdid_poll.py` | `readdid --poll` (periodic watch, `--until`, `--changes`, session recovery) |
 | `test_abs_capture.py` / `test_ccm_capture.py` | secrets, SBL/finalise signatures, `37` CRC echoes from FORScan / UCDS captures |
 | `test_ccm_flash_replay.py` | full CCM flash against a fake ESR bootloader (pending `36`/`37`, erase-before-write); qa45 full/keepEEE/apponly; retained-data gate |
-| `test_hcm_profile.py` | HCM registry, software-keyed SBL/secret selection, bench seed/key pairs, `10 03` pre-unlock order, `readdid` |
+| `test_hcm_profile.py` | HCM registry, software-keyed SBL/secret selection, bench seed/key pairs, `10 03` pre-unlock order, firmware DID definitions in the defs DB (bench F106 decode), `readdid` |
 | `test_hvac_profile.py` | HVAC generations, software-keyed SBL/secret, generation guard, keygen vs the GJ5T application (`../HVAC/work/AK.bin`, skips when absent) |
 
 Tests that need OEM VBFs outside the repo (`../ABS/*.vbf`) skip when absent.
