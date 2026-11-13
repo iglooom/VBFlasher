@@ -554,6 +554,10 @@ def load_ucds_dir(w, folder, address, label, wr_sec=None):
         for m in re.finditer(r"^\| `([0-9A-F]{4})` \| #\d+ \| ([^|]+?) \|", inv.read_text(),
                              re.M):
             names.setdefault(int(m.group(1), 16), m.group(2).strip())
+    dc = folder / "bcm_direct_config.json"     # names for decoded tables too
+    if dc.exists():
+        for k, e in json.load(open(dc))["dids"].items():
+            names.setdefault(to_int("0x" + k), e["name"])
     dids = {}
     for fn in sorted(list(folder.glob("*_decoded.json")) + list(folder.glob("did_*_defs.json"))):
         d = json.load(open(fn))
@@ -574,7 +578,6 @@ def load_ucds_dir(w, folder, address, label, wr_sec=None):
     # Its access is authoritative for this module: "config" DIDs are written
     # like UCDS writes DE00 (10 03 + 27 03), everything else is read-only.
     force = False
-    dc = folder / "bcm_direct_config.json"
     if dc.exists():
         j = json.load(open(dc))
         sess, lvl = j["write"]["session"], j["write"]["security_level"]
