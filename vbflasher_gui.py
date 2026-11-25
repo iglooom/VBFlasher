@@ -321,7 +321,7 @@ class Main(QMainWindow):
         tb.addWidget(QLabel(" Module: "))
         self.mod_combo = QComboBox()
         self.mod_combo.setMinimumWidth(320)
-        for txid in sorted(ecu_db.ECUS):
+        for txid in sorted(ecu_db.ECUS, key=lambda t: (ecu_db.ECUS[t].name.casefold(), t)):
             p = ecu_db.ECUS[txid]
             self.mod_combo.addItem(f"{p.name}  [0x{txid:03X}, {p.bus}]", txid)
         self.mod_combo.addItem("Custom CAN id…", -1)
@@ -352,12 +352,11 @@ class Main(QMainWindow):
         self.ic_combo = QComboBox()
         tb.addWidget(self.ic_combo)
         tb.addSeparator()
-        self.busy_lbl = QLabel("  idle  ")
-        tb.addWidget(self.busy_lbl)
-        stop = QPushButton("Stop")
-        stop.setToolTip("cancel a polling job / send Ctrl-C to the running CLI job")
-        stop.clicked.connect(self.stop_jobs)
-        tb.addWidget(stop)
+        self.stop_btn = QPushButton("X")
+        self.stop_btn.setToolTip("idle")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_jobs)
+        tb.addWidget(self.stop_btn)
         self.refresh_ifaces()
         idx = self.mod_combo.findData(int(self.settings.value("module", 0x726)))
         if idx >= 0:
@@ -458,12 +457,14 @@ class Main(QMainWindow):
 
     def _busy(self, _=None):
         b = self.busy()
-        self.busy_lbl.setText("  BUSY  " if b else "  idle  ")
-        self.busy_lbl.setStyleSheet("color:#b00020;font-weight:bold" if b else "")
+        self.stop_btn.setEnabled(b)
+        self.stop_btn.setToolTip("stop: cancel the running bus job / send Ctrl-C to the CLI job"
+                                 if b else "idle")
+        self.stop_btn.setStyleSheet("color:#b00020;font-weight:bold" if b else "")
 
     def guard(self):
         if self.busy():
-            QMessageBox.information(self, APP, "A bus job is still running. Wait or press Stop.")
+            QMessageBox.information(self, APP, "A bus job is still running. Wait or press X.")
             return False
         return True
 
@@ -603,7 +604,7 @@ class ModulesTab(QWidget):
         self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tbl.verticalHeader().setVisible(False)
-        self.txids = sorted(ecu_db.ECUS)
+        self.txids = sorted(ecu_db.ECUS, key=lambda t: (ecu_db.ECUS[t].name.casefold(), t))
         for r, txid in enumerate(self.txids):
             p = ecu_db.ECUS[txid]
             for c, v in enumerate([p.name, f"{txid:03X}/{p.resp_id():03X}", p.bus, "", "", "",
@@ -2460,11 +2461,11 @@ class ServiceTab(QWidget):
         f.addWidget(b, 2, 0, 1, 2)
         lay.addWidget(g)
 
-        g = QGroupBox("Silence (hold in programmingSession; Stop = Ctrl-C restores)")
+        g = QGroupBox("Silence (hold in programmingSession; X = Ctrl-C restores)")
         h = QHBoxLayout(g)
         self.sdur = QDoubleSpinBox()
         self.sdur.setRange(0, 86400)
-        self.sdur.setSpecialValueText("until Stop")
+        self.sdur.setSpecialValueText("until X")
         h.addWidget(QLabel("duration s"))
         h.addWidget(self.sdur)
         for text, fn in (("Silence current module", lambda: self.silence(False)),
@@ -2606,7 +2607,7 @@ class ServiceTab(QWidget):
             a += self.m.cli_iface_args(t) if not all_ else ["--iface", self.m.iface_override()]
         if self.sdur.value() > 0:
             a += ["--duration", str(self.sdur.value())]
-        self.m.run_cli(a, title="silence (press Stop to end)")
+        self.m.run_cli(a, title="silence (press X to end)")
 
     def _mfile(self):
         f, _ = QFileDialog.getSaveFileName(self, "binary file", self.mfile.text() or HERE,
