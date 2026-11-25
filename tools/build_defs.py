@@ -359,6 +359,21 @@ def build_mdx(w, mdx):
         if w.module("spec", spec, None, None, short, ename, to_int(phys), "fdrs", 0, items):
             n += 1
     print(f"   fdrs spec definitions: {n}")
+    # 1b) UCDS-found MDX: same Ford documents, keyed by the same Part II spec,
+    # but not obtained from Ford -> priority 1, so a published FDRS document of
+    # the same spec (priority 0) still wins when both exist.
+    n = 0
+    for fid, pn, short, ename, phys in c.execute(
+            "SELECT f.id,f.part_number,e.shortname,e.ecu_name,e.physical_address "
+            "FROM file f JOIN ecu e ON e.file_id=f.id WHERE f.source='ucds' AND f.parsed=1 "
+            "ORDER BY f.part_number, f.id").fetchall():
+        spec = norm_spec(pn)
+        if not spec:
+            continue
+        items = did_items(w, c.execute(q_did, (fid,)))
+        if w.module("spec", spec, None, None, short, ename, to_int(phys), "ucds-mdx", 1, items):
+            n += 1
+    print(f"   ucds spec definitions: {n}")
     # 2) IDS per-platform MDX (mostly hand-made stubs) -> address via transport
     tmap = {}
     for plat, mtype, tgt in c.execute(
@@ -706,7 +721,7 @@ def main():
     w.db.executemany("INSERT INTO meta VALUES(?,?)", [
         ("format", "1"),
         ("built", time.strftime("%Y-%m-%d %H:%M:%S")),
-        ("source", "IDSdb mdx_data.sqlite + ccf.sqlite + UCDS C520 IPC/BCM/IPMA extractions + FDRS-cache CGEA IPMA (DSNK3T-19H406-AA) + HCM firmware DID table (DS7S71-13K031-CA)"),
+        ("source", "IDSdb mdx_data.sqlite (FDRS, IDS, synth, UCDS-found MDX) + ccf.sqlite + UCDS C520 IPC/BCM/IPMA extractions + FDRS-cache CGEA IPMA (DSNK3T-19H406-AA) + HCM firmware DID table (DS7S71-13K031-CA)"),
         ("bits", "field l/m = lsb/msb counted from the LSB of the whole payload"),
     ])
     w.db.commit()
