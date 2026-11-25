@@ -59,6 +59,14 @@ VECTORS = [
      "41e1ebbc50642b8eee73bfa50d5a0a7e"),
     ("cgea_app", SECRET_L3, "a404bdf0a9e0270aa6b44e70df0c539b",
      "aaf7772d6ba1ab5ee345711d523c5598"),
+    # SYNC 4 APIM (VMCU 14G676) level 3, live on NU5T-14G681-KB 2026-11-20
+    ("cgea_app", bytes.fromhex("6034AC8A267F94B894BD71AE"),
+     "1f699cca29c352f71a8f30dc666c6cdd", "172b1fef7292da7b08210e192c7a0ab5"),
+    ("cgea_app", bytes.fromhex("6034AC8A267F94B894BD71AE"),
+     "e8cac9102a82ace5d287fc32c6886d7b", "3b77144394421d1514369674450a09fa"),
+    # SYNC 4 APIM level 1 (programming session 10 02), live 2026-11-20
+    ("cgea_pbl", bytes.fromhex("A758F5EE7019B6A13421F813"),
+     "6f183043aa6c98ac50fef86d3b71811a", "901e3e4b76da194571e2e080bc5cbdf351b7"),
     ("cgea_pbl", SECRET_L1, "10524001e531f401321d4f667bfae457",
      "7325a3e9ca302318920e25ed70680f93808f"),
 ]

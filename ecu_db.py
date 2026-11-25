@@ -614,6 +614,18 @@ ECUS = {
         secrets=(
             SecretRule("", 3, "9A78563412"),
             SecretRule("", 1, "08306155AA"),
+            # SYNC 4 (F111 xU5T-14G681-*): 16-byte seeds, same HMAC-SHA1
+            # constructions as the CGEA IPMA, own 12-byte secrets. The VMCU
+            # (PowerPC VLE, 14G676) runs SecurityAccess: Dcm table @0x09154138
+            # {getSeed, compareKey, seedLen 16} x2; compareKey 0x090950F2
+            # (18-B key, "JaKe") copies K from 0x09152684, 0x090951E6 (16-B
+            # key, "zaCK") from 0x09152690. Identical bytes in every VMCU
+            # build MU5T-14G676-AA (2018) .. PU5T-14G676-DA: global secret.
+            # See /home/gl/Projects/ford/sync4/SYNC4_security_access.md.
+            *(SecretRule(p, 3, "6034AC8A267F94B894BD71AE", algo="cgea_app")
+              for p in ("MU5T-14G681", "NU5T-14G681", "PU5T-14G681")),
+            *(SecretRule(p, 1, "A758F5EE7019B6A13421F813", algo="cgea_pbl")
+              for p in ("MU5T-14G681", "NU5T-14G681", "PU5T-14G681")),
         ),
         sbls=(
             SblRule("HL1T-14G380", "GB5T-14G376-AA.VBF"),
@@ -627,6 +639,10 @@ ECUS = {
             SecretRule("AV61-12B684", 3, "2431DEF946"),
             SecretRule("BV61-12B684-D", None, "083061A4C5"),
             SecretRule("CV6A-12B684", None, "083061A4C5"),
+            # Application level 3 (10 03 + 27 03/04, e.g. 2F IO control) uses a
+            # different secret: "DIODE". On-car proven on CV6A-12B684-CA
+            # (27 04 -> 67 04, then 2F 0308 accepted); 083061A4C5 got NRC 35.
+            SecretRule("CV6A-12B684", 3, "44494F4445"),
         ),
         sbls=(
             SblRule("AV61-12B684", "AV61-14C273-AA.vbf"),
