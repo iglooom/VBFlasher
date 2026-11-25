@@ -76,6 +76,12 @@ TP_INTERVAL = 1.5
 # match it rather than the 0.1 s we used to use. Cost is one second per flash.
 SEED_DELAY = 1.0
 
+# After 71 01 0301 the SBL re-initialises the CAN controller. A segmented
+# request sent immediately got no flow control (HCM AM51-14C084-CB: errno 70
+# on 31 01 FF00). Wait this long, then probe with single-frame 3E 00. Applied
+# to every module and every SBL path (flash, memread, memwrite, backup).
+SBL_SETTLE = 1.0
+
 # --recovery PBL catch (see recovery_catch_pbl / vbf.PblFlood). 12 ms is
 # FORScan's measured rate in the ABS recovery captures (171 frames in 2.058 s).
 FLOOD_INTERVAL = 0.012
@@ -156,6 +162,27 @@ def settle_before_seed(delay=SEED_DELAY):
         print(f"   settling {delay:.1f}s before requestSeed "
               f"(module may still be entering its bootloader)")
         time.sleep(delay)
+
+
+def settle_sbl(ecu, settle=SBL_SETTLE, refusal="refusing to continue"):
+    """Wait after the SBL start, then require a single-frame 3E 00 answer
+    before anything segmented is sent (see SBL_SETTLE). 0 disables."""
+    if not settle:
+        return
+    print(f"   settling {settle:.1f}s, then probing the SBL with 3E 00")
+    time.sleep(settle)
+    for attempt in range(1, 6):
+        try:
+            r = ecu.req("3E00", timeout=1.0, what="3E 00 SBL probe")
+        except OSError as e:
+            print(f"   ..   3E 00 SBL probe: {e}")
+            r = None
+        if r is not None and len(r) and r[0] == 0x7E:
+            print(f"   OK   3E 00 SBL probe            {fmt(r)}"
+                  f" (attempt {attempt})")
+            return
+        time.sleep(0.5)
+    raise SystemExit(f"SBL did not answer 3E 00 after start; {refusal}")
 
 
 # --------------------------------------------------------------------------
@@ -1064,31 +1091,8 @@ def flash_session(txid, files, args):
             print("   (a power cycle clears the RAM-resident SBL; the "
                   "application is untouched.)")
         else:
-            settle = getattr(args, "sbl_settle", 1.0)
-            if settle:
-                # The SBL takes over the CAN controller when it starts. An
-                # erase sent right after the 71 01 0301 answer got no flow
-                # control (HCM AM51-14C084-CB, 2026-11-15: errno 70 on the
-                # segmented 31 01 FF00; the module fell back to its intact
-                # application). Wait, then require a single-frame answer
-                # before sending anything segmented.
-                print(f"   settling {settle:.1f}s, then probing the SBL "
-                      "with 3E 00")
-                time.sleep(settle)
-                for attempt in range(1, 6):
-                    try:
-                        r = ecu.req("3E00", timeout=1.0, what="3E 00 SBL probe")
-                    except OSError as e:
-                        print(f"   ..   3E 00 SBL probe: {e}")
-                        r = None
-                    if r is not None and len(r) and r[0] == 0x7E:
-                        print(f"   OK   3E 00 SBL probe            {fmt(r)}"
-                              f" (attempt {attempt})")
-                        break
-                    time.sleep(0.5)
-                else:
-                    raise SystemExit("SBL did not answer 3E 00 after start; "
-                                     "refusing to erase (application untouched)")
+            settle_sbl(ecu, getattr(args, "sbl_settle", SBL_SETTLE),
+                       "refusing to erase (application untouched)")
             for v in to_flash:
                 erase = v.flash_erase()
                 skipped = len(v.erase) - len(erase)
@@ -1224,6 +1228,7 @@ def _open_sbl_session(profile, args, need_secret=True):
     ecu.expect("31010301" + call_arg, 0x71, "31 01 0301 start SBL",
                timeout=10.0)
     print(f"   SBL running (call 0x{sbl.call:08X})")
+    settle_sbl(ecu, getattr(args, "sbl_settle", SBL_SETTLE), "refusing to continue")
     return ecu, ka, quiet, logf
 
 
@@ -2952,6 +2957,11 @@ def selftest():
         getattr(ecu_db.get_profile(0x7E0), "bus", None) == "HS-CAN"
         and getattr(ecu_db.get_profile(0x7E0), "default_iface", lambda: None)()
         == "can0")
+    _pcm = ecu_db.ECUS[0x7E0]
+    chk("PCM CV6A level 3 secret == 44494F4445 (DIODE)",
+        _pcm.pick_secret("CV6A-12B684-CA", 3) == bytes.fromhex("44494F4445"))
+    chk("PCM CV6A level 1 secret stays 083061A4C5",
+        _pcm.pick_secret("CV6A-12B684-CA", 1) == bytes.fromhex("083061A4C5"))
     _expected_ms = {0x720, 0x727, 0x733, 0x7A5, 0x7A7}
     _actual_ms = {txid for txid, p in ecu_db.ECUS.items() if p.bus == "MS-CAN"}
     chk("all registered MS-CAN modules default to can1",
@@ -4413,7 +4423,9 @@ def build_parser():
         sp.add_argument("--tp-interval", type=float, default=TP_INTERVAL)
         sp.add_argument("--progress-interval", type=float, default=1.0)
         sp.add_argument("--erase-timeout", type=float, default=60.0)
-        sp.add_argument("--sbl-settle", type=float, default=1.0)
+        sp.add_argument("--sbl-settle", type=float, default=SBL_SETTLE,
+                        help="seconds to wait after the SBL start, then probe "
+                             "it with 3E 00 (0 disables)")
         sp.add_argument("--yes", "-y", action="store_true",
                         help="skip the confirmation prompt")
         sp.add_argument("--logfile", default=None,
@@ -4540,7 +4552,7 @@ def build_parser():
                         f"enters its bootloader). 0 disables.")
     s.add_argument("--erase-timeout", type=float, default=60.0,
                    help="seconds of SILENCE that ends an erase/finalise wait")
-    s.add_argument("--sbl-settle", type=float, default=1.0,
+    s.add_argument("--sbl-settle", type=float, default=SBL_SETTLE,
                    help="seconds to wait after the SBL start before the first "
                         "erase, then probe it with single-frame 3E 00 until it "
                         "answers (HCM V850: the SBL re-inits CAN and gave no "
